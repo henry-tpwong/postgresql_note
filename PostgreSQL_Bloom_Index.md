@@ -31,21 +31,21 @@ PostgreSQL 提供的 Bloom Index 是解决此场景的利器。它专为 WHERE c
 ---
 title: PostgreSQL Bloom Index 执行流程
 ---
-flowchart LR
-    subgraph A[① 写入时：生成指纹]
+flowchart TD
+    subgraph A[写入：生成签名]
         direction LR
-        A1[索引列值<br>c1, c2, ..., cN] --> A2[哈希函数<br>（多个）] --> A3[Signature<br>（变长的bit串）]
+        A1[索引列值 c1,c2,…,cN] --> A2[多个哈希函数] --> A3[Signature<br>变长bit串]
     end
 
-    subgraph B[② 查询时：快速检索]
+    subgraph B[查询：快速筛查]
         direction LR
-        B1[查询条件<br>WHERE c1=v1 AND c5=v5] --> B2[计算查询指纹] --> B3[与索引中的Signature<br>做 位图扫描]
+        B1[查询条件 WHERE c1=v1 AND c5=v5] --> B2[计算查询指纹] --> B3[与索引签名做位图扫描]
     end
 
-    B3 --> C{判断结果}
-    C -->|❌ 不匹配| D[直接丢弃<br>（一定不存在，零损耗）]
-    C -->|⚠️ 匹配| E[回表（Heap）获取实际行数据]
-    E --> F[执行 Recheck<br>（过滤误报）]
+    B3 --> C{匹配?}
+    C -->|❌ 不匹配| D[丢弃，一定不存在<br>零损耗]
+    C -->|⚠️ 匹配| E[回表获取实际行]
+    E --> F[Recheck 过滤误报]
     F --> G[返回最终结果]
 ```
 
