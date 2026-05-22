@@ -10,13 +10,7 @@
 
 | 筆記 | 主題 |
 |------|------|
-| [PostgreSQL_index.md](index/PostgreSQL_index.md) | Bitmap Heap Scan / Recheck Cond / EXPLAIN 分析 / BRIN / 索引總覽 / Leaf Page 與 Covering Index |
-| [PostgreSQL_BRIN.md](index/PostgreSQL_BRIN.md) | BRIN 索引原理、體積對比（540x 小於 B-tree）、物聯網場景 |
-| [PostgreSQL_Bloom_Index.md](index/PostgreSQL_Bloom_Index.md) | Bloom filter 索引：單索引支援多列組合查詢 |
-| [PostgreSQL_RUM_index.md](index/PostgreSQL_RUM_index.md) | RUM index：支援 ranking / phrase search / 雙欄位複合 |
-| [PostgreSQL_GIN_LIMIT_Slow.md](index/PostgreSQL_GIN_LIMIT_Slow.md) | GIN index + LIMIT 慢的原因與 5 種解法 |
-| [PostgreSQL_Fuzzy_Search_Index.md](index/PostgreSQL_Fuzzy_Search_Index.md) | GIN / GiST / SP-GiST / RUM 模糊查詢原理與選擇決策 |
-| [PostgreSQL_Scan_Types_EXPLAIN.md](index/PostgreSQL_Scan_Types_EXPLAIN.md) | EXPLAIN 掃描類型全解析：Seq Scan / Index Scan / Bitmap Scan / TID Scan |
+| [PostgreSQL_Index_Full.md](index/PostgreSQL_Index_Full.md) | **完整索引學習筆記**：掃描類型全解析 → Bitmap Heap Scan → EXPLAIN 分析 → BRIN → Bloom → GIN/GiST/SP-GiST/RUM 模糊查詢 → GIN+LIMIT 優化 → RUM 全文檢索 → Leaf Page & Covering Index → 索引選擇速查表 |
 
 ### 查詢效能優化
 
