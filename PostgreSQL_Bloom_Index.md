@@ -1,3 +1,4 @@
+```markdown
 # PostgreSQL Bloom Index — 一個索引支撐任意 Column 組合查詢
 
 作为开发者，在设计数据访问层（DAL）时，面对运营后台那种几十个字段任意组合的筛选需求，几乎是一场索引噩梦。
