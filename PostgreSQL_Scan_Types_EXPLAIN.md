@@ -305,30 +305,126 @@ LIMIT 100;
 | `EXPLAIN` 顯示大量 Heap Fetch | 表示現有 Index Scan 耗費大量 random I/O 做 heap fetch |
 | 寫入頻率低 | 每個索引都需在寫入時維護，高寫入表的 covering index 會造成寫入放大 |
 
-### Senior Dev 補充：Visibility Map 與 Heap Fetch 的秘密
+### Senior Dev 補充：Visibility Map、MVCC 與 VACUUM — 為什麼 VACUUM 是 Index-Only Scan 的幕後功臣
 
-為什麼有時 Index-Only Scan 仍然需要 Heap Fetch？
+> **實戰法則**：如果你建了 covering index 但 `Heap Fetches` 仍然很大，**問題不是索引設計，而是 VACUUM 策略**。增加 `autovacuum` 頻率或在大量寫入後手動 `VACUUM` 可以恢復 Index-Only Scan 的效能。
 
-Postgres 的 MVCC 機制下，index entry 不包含 tuple 的可見性資訊（哪個 transaction 可見哪個版本的 row）。因此 Index-Only Scan 需要檢查 heap page 上的 **visibility map（VM）**：
+要理解為何 VACUUM 是 Index-Only Scan 的「幕後功臣」，得先從 PostgreSQL 的 MVCC（多版本並行控制）和 Visibility Map（可見性地圖）說起。
 
-- VM bit = 1（all-visible）：page 中所有 tuple 對所有 transaction 都可見 → **不需要** heap fetch
-- VM bit = 0：page 中可能有 dead tuple 或未 committed tuple → **必須** heap fetch 確認可見性
+#### 1. 為什麼一行資料會變成「看不見」？
 
-因此 `Heap Fetches: 0` 的關鍵前提是：
-1. 表經過充分的 `VACUUM`，VM 被更新
-2. 沒有 concurrent write 在掃描期間產生 dead tuple
+在 PostgreSQL 中，`UPDATE` 或 `DELETE` 並不會立刻移除舊資料，而是在原地留下一個 **死元組（dead tuple）**。這樣設計是為了讓其他正在執行的事務還能看見他們「應該看見」的版本。
+
+- 當你執行 `UPDATE` 時，Postgres 會插入一個新版本的 row，並把舊版本標記為無效。
+- 這些舊版本依然佔用磁碟空間，而且 heap page 上會同時存在「對某些事務可見」和「對某些事務不可見」的 tuple。
+
+只有當沒有任何事務還需要這些舊版本時，它們才會被 `VACUUM` 清理，空間才能被回收重用。
+
+#### 2. Visibility Map：Index-Only Scan 的「免檢金牌」
+
+每個 heap table 都有一張對應的 **Visibility Map（VM）**，它記錄每一個 data page 的兩個重要狀態：
+
+- **all-visible**：這個 page 裡的所有 tuple 對所有事務都已經是可見的（沒有未提交的插入、沒有死元組需要遮擋）。
+- **all-frozen**：這個 page 已被凍結，防止事務 ID 回捲（進階主題）。
+
+當查詢進行 Index-Only Scan 時，會發生以下流程：
+
+```
+                         ┌─────────────┐
+                         │  索引找到   │
+                         │  目標 row   │
+                         │  所在 heap  │
+                         │    page     │
+                         └──────┬──────┘
+                                │
+                    ┌───────────▼───────────┐
+                    │ 該 page 的 VM 標記    │
+                    │   為 all-visible？    │
+                    └───────────┬───────────┘
+                                │
+                 ┌──────────────┼──────────────┐
+                 │ YES                         │ NO
+                 │                             │
+    ┌────────────▼────────────┐    ┌───────────▼───────────┐
+    │ 直接從索引返回資料      │    │ 必須去 heap page 檢查  │
+    │（Heap Fetches: 0）      │    │ tuple 的可見性         │
+    └─────────────────────────┘    └───────────┬───────────┘
+                                              │
+                                    ┌─────────▼─────────┐
+                                    │ 增加 Heap Fetches  │
+                                    │       計數         │
+                                    └─────────┬─────────┘
+                                              │
+                                    ┌─────────▼─────────┐
+                                    │ 若 tuple 對目前    │
+                                    │ 事務可見 → 回傳   │
+                                    │ 否則 → 忽略       │
+                                    └───────────────────┘
+```
+
+- 如果 VM 說 page 是 `all-visible`，Postgres 就完全信任它，連碰都不碰 heap，直接從 index 輸出結果。這就是 `Heap Fetches: 0` 的最高境界。
+- 只要 page 不滿足 `all-visible` 條件（例如曾發生過 `UPDATE` 但尚未被 `VACUUM`），就必須實際讀取 heap page，逐一檢查每一行的可見性，產生 `Heap Fetches`。
+
+#### 3. VACUUM 如何讓 VM 變成 all-visible？
+
+`VACUUM` 會做兩件關鍵事：
+
+1. **清理死元組**：將不再被任何事務需要的舊版本 tuple 標記為可用空間。
+2. **更新 Visibility Map**：清完 dead tuple 後，該 page 上剩下的全部都是「對所有人可見」的 live tuple，此時 `VACUUM` 就會把這個 page 在 VM 中的 `all-visible` bit 設為 1。
+
+之後的 Index-Only Scan 再碰到這個 page，就能直接跳過 heap fetch，因為 VM 已經保證「不用檢查了，全部可見」。
+
+這就是那條實戰法則背後的原理：因為即使索引裡包含了所有需要的欄位，只要那些 heap page 還沒被 `VACUUM` 更新過 VM，Postgres 就不敢直接用索引的內容，被迫一次又一次地去 heap 確認，導致大量的 `Heap Fetches`。
+
+#### 4. 實際監控與調整策略
+
+**4.1 檢查死元組與 VACUUM 狀態**
 
 ```sql
--- 檢查 visibility map 覆蓋率
 SELECT relname,
        n_live_tup,
        n_dead_tup,
-       round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct
+       round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct,
+       last_autovacuum,
+       last_vacuum
 FROM pg_stat_user_tables
-WHERE relname = 'index_only_test';
+WHERE relname = 'your_table_name';
 ```
 
-> **實戰法則**：如果你建了 covering index 但 `Heap Fetches` 仍然很大，**問題不是索引設計，而是 VACUUM 策略**。增加 `autovacuum` 頻率或在大量寫入後手動 `VACUUM` 可以恢復 Index-Only Scan 的效能。
+- 如果 `dead_pct` 超過 5%~10%，且你的查詢經常使用 Index-Only Scan，就表示 VACUUM 的頻率需要提高。
+- 觀察 `last_autovacuum` 和 `last_vacuum` 的時間，若太久沒執行，就是警訊。
+
+**4.2 手動觸發 VACUUM 進行測試**
+
+```sql
+VACUUM (VERBOSE) your_table_name;
+```
+
+然後再執行一次你的查詢，查看 `EXPLAIN (ANALYZE, BUFFERS)` 中 `Heap Fetches` 是否大幅下降。通常立刻就能看到改善。
+
+**4.3 調整 autovacuum 參數（單表級別）**
+
+如果手動 `VACUUM` 有效，就代表 autovacuum 的預設設定對這張表來說太「寬鬆」。可以在單表上調整 storage parameter：
+
+```sql
+ALTER TABLE your_table_name SET (
+    autovacuum_vacuum_scale_factor = 0.01,   -- 原本預設 0.2（20%），改成 1%
+    autovacuum_vacuum_threshold = 1000       -- 死元組超過 1000 就觸發
+);
+```
+
+- `autovacuum_vacuum_scale_factor`：表中有多大比例的 dead tuple 才觸發 autovacuum。對於大型表（上百萬行），`0.2` 可能會累積數十萬死元組才動作，改為 `0.01`~`0.05` 會讓 VACUUM 更頻繁。
+- `autovacuum_vacuum_threshold`：絕對死元組數量門檻，避免極小表頻繁 vacuum。
+
+**4.4 加快 Index-Only Scan 的輔助：VACUUM FREEZE**
+
+如果你的表有大量寫入，也可以考慮稍微積極的凍結策略（讓 VM 也標記為 `all-frozen`），不過一般情況調高 autovacuum 頻率就足夠。
+
+#### 5. 總結：VACUUM 是 Index-Only Scan 效能的真正守門員
+
+- 沒有 `VACUUM`，Visibility Map 就不會更新，Index-Only Scan 永遠無法信任索引中的資料，必須頻繁回表檢查。
+- 即使你精心設計了 covering index，只要寫入多、VACUUM 少，`Heap Fetches` 就會居高不下，索引效益大打折扣。
+- 在生產環境中，監控 dead tuple 比例 + 調校 autovacuum 參數，和設計索引本身一樣重要。
 
 ### 包含欄位的索引（INCLUDE Index）
 

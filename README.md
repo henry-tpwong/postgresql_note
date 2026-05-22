@@ -10,15 +10,13 @@
 
 | 筆記 | 主題 |
 |------|------|
-| [PostgreSQL_index.md](PostgreSQL_index.md) | Bitmap Heap Scan / Recheck Cond / EXPLAIN 分析 / BRIN / 索引總覽 |
-| [PostgreSQL_BTree_Internals.md](PostgreSQL_BTree_Internals.md) | B-Tree 內部結構、page 分裂、fillfactor、deduplication |
+| [PostgreSQL_index.md](PostgreSQL_index.md) | Bitmap Heap Scan / Recheck Cond / EXPLAIN 分析 / BRIN / 索引總覽 / Leaf Page 與 Covering Index |
 | [PostgreSQL_BRIN.md](PostgreSQL_BRIN.md) | BRIN 索引原理、體積對比（540x 小於 B-tree）、物聯網場景 |
-| [PostgreSQL_BRIN_inclusion_opclass.md](PostgreSQL_BRIN_inclusion_opclass.md) | BRIN inclusion opclass 與 R-Tree 策略 |
 | [PostgreSQL_Bloom_Index.md](PostgreSQL_Bloom_Index.md) | Bloom filter 索引：單索引支援多列組合查詢 |
 | [PostgreSQL_RUM_index.md](PostgreSQL_RUM_index.md) | RUM index：支援 ranking / phrase search / 雙欄位複合 |
 | [PostgreSQL_GIN_LIMIT_Slow.md](PostgreSQL_GIN_LIMIT_Slow.md) | GIN index + LIMIT 慢的原因與 5 種解法 |
 | [PostgreSQL_Fuzzy_Search_Index.md](PostgreSQL_Fuzzy_Search_Index.md) | GIN / GiST / SP-GiST / RUM 模糊查詢原理與選擇決策 |
-| [PostgreSQL_IndexScan_IO_Amplification.md](PostgreSQL_IndexScan_IO_Amplification.md) | Bitmap Scan IO 放大原理與優化 |
+| [PostgreSQL_Scan_Types_EXPLAIN.md](PostgreSQL_Scan_Types_EXPLAIN.md) | EXPLAIN 掃描類型全解析：Seq Scan / Index Scan / Bitmap Scan / TID Scan |
 
 ### 查詢效能優化
 
@@ -116,6 +114,7 @@
 | [PostgreSQL_pgcrypto.md](PostgreSQL_pgcrypto.md) | pgcrypto 加密 extension |
 | [PostgreSQL_Trigger_Audit.md](PostgreSQL_Trigger_Audit.md) | Trigger 審計 |
 | [PostgreSQL_pg_trgm_Regex_100Billion.md](PostgreSQL_pg_trgm_Regex_100Billion.md) | pg_trgm 正則 100 億級別案例 |
+| [PostgreSQL_Dev_Standards.md](PostgreSQL_Dev_Standards.md) | PG 17 開發規範：命名、索引、SQL 編寫、schema 設計（標記過時規則） |
 
 ---
 
