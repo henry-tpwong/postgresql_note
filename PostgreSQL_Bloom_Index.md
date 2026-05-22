@@ -196,10 +196,6 @@ SELECT dumbloom_contains(users, 'pipeline') FROM t; -- true
 SELECT dumbloom_contains(users, 'unknown') FROM t;  -- false（一定不在）
 ```
 
-> 補充（Senior Dev）：Double hashing 的核心思路是 `g_i(x) = (h1(x) + i * h2(x)) mod m`，可以證明在 h1, h2 的取值空間與 m 互質時，k 個 hash 之間是 pair-wise independent 的。PG bloom index 的 C 實作中直接使用了 `hashfn_any()` + `hashfn_extended()` 產生兩個 base hash。
->
-> `hashtext()` 是 PG 內建的 string hash function（基於 Jenkins lookup3），用於 `hash index` 等場景。它的 collision rate 對 Bloom 的 false positive rate 影響有限（因為 Bloom 本身就容許 false positive）。
-
 ---
 
 ## 4. PG 9.6 Bloom Index 實戰
@@ -322,28 +318,3 @@ CREATE INDEX idx_test1_1 ON test1
 > - 數據量極大、查詢以大範圍為主 → BRIN
 >
 > Bloom index 的 `length` 參數（signature length，單位是 uint16 = 2 bytes，預設 80 = 160 bytes）直接決定 false positive rate。`length` 越大 → 更精確但 index 更大。可以在 `CREATE INDEX ... WITH (length = 160)` 中調整。PG 14 引入了 bloom extension 的 parallel index build 支援。
-
----
-
-## 6. Bloom 的 Negator 優化原理
-
-Bloom filter 的核心定義："false 一定是假"。PG 利用優化器中的 **negator** 機制，讓 `<>` 查詢也能受益：
-
-```
-(x <> y)  ≡  NOT (x = y)
-
-由於 Bloom 的 = 判斷若為假 → 一定是假
-→ NOT(false) = true → 肯定為真
-
-同理反向推理：
-(x = y)  ≡  NOT (x <> y)
-NOT(false) = true → 肯定為真
-```
-
-這意味著：
-- `=` 查詢 → Bloom index + Recheck（因為 true 可能有 false positive）
-- `<>` 查詢 → Bloom index，但 **不需要 Recheck**（因為 false 一定是假的）
-
-這節省了 `<>` 查詢的 heap page read 成本。
-
-> 補充（Senior Dev）：negator 是 PG optimizer 的運算符對偶概念（定義在 `pg_operator.oprnegate`）。例如 `=` 的 negator 是 `<>`（反之亦然）。Planner 利用這層關係做邏輯等價轉換：當你寫了 `WHERE col <> 42`，planner 內部等同 `WHERE NOT (col = 42)`，對 Bloom filter 而言 `NOT(false) = true` 是決定性的、不需要 Recheck。這個特性在設計 Bloom index schema 時值得利用——如果你的業務中 `<>` 查詢也很常見，可以將查詢改寫為 `NOT IN (...)` 或 `<>` 來完全避免 Recheck 成本。
