@@ -49,15 +49,6 @@ Check element:
 | `n` | 預期唯一值個數 | 使用者指定 |
 | `p` | 允許的 false positive rate | 使用者指定（如 0.02 = 2%） |
 
-> 補充（Senior Dev）：Bloom filter 的 false positive 機率公式：
-> `P ≈ (1 - e^(-kn/m))^k`
->
-> 在 `k = (m/n) * ln(2)` 時達到最優，此時 `P ≈ (0.6185)^(m/n)`。這意味著：
-> - 要想 p = 1%，需要 `m/n ≈ 9.6`（每個 element 約 10 bit）
-> - 要想 p = 0.1%，需要 `m/n ≈ 14.4`
-> - 對於 PG Bloom index 來說，每個 index entry 對應一個 table row，n = #rows
-> - 如果 table 有 1 億 row，p=2% → m ≈ 8.14 億 bit ≈ 97 MB —— 與原文實測 153 MB（15 column）吻合
->
 > 相比 B-tree：同一張 1 億行的表，15 個 B-tree index 可能需要 **數十 GB**（每個 index 存所有 key + TID），Bloom 只需 153 MB，差距超過 10 倍。
 
 ---
