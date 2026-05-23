@@ -91,22 +91,6 @@ random_page_cost * selectivity * relpages  vs  seq_page_cost * relpages
 
 但 `effective_cache_size` 也影響決策：如果 Planner 認為大部分 index page 已在 shared buffer 中，random access 成本估算會降低。
 
-### II. Senior Dev 補充：Index Scan 的 I/O 放大陷阱
-
-Index Scan 看似高效，但存在一個容易被忽略的問題——**I/O 放大（Random I/O Amplification）**：
-
-- 每個 heap tuple fetch 都是一次 random page access
-- 如果 index 和 heap 的 physical ordering 不一致（correlation 低），每個 row 可能要讀一個不同的 data page
-- 極端情況：回傳 1000 rows 可能觸發 1000 次 random disk read
-
-Postgres 統計資訊中的 `pg_stats.correlation` 反映 column physical ordering 與 logical ordering 的吻合度（-1 到 1）。接近 -1 或 1 代表高度有序，Planner 會更傾向 Index Scan。接近 0 代表隨機分佈，Planner 可能轉向 Bitmap Scan。
-
-```sql
--- 查看 correlation
-SELECT attname, correlation FROM pg_stats
-WHERE tablename = 'accounts' AND attname = 'id';
-```
-
 ---
 
 ## 4 Bitmap Index Scan + Bitmap Heap Scan（點陣圖掃描）
@@ -176,6 +160,79 @@ EXPLAIN SELECT * FROM t WHERE a = 1 OR b = 2;
 ```
 
 > **關鍵參數 `work_mem`**：bitmap 是存在記憶體中的。如果 `work_mem` 不夠容納完整 bitmap（或 heap page 超過 `effective_cache_size` 預估），Planner 可能放棄 Bitmap Scan 改用 Seq Scan。增大 `work_mem` 有助於讓 Bitmap Scan 出現在更合適的場景中。
+
+#### a 實戰範例：電商訂單查詢（BitmapOr / BitmapAnd）
+
+營運人員常用以下條件篩選訂單：
+
+```sql
+-- 查詢 1：布魯克林區已出貨的訂單（AND）
+WHERE district = 'Brooklyn' AND status = 'shipped'
+
+-- 查詢 2：布魯克林區「或」已出貨的訂單（OR）
+WHERE district = 'Brooklyn' OR status = 'shipped'
+```
+
+`district` 和 `status` 各有獨立索引，但沒有聯合索引。
+
+**建立測試表與索引：**
+
+```sql
+CREATE TABLE orders (
+    id          SERIAL PRIMARY KEY,
+    customer    TEXT NOT NULL,
+    district    TEXT NOT NULL,   -- 行政區（50 個不同值）
+    status      TEXT NOT NULL,   -- pending / processing / shipped / cancelled（4 個值）
+    amount      NUMERIC(10,2),
+    created_at  TIMESTAMP DEFAULT now()
+);
+
+CREATE INDEX idx_orders_district ON orders (district);
+CREATE INDEX idx_orders_status   ON orders (status);
+```
+
+**查詢範例：OR 組合（聯集）**
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT *
+FROM orders
+WHERE district = 'District_5' OR status = 'cancelled';
+```
+
+預期執行計畫（關鍵部分）：
+
+```
+Bitmap Heap Scan on orders  (cost=... rows=...)
+  Recheck Cond: ((district = 'District_5'::text) OR (status = 'cancelled'::text))
+  Heap Blocks: exact=N
+  Buffers: shared hit=...
+  ->  BitmapOr                            ← 兩個 bitmap 取聯集
+        ->  Bitmap Index Scan on idx_orders_district
+              Index Cond: (district = 'District_5'::text)
+        ->  Bitmap Index Scan on idx_orders_status
+              Index Cond: (status = 'cancelled'::text)
+```
+
+**發生了什麼事？**
+
+```mermaid
+flowchart TD
+    A["SQL: district='District_5' OR status='cancelled'"] --> B["Bitmap Index Scan on idx_orders_district"]
+    A --> C["Bitmap Index Scan on idx_orders_status"]
+    B --> D["Bitmap A: 標記 district='District_5' 的 page"]
+    C --> E["Bitmap B: 標記 status='cancelled' 的 page"]
+    D --> F["BitmapOr: A ∪ B<br>任一個條件命中的 page 都保留"]
+    E --> F
+    F --> G["Bitmap Heap Scan<br>依序讀取聯集 page<br>逐行 Recheck OR 條件"]
+```
+
+**關鍵解讀：**
+- `BitmapOr` 取聯集，page 在任意一個 bitmap 中出現就保留
+- `status='cancelled'` 假設只有 5% 的 row、`district='District_5'` 只有 2% 的 row，即便加起來掃描量也遠小於全表掃描
+- **每個 page 只讀一次**，避免了 Index Scan 重複 fetch 同一 page 的問題
+
+> 這種方式讓你**不需要為 `(district, status)` 建立聯合索引**，卻依然能用兩個獨立索引高效查詢——這就是 Bitmap Scan 的威力。同理，`AND` 條件會使用 `BitmapAnd` 取交集：只有兩個 bitmap 都標記為 1 的 page 才會被保留。
 
 ---
 
@@ -323,37 +380,15 @@ LIMIT 100;
 
 當查詢進行 Index-Only Scan 時，會發生以下流程：
 
-```
-                         ┌─────────────┐
-                         │  索引找到   │
-                         │  目標 row   │
-                         │  所在 heap  │
-                         │    page     │
-                         └──────┬──────┘
-                                │
-                    ┌───────────▼───────────┐
-                    │ 該 page 的 VM 標記    │
-                    │   為 all-visible？    │
-                    └───────────┬───────────┘
-                                │
-                 ┌──────────────┼──────────────┐
-                 │ YES                         │ NO
-                 │                             │
-    ┌────────────▼────────────┐    ┌───────────▼───────────┐
-    │ 直接從索引返回資料      │    │ 必須去 heap page 檢查  │
-    │（Heap Fetches: 0）      │    │ tuple 的可見性         │
-    └─────────────────────────┘    └───────────┬───────────┘
-                                              │
-                                    ┌─────────▼─────────┐
-                                    │ 增加 Heap Fetches  │
-                                    │       計數         │
-                                    └─────────┬─────────┘
-                                              │
-                                    ┌─────────▼─────────┐
-                                    │ 若 tuple 對目前    │
-                                    │ 事務可見 → 回傳   │
-                                    │ 否則 → 忽略       │
-                                    └───────────────────┘
+```mermaid
+flowchart TD
+    A["索引找到目標 row<br>所在 heap page"] --> B{"該 page 的 VM 標記<br>為 all-visible？"}
+    B -->|"YES"| C["直接從索引返回資料<br>（Heap Fetches: 0）"]
+    B -->|"NO"| D["必須去 heap page 檢查<br>tuple 的可見性"]
+    D --> E["增加 Heap Fetches 計數"]
+    E --> F{"若 tuple 對目前<br>事務可見？"}
+    F -->|"可見"| G["回傳"]
+    F -->|"不可見"| H["忽略"]
 ```
 
 - 如果 VM 說 page 是 `all-visible`，Postgres 就完全信任它，連碰都不碰 heap，直接從 index 輸出結果。這就是 `Heap Fetches: 0` 的最高境界。
