@@ -1,3 +1,13 @@
+# PostgreSQL Index 完全指南 — 從掃描類型到索引選型
+
+> 本文是一份 PostgreSQL 索引的系統性筆記，涵蓋 EXPLAIN 六種掃描類型、Bitmap/B-tree/BRIN/Bloom/GiST/SP-GiST/GIN/RUM 八種索引機制、以及模糊查詢與全文檢索的實戰選型。
+>
+> **閱讀路徑**：新手建議從第一篇依序閱讀（§一 打掃描基礎 → §二 理解核心機制 → §三~五 學各類索引 → §六~七 深入全文檢索）。有特定場景需求的讀者可跳到對應章節。
+>
+> 原始來源：PostgreSQL 官方文件、德哥（digoal）blog 系列、Postgres Professional 技術文章，經整理、補充 Mermaid 圖解與 Senior Dev 實戰註解。
+
+---
+
 # 一、PostgreSQL EXPLAIN 計畫中的掃描類型全解析
 
 ## 1 為什麼讀懂掃描類型是效能的關鍵
