@@ -1462,37 +1462,12 @@ SELECT count(*) FROM tab WHERE id = 100000;
 
 ---
 
-## 6 Oracle Exadata Storage Index
-
-Oracle 有類似機制，但僅限 Exadata 一體機（Storage Index 在 storage cell 層面，對 SQL 層透明）。PostgreSQL BRIN 是開源免費、任何硬體均可用的對等方案。
-
-Oracle Storage Index 連結：[https://docs.oracle.com/cd/E50790_01/doc/doc.121/e50471/concepts.htm#SAGUG20984](https://docs.oracle.com/cd/E50790_01/doc/doc.121/e50471/concepts.htm#SAGUG20984)
-
----
-
-> [PG 11+] **multi-column BRIN**：PG 11 起 BRIN 支援不同 column 使用不同 opclass，實現真正的複合 BRIN index：
-> ```sql
-> CREATE INDEX idx_brin_multi ON tab USING BRIN (
->     create_time timestamptz_minmax_ops,
->     status int4_bloom_ops
-> ) WITH (pages_per_range = 128, autosummarize = on);
-> ```
->
-> [PG 13+] **parallel BRIN scan**：PG 13 起 BRIN index scan 支援 parallel query，對於大範圍掃描 + 多 CPU 環境可進一步加速。
->
-> [PG 版本差異] 原文 EXPLAIN 輸出來自 PG 9.5，與最新版本有幾處格式差異：
-> - `Planning time`（小寫 t）在 PG 13 改為 `Planning Time`（大寫 T）
-> - PG 12+ 新增 `JIT` 資訊行（若 JIT 啟用）、PG 13+ 新增 `Memory` 用量、PG 14+ 新增 `Worker` 資訊
->
-> 各項核心指標（`Buffers`、`Heap Blocks`、`Rows Removed by Index Recheck`）格式不變，原文 benchmark 結論在最新版本仍然有效。
-
-## 7 小結
+## 6 小結
 
 1. BRIN 針對 IoT 場景：流式寫入、範圍查詢。對寫入影響微乎其微，index size 比 BTREE 小數百倍
 2. 範圍查詢效能與 BTREE 差距在毫秒級，但 index 體積節省巨大
 3. 精確點查不如 BTREE（差距 1000x），不應用作 point-lookup 的主 index
 4. 結合 JSON / GiST 等功能，適合 IoT 混合分析場景
-5. 德哥原文結論：DBA 應抓準各類 index 特性，匹配到合適場景（千里馬與伯樂）
 
 # 四、PostgreSQL Bloom Index — 一個索引支撐任意 Column 組合查詢
 
@@ -1504,20 +1479,43 @@ Oracle Storage Index 連結：[https://docs.oracle.com/cd/E50790_01/doc/doc.121/
 
 ```mermaid
 ---
-title: 傳統多字段組合查詢的索引爆炸困境
+title: 傳統 B-tree 多欄位組合查詢的索引爆炸困境
 ---
 flowchart TD
-    A[用戶發起查詢<br>可選條件：c1, c2, c3] --> B{規劃器評估索引}
-    B -->|方案1| C[全表掃描]
-    C --> D[❌ 數據量一大查詢就崩潰]
+    subgraph demand["營運後台查詢需求"]
+        direction LR
+        Q1["WHERE c1 = ?"]
+        Q2["WHERE c2 = ?"]
+        Q3["WHERE c1=? AND c2=?"]
+        Q4["WHERE c2=? AND c3=?"]
+        Q5["WHERE c1=? AND c3=?"]
+        Q6["WHERE c1=? AND c2=? AND c3=?"]
+    end
 
-    B -->|方案2| E[單個聯合索引<br>（如 idx_c1_c2_c3）]
-    E --> F{查詢 WHERE c2 = ?}
-    F --> G[❌ 未命中前導列，索引失效]
+    demand --> choices{"B-tree 三種方案"}
 
-    B -->|方案3| H[窮舉所有組合<br>（建立 2^N 個獨立索引）]
-    H --> I[❌ 存儲爆炸、寫入性能災難]
+    choices -->|"方案 A"| seq["全表掃描<br/>Seq Scan"]
+    seq --> bad1["❌ 百萬行以上<br/>查詢秒變分鐘"]
+
+    choices -->|"方案 B"| comp["建一個聯合索引<br/>idx(c1, c2, c3)"]
+    comp --> trap{"查詢可選欄位<br/>任意組合"}
+    trap -->|"WHERE c2=?"| fail1["❌ 未命中前導列 c1<br/>索引完全失效"]
+    trap -->|"WHERE c1=? AND c3=?"| fail2["❌ 跳過 c2<br/>只能用到 c1 過濾"]
+    trap -->|"WHERE c1=? AND c2=? AND c3=?"| ok["✅ 完美命中"]
+
+    choices -->|"方案 C"| exhaust["窮舉所有欄位組合<br/>建 2ᴺ - 1 個索引"]
+    exhaust --> bomb["❌ 索引爆炸"]
+    bomb --> detail["3 欄 → 7 個索引<br/>10 欄 → 1,023 個索引<br/>20 欄 → 1,048,575 個索引"]
+    detail --> cost["寫入效能崩潰<br/>儲存是表的 N 倍"]
 ```
+
+**三種方案全軍覆沒：**
+
+| 方案 | 困境 | 結果 |
+|------|------|------|
+| 全表掃描 | 數據量大時 I/O 爆炸 | 毫秒 → 分鐘 |
+| 單個聯合索引 | 前導列缺失即失效 | 只有一種組合能命中 |
+| 窮舉組合索引 | (2ᴺ − 1) 個索引 | 儲存爆炸、寫入崩潰 |
 
 PostgreSQL 提供的 Bloom Index 是解決此場景的利器。它專爲 WHERE c1=v1 AND c5=v5 AND ... 這類等值組合查詢設計，用極小的存儲成本實現高效過濾。
 
