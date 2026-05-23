@@ -43,205 +43,1270 @@ Client Request → Parser → Analyzer → Planner → Executor → Client Respo
 
 ## 2. Client Request
 
-PostgreSQL 使用 **process-per-connection** 模型（single-threaded），所有 concurrency 發生在 process level。
+當你打開應用程式、下了一行 SQL 時，這行 SQL 是怎麼送進 PostgreSQL 的？這個階段就是在處理這件事。
 
-### I. Wire Protocol
+### I. 先認識 Postmaster：PG 的「總機」
 
-Client 與 Server 之間使用 binary message protocol：message 的第一個 byte 是 type code（如 `Q` = simple query、`P` = Parse、`B` = Bind、`E` = Execute），接下來 4 bytes 是 message length，message body 按 type 對應的格式編碼。
+PostgreSQL 啟動後，第一個跑起來的 process 叫做 **Postmaster**。你可以把它想像成一個總機或櫃檯接待員：
 
-Message types 定義在 [PostgreSQL Protocol Message Formats](http://www.postgresql.org/docs/9.4/static/protocol-message-formats.html)，client-side wrapper 位於 `libpq`（`src/include/libpq`）。
+> Postmaster **自己不處理 SQL**，它的工作只有兩件事：
+> 1. 監聽 client 的連線請求（預設 port 5432）
+> 2. 幫每個 client **指派（fork）一個專屬的後台 process**（backend process）
 
-### II. Backend Process 分配
+```mermaid
+flowchart LR
+    subgraph OS["作業系統"]
+        PM["🏠 Postmaster\n（總機/接待員）\n監聽 port 5432"]
+        BP1["👷 Backend Process 1\n（處理 Client A 的 SQL）"]
+        BP2["👷 Backend Process 2\n（處理 Client B 的 SQL）"]
+        BP3["👷 Backend Process 3\n（處理 Client C 的 SQL）"]
+    end
 
-Client 獲取 backend process 有兩種路徑：
+    CA["💻 Client A"] -->|"1. 連線請求"| PM
+    CB["💻 Client B"] -->|"1. 連線請求"| PM
+    CC["💻 Client C"] -->|"1. 連線請求"| PM
 
-1. **Reuse idle process**：backend process 空閒時持續嘗試讀取新 incoming message，直接接管 client 請求
-2. **Fork new process**：postmaster fork 新 backend process。Postmaster 本質上是 proxy server + child process supervisor
+    PM -.->|"2. fork 新 process"| BP1
+    PM -.->|"2. fork 新 process"| BP2
+    PM -.->|"2. 指派到空閒 process"| BP3
 
-> 補充（Senior Dev）：Process-per-connection 是 PG 最經典的架構限制之一。每個 connection 至少消耗 ~5-10 MB private memory（取決於 `work_mem` / `temp_buffers`），所以 1000 connections = 5-10 GB。這也是為什麼 production 強烈建議使用 connection pooler（PgBouncer / Pgpool-II）。
->
-> 關於 message protocol，有兩個模式：
-> - **Simple Query Protocol**：`Q` message，一次性傳送整條 SQL → PG 內部走 `exec_simple_query()`
-> - **Extended Query Protocol**：`P`(Parse) → `B`(Bind) → `E`(Execute) 三步，允許 parameterized query、cursor、batch execution。JDBC / Npgsql 預設使用 Extended Protocol
->
-> 函數名 `exec_simple_query` **極具誤導性** —— 它處理絕大多數 query，包括極度複雜的查詢。
+    CA -->|"3. 發送 SQL"| BP1
+    CB -->|"3. 發送 SQL"| BP2
+    CC -->|"3. 發送 SQL"| BP3
+
+    style PM fill:#fff9c4,stroke:#f9a825
+    style BP1 fill:#e8f5e9,stroke:#388e3c
+    style BP2 fill:#e8f5e9,stroke:#388e3c
+    style BP3 fill:#e8f5e9,stroke:#388e3c
+```
+
+### II. Process-per-Connection：一人一間辦公室
+
+PostgreSQL 的核心設計是 **一個 connection = 一個 OS process**（不是 thread）。
+
+```mermaid
+flowchart TD
+    subgraph MySQL["MySQL（對比）"]
+        M1["Thread 1"]
+        M2["Thread 2"]
+        M3["Thread 3"]
+        MP["Process\n（共用記憶體）"]
+        M1 --- MP
+        M2 --- MP
+        M3 --- MP
+    end
+
+    subgraph PG["PostgreSQL"]
+        P1["Backend Process 1\n獨立記憶體 ~5-10MB"]
+        P2["Backend Process 2\n獨立記憶體 ~5-10MB"]
+        P3["Backend Process 3\n獨立記憶體 ~5-10MB"]
+    end
+
+    style PG fill:#e3f2fd,stroke:#1565c0
+    style MySQL fill:#fce4ec,stroke:#c62828
+```
+
+**優點：**
+- 穩定性高：一個 process crash 不會拖垮其他 connection
+- 不用擔心 thread-safe 問題（每個 process 各自獨立）
+
+**缺點（也是最重要的生產考量）：**
+- 每個 connection 至少吃掉 **5~10 MB 記憶體**（視 `work_mem` 設定而定）
+- **1000 個 connection = 5~10 GB 記憶體就這樣沒了**
+- 這也是為什麼正式環境**一定要用 connection pooler**
+
+```mermaid
+flowchart LR
+    subgraph Bad["❌ 沒有 Connection Pooler"]
+        C1["App 1"] --> BP_A["Backend\n5MB"]
+        C2["App 2"] --> BP_B["Backend\n5MB"]
+        C3["App 3"] --> BP_C["Backend\n5MB"]
+        C4["..."] --> BP_D["..."]
+        C1000["App 1000"] --> BP_Z["Backend\n5MB"]
+    end
+
+    subgraph Good["✅ 使用 PgBouncer"]
+        A1["App 1"]
+        A2["App 2"]
+        A3["App 3"]
+        A1000["App 1000"]
+        PB["PgBouncer\n（排隊/復用）"]
+        BW1["Backend\n× 20 個"]
+        A1 --> PB
+        A2 --> PB
+        A3 --> PB
+        A1000 --> PB
+        PB --> BW1
+    end
+
+    style Bad fill:#ffebee,stroke:#c62828
+    style Good fill:#e8f5e9,stroke:#2e7d32
+```
+
+### III. Wire Protocol：Client 跟 PG 怎麼「說話」
+
+Client 不是直接傳 SQL 字串給 PG，而是透過一套**二進位通訊協定（wire protocol）**。
+
+每一條訊息的第一個 byte 是**訊息類型代碼**，接下來 4 bytes 是訊息長度，後面才是實際內容。
+
+```mermaid
+flowchart TD
+    subgraph Simple["Simple Query Protocol（簡單模式）"]
+        S1["Client 一次送出整條 SQL\n（含 Q 標頭 + 訊息長度 + SQL 內容）"]
+        S2["PG 一次跑完 Parser → Planner → Executor"]
+        S3["PG 一次回傳所有結果"]
+        S1 --> S2 --> S3
+    end
+
+    subgraph Extended["Extended Query Protocol（擴展模式）"]
+        E1["步驟 1：Parse\n只解析語法、產生 pre-compiled statement\n（還不執行，也不知道參數值）"]
+        E2["步驟 2：Bind\n帶入實際參數值、產生 execution plan"]
+        E3["步驟 3：Execute\n真正執行並回傳結果"]
+        E1 --> E2 --> E3
+    end
+
+    style Simple fill:#fff3e0,stroke:#ef6c00
+    style Extended fill:#e8eaf6,stroke:#3949ab
+```
+
+| 模式 | 誰在用 | 一句話解釋 |
+|------|--------|-----------|
+| **Simple Query** | `psql` 命令行、簡單 scripts | 一句 SQL 丟進去 → 結果出來 |
+| **Extended Query** | JDBC、Npgsql、所有正式 Driver | 先編譯 → 再帶參數 → 再執行（安全又快） |
+
+**實際範例 —— 同樣的 SQL，兩種傳法：**
+
+```
+Simple Query：
+  Client → PG:  [Q][長度][SELECT * FROM users WHERE id = 1]
+  PG → Client:  [T][長度][查詢結果 row 1][T][查詢結果 row 2]...
+
+Extended Query：
+  Client → PG:  [P][長度][SELECT * FROM users WHERE id = $1]     ← Parse，用 $1 佔位
+  PG → Client:  [1]（表示 parse 完成，給你一個 statement ID）
+  Client → PG:  [B][長度][statement ID][參數值: 1]              ← Bind，帶入實際值
+  PG → Client:  [2]（bind 完成）
+  Client → PG:  [E][長度][statement ID]                         ← Execute
+  PG → Client:  [T][長度][查詢結果 row 1][T][查詢結果 row 2]...
+```
+
+> Extended Query 的關鍵好處：
+> - **防止 SQL injection**：參數是分開傳的，不會跟 SQL 語法混在一起
+> - **可重複執行**：同一條 SQL 只需要 Parse 一次，之後只要 Bind + Execute（省下 parse 成本）
+> - **支援 Cursor**：可以一段一段 fetch 結果，而不是一次全部回傳
+
+### IV. 整個 Client Request 階段總覽
+
+```mermaid
+flowchart TD
+    subgraph Step1["步驟 1：連線建立"]
+        C["App 發起 TCP 連線\n到 PG port 5432"]
+        PM["Postmaster 接收連線"]
+        Fork{"有沒有\n空閒的 backend？"}
+        Reuse["指派給空閒的\nbackend process"]
+        New["fork 一個全新的\nbackend process"]
+    end
+
+    subgraph Step2["步驟 2：身分驗證"]
+        Auth["Backend 要求認證\n（密碼/SSL/certificate...）"]
+        OK{"驗證通過？"}
+        Reject["拒絕連線"]
+    end
+
+    subgraph Step3["步驟 3：收發訊息"]
+        Msg["Client 透過 Wire Protocol\n發送 SQL 訊息"]
+        Mode{"用哪種模式？"}
+        Simple["Simple Query：一次整條 SQL"]
+        Extended["Extended Query：Parse→Bind→Execute 三步"]
+    end
+
+    C --> PM
+    PM --> Fork
+    Fork -->|"有"| Reuse
+    Fork -->|"沒有"| New
+    Reuse --> Auth
+    New --> Auth
+    Auth --> OK
+    OK -->|"失敗"| Reject
+    OK -->|"成功"| Msg
+    Msg --> Mode
+    Mode --> Simple
+    Mode --> Extended
+
+    style Step1 fill:#e1f5fe,stroke:#0288d1
+    style Step2 fill:#fff3e0,stroke:#f57c00
+    style Step3 fill:#e8f5e9,stroke:#388e3c
+```
+
+> 補充（Senior Dev）：函數名 `exec_simple_query` **極具誤導性** —— 它處理絕大多數 query，包括極度複雜的查詢。不要被 "simple" 這個字騙了。
 
 ## 3. Parser
 
-Raw SQL string 被 parser 解析為 **parse tree**（由 query node 構成的 tree）。
+### I. Parser 在做什麼？一句話：把「字串」變成「樹」
 
-入口函數：`postgres.c:exec_simple_query`。
-
-| 概念 | 說明 |
-|------|------|
-| Parse Tree Node Types | `parsenodes.h`：`SelectStmt`、`InsertStmt`、`DeleteStmt`、`UpdateStmt`、`CreateStmt` 等 |
-| 輸出 | 純語法結構，未做語義檢查 |
-| Debug | `SET debug_print_parse = on`，輸出寫入 server log |
-
-> 補充（Senior Dev）：`debug_print_*` 系列參數輸出極其詳細（包含完整 tree dump），在 production 開啟會 flood log。建議只在 dev session 中 `SET`（僅影響當前 connection）而非全域 `ALTER SYSTEM`。另外 `debug_pretty_print = on` 可以讓 tree dump 變成 indented 格式，大幅提升可讀性。
->
-> Parser 使用 `gram.y` + `scan.l`（flex/bison）生成。PG 的 SQL 語法是 LALR(1)，有一個著名的 corner case：`SELECT 1 AS foo UNION SELECT 2` vs `SELECT 1 AS foo, 2 AS bar` —— parser 需要 lookahead context 來區分 `UNION` 關鍵字和 alias `UNION`，這導致了某些 ambiguous grammar 的 shift/reduce conflict。
-
-## 4. Analyzer (Semantic Analysis & Rewriting)
-
-Parse tree 經過 semantic analysis 和 transformation 後被改寫為一個或多個等價的 Query object。
-
-### I. View Rewriting
+當你寫下一行 SQL：
 
 ```sql
-CREATE VIEW example_view AS SELECT * FROM table WHERE table.column = 'foo';
-SELECT * FROM example_view;
--- Analyzer 改寫為：
-SELECT * FROM table WHERE table.column = 'foo';
+SELECT name, age FROM users WHERE id = 1;
 ```
 
-`analyze.c:transformStmt` 根據 query type 進行不同的分析和正規化處理，輸出統一的 Query object 給 Planner。
+對電腦來說，這只是一串**文字**。電腦看不懂 "SELECT" 是什麼意思、"FROM" 跟誰是一組的。Parser 的工作就是把這串文字轉換成一個**有結構的樹狀資料**（parse tree）。
 
-| 概念 | 說明 |
-|------|------|
-| View 改寫 | 非 materialized view → 展開為 base table 查詢 |
-| 正規化 | 統一各種 query type 的表示形式 |
-| 輸出 | Query object（`parsenodes.h:Query`） |
-| Debug | `SET debug_print_rewritten = on` |
+```mermaid
+flowchart LR
+    Raw["📝 Raw SQL 字串\n──────────\nSELECT name, age\nFROM users\nWHERE id = 1"]
+    Parser["🔧 Parser\n語法分析"]
+    Tree["🌳 Parse Tree\n──────────\n一棵樹狀結構\n每個節點代表\nSQL 的一個語法單元"]
 
-> 補充（Senior Dev）：Analyzer 不只處理 View，還處理：
-> - **Column name resolution**：`*` → 展開為實際 column list
-> - **Type inference & implicit cast**：`WHERE col = 42` 如果 col 是 text → 自動推斷需要 `42::text`
-> - **Default expression resolution**：INSERT 漏掉的 column 補 default value
-> - **Rule system**：`CREATE RULE` 定義的 rewrite rule（PG 內部用 rule 實現 View——`CREATE VIEW` 本質上就是建立一個 `_RETURN` rule）
+    Raw --> Parser --> Tree
+
+    style Raw fill:#fff9c4,stroke:#f9a825
+    style Parser fill:#e1f5fe,stroke:#0288d1
+    style Tree fill:#e8f5e9,stroke:#388e3c
+```
+
+### II. Parse Tree 長什麼樣子？實際拆解一條 SELECT
+
+PG 會把 SQL 的每個關鍵字拆成一個「節點」，然後按照層級關係組成一棵樹。
+
+```mermaid
+flowchart TD
+    Root["🔵 SelectStmt\n（整條 SELECT 語句）"]
+
+    Root --> Target["🟢 TargetList\n（要查哪些欄位）"]
+    Root --> From["🟢 FromClause\n（從哪張表查）"]
+    Root --> Where["🟢 WhereClause\n（過濾條件）"]
+
+    Target --> Col1["📋 ColumnRef: name"]
+    Target --> Col2["📋 ColumnRef: age"]
+
+    From --> Table["📋 TableRef: users"]
+
+    Where --> Cond["🟠 EqualsExpr（=）"]
+    Cond --> Left["📋 ColumnRef: id"]
+    Cond --> Right["📋 ConstValue: 1"]
+
+    style Root fill:#bbdefb,stroke:#1565c0
+    style Target fill:#c8e6c9,stroke:#2e7d32
+    style From fill:#c8e6c9,stroke:#2e7d32
+    style Where fill:#c8e6c9,stroke:#2e7d32
+    style Cond fill:#ffe0b2,stroke:#e65100
+```
+
+> **白話解釋**：SQL 是一個巢狀層級語言——`WHERE` 裡面包含「條件」，條件裡面又包含「左邊的 column」和「右邊的值」。Parser 的工作就是把這種層級關係用樹的方式「畫」出來，讓後面的階段可以照著這棵樹往下處理。
+
+不同類型的 SQL 會產生不同根節點的 parse tree：
+
+| SQL 類型 | Parse Tree 根節點 | 範例 |
+|----------|-------------------|------|
+| `SELECT` | `SelectStmt` | `SELECT * FROM t` |
+| `INSERT` | `InsertStmt` | `INSERT INTO t VALUES (1)` |
+| `UPDATE` | `UpdateStmt` | `UPDATE t SET x = 1` |
+| `DELETE` | `DeleteStmt` | `DELETE FROM t` |
+| `CREATE TABLE` | `CreateStmt` | `CREATE TABLE t (id INT)` |
+
+### III. Parser 只管語法、不管語義
+
+Parser 的工作範圍很窄——**只檢查你寫的 SQL 符不符合語法規則**，不檢查語義。
+
+```mermaid
+flowchart TD
+    SQL["SELECT name\nFROM users\nWHERE id = 1"]
+
+    P["Parser"]
+    Result{"語法檢查"}
+
+    Pass["✅ 通過：產生 Parse Tree\n（繼續往下走）"]
+    Fail["❌ 失敗：噴 syntax error\n（例如漏了 FROM 關鍵字）"]
+
+    NotCheck["⚠️ 以下東西 Parser 不會檢查：\n• users 這張表真的存在嗎？\n• 有 name 這個欄位嗎？\n• id 的型別是整數嗎？\n這些都是下一個階段（Analyzer）的工作"]
+
+    SQL --> P --> Result
+    Result -->|"語法正確"| Pass
+    Result -->|"語法錯誤"| Fail
+    Pass --- NotCheck
+
+    style Pass fill:#e8f5e9,stroke:#2e7d32
+    style Fail fill:#ffebee,stroke:#c62828
+    style NotCheck fill:#fff8e1,stroke:#ff8f00
+```
+
+**實際例子：**
+
+```sql
+-- ✅ Parser 會過（語法正確），但會在後面的 Analyzer 階段報錯
+SELECT abc FROM nonexistent_table;
+-- Parser: "OK，這是個合法的 SELECT，往下傳"
+-- Analyzer: "等等，根本沒有 nonexistent_table 這張表！→ 報錯"
+
+-- ❌ Parser 直接擋下（語法錯誤，連 parse tree 都生不出來）
+SELECT * FROM;
+-- Parser: "FROM 後面沒接東西？這不合語法 → syntax error"
+```
+
+### IV. Parser 的兩步驟：斷詞 → 建樹
+
+Parser 內部其實分了兩個小步驟，就像人讀句子一樣：
+
+```mermaid
+flowchart LR
+    subgraph Tokenizer["步驟 1：斷詞（Tokenizer / Lexer）"]
+        T1["把 SQL 字串切成\n一個一個 token\n──────────\nSELECT / name / , / age\n/ FROM / users / WHERE\n/ id / = / 1 / ;"]
+    end
+
+    subgraph Grammar["步驟 2：建樹（Grammar Parser）"]
+        G1["按照 SQL 語法規則\n把 token 組合成樹\n──────────\n看到 SELECT 開頭 →\n後面應該是欄位列表\n看到 FROM →\n後面應該是表名\n看到 WHERE →\n後面應該是條件"]
+    end
+
+    Raw["SELECT name, age FROM users WHERE id = 1;"]
+    Tokens["Token 串流\n[SELECT][name][,][age][FROM][users][WHERE][id][=][1][;]"]
+    Tree["Parse Tree"]
+
+    Raw --> Tokenizer --> Tokens --> Grammar --> Tree
+
+    style Tokenizer fill:#f3e5f5,stroke:#7b1fa2
+    style Grammar fill:#e8eaf6,stroke:#3949ab
+    style Raw fill:#fff9c4,stroke:#f9a825
+    style Tree fill:#e8f5e9,stroke:#388e3c
+```
+
+> **補充（Senior Dev）**：Parser 的原始碼使用 `flex`（斷詞）和 `bison`（建樹）這兩個經典工具自動生成。PG 的 SQL 語法規格非常龐大，語法檔案（`gram.y`）有超過 15,000 行。
 >
-> 重要區別：`EXPLAIN (ANALYZE, VERBOSE)` 中的 `Output` 欄位顯示的是 analyzer 處理後的 column list（已展開、已 cast），不是 raw SQL 的原始寫法。
->
-> PG 的 rewrite system 允許 recursive rewrite。當一個 query tree 被 rewrite 後，新的 tree 會再次經過 rewrite 階段，直到沒有更多 rule 可以觸發。PG 以 `max_rewrite_depth` 做保護（超出即報錯）。
+> Debug 技巧：如果你好奇 PG 內部 parse 完長什麼樣，可以在自己的 session 中執行：
+> ```sql
+> SET debug_print_parse = on;
+> SET debug_pretty_print = on;   -- 讓輸出有縮排，比較好讀
+> SELECT * FROM users WHERE id = 1;
+> -- parse tree 會印在 server log 裡（不是 client 端）
+> ```
+> 注意這只在開發時用，production 開下去 log 會被灌爆。
+
+## 4. Analyzer（語義分析與改寫）
+
+### I. Analyzer 在做什麼？一句話：把「語法樹」變成「有語義的查詢」
+
+還記得 Parser 產出的 parse tree **完全不檢查語義**嗎？Parser 只確認你寫的 SQL「文法正確」，但不保證「語義合理」。Analyzer 接手 parse tree 後，做的事情就是在回答以下問題：
+
+```mermaid
+flowchart TD
+    PT["🌳 Parse Tree\n（只有語法結構\n不知道表在不在、\n型別對不對）"]
+
+    Check["🔍 Analyzer\n語義分析 + 改寫"]
+
+    Q["📦 Query Object\n（含完整語義資訊\n表名、欄位名、型別\n全部確認完畢）"]
+
+    PT --> Check --> Q
+
+    subgraph Questions["Analyzer 回答的問題"]
+        Q1["❓ users 這張表真的存在嗎？"]
+        Q2["❓ name 真的是 users 的欄位嗎？"]
+        Q3["❓ WHERE id = 1，id 是整數、\n1 也是整數，型別配對 OK 嗎？"]
+        Q4["❓ SELECT *，* 到底代表哪些欄位？"]
+        Q5["❓ users 其實是一個 View？\n如果是，幫我把 View 展開成真正的表"]
+    end
+
+    Check --- Questions
+
+    style PT fill:#e8f5e9,stroke:#388e3c
+    style Check fill:#e1f5fe,stroke:#0288d1
+    style Q fill:#fff3e0,stroke:#f57c00
+    style Questions fill:#f5f5f5,stroke:#9e9e9e
+```
+
+### II. Analyzer 的六大職責
+
+Analyzer 不是只做一件事，而是分六個面向把 parse tree「補完」：
+
+```mermaid
+flowchart TD
+    PT["Parse Tree 輸入"]
+
+    subgraph Duties["Analyzer 六大職責"]
+        D1["🔎 欄位/表名解析\n• SELECT * → 展開成實際欄位\n• 檢查表是否存在\n• 檢查欄位是否屬於該表"]
+        D2["🔄 View 展開\n• 把 View 參考\n  替換成真實表查詢"]
+        D3["🔢 型別推斷\n• 'abc' 是什麼型別？\n• 42 + 3.14 → 自動轉型"]
+        D4["📝 預設值補全\n• INSERT 漏掉的欄位\n  自動補 DEFAULT 值"]
+        D5["📐 Rule 改寫\n• CREATE RULE 定義的規則\n• PG 內部用 Rule\n  來實現 View"]
+        D6["🔄 遞迴改寫\n• 改寫後的查詢可能\n  還能繼續被改寫\n• 直到沒有 Rule 可觸發"]
+    end
+
+    Q["Query Object 輸出"]
+
+    PT --> Duties --> Q
+
+    style PT fill:#e8f5e9,stroke:#388e3c
+    style Duties fill:#e1f5fe,stroke:#0288d1
+    style Q fill:#fff3e0,stroke:#f57c00
+```
+
+### III. 實際案例 1：View 展開（最經典的改寫）
+
+View 是 SQL 中最常見的「虛擬表」。你寫的時候把它當成表來查，但 Analyzer 會在背後幫你把 View **展開**成真正的查詢：
+
+```mermaid
+flowchart TD
+    Before["✍️ 你寫的 SQL\n──────────\nSELECT * FROM \nactive_users\nWHERE city = 'Taipei'"]
+
+    View["📋 當初 CREATE VIEW：\n──────────\nCREATE VIEW active_users AS\n  SELECT * FROM users\n  WHERE status = 'active'"]
+
+    After["🔄 Analyzer 改寫後的 SQL（等價）\n──────────\nSELECT * FROM users\nWHERE status = 'active'\n  AND city = 'Taipei'"]
+
+    Before --> View --> After
+
+    style Before fill:#fff9c4,stroke:#f9a825
+    style View fill:#e8eaf6,stroke:#3949ab
+    style After fill:#e8f5e9,stroke:#388e3c
+```
+
+> **白話解釋**：你查 `active_users`，Analyzer 把你當初 `CREATE VIEW` 時寫的 SQL 拿出來「貼回去」，再跟你這次加的 `WHERE city = 'Taipei'` 合併在一起。最終 Planner 看到的是一條直接查 `users` 表的 SQL，View 已經不見了。
+
+### IV. 實際案例 2：`*` 展開與型別推斷
+
+```mermaid
+flowchart TD
+    Before["✍️ 你寫的 SQL\n──────────\nSELECT *\nFROM users\nWHERE age = 18"]
+
+    A1["🔎 步驟 1：* 展開\n──────────\n查系統目錄 → 找出\nusers 表有哪些欄位\n結果：id, name, age, email\n→ 自動展開為\nSELECT id, name, age, email"]
+
+    A2["🔢 步驟 2：型別推斷\n──────────\nusers.age 是 integer\n18 是數字 → 也是 integer\n型別一致，不需要轉換\n（如果不一致，會自動插入 CAST）"]
+
+    After["📦 Analyzer 處理後\n──────────\nSELECT id, name, age, email\nFROM users\nWHERE age = 18\n（* 已展開、型別已確認）"]
+
+    Before --> A1 --> A2 --> After
+
+    style Before fill:#fff9c4,stroke:#f9a825
+    style A1 fill:#e3f2fd,stroke:#1565c0
+    style A2 fill:#f3e5f5,stroke:#7b1fa2
+    style After fill:#e8f5e9,stroke:#388e3c
+```
+
+**更具體的例子 —— 型別不匹配時的自動轉換：**
+
+```sql
+-- 你寫的 SQL
+SELECT * FROM users WHERE name = 123;
+--            ^^^^                ^^^
+--            text 型別          integer 型別  ← 不匹配！
+
+-- Analyzer 自動處理：
+-- → 把 123 轉成文字 '123'
+-- → 實際上變成: WHERE name = '123'::text
+-- 這個隱式轉換你沒寫，但 Analyzer 幫你加了
+```
+
+### V. 實際案例 3：INSERT 預設值補全
+
+```sql
+CREATE TABLE users (
+    id       SERIAL PRIMARY KEY,
+    name     TEXT NOT NULL,
+    created  TIMESTAMP DEFAULT now()
+);
+
+-- 你只指定了 name
+INSERT INTO users (name) VALUES ('Alice');
+
+-- Analyzer 自動補全為：
+-- INSERT INTO users (id, name, created)
+-- VALUES (nextval('users_id_seq'), 'Alice', now())
+--        ^^^^^^^^^^^^^^^^^^^^^^^          ^^^^^^
+--        自動補的 SERIAL 值              自動補的 DEFAULT 值
+```
+
+### VI. Rule 系統與遞迴改寫
+
+PG 內部用一套叫「Rule 系統」的機制來實現 View 和其他改寫邏輯。改寫可能不只一層：
+
+```mermaid
+flowchart TD
+    Start["📦 Parse Tree 輸入"]
+    Rewrite["🔄 檢查有沒有\n適用的 Rule？"]
+    Apply["✏️ 套用 Rule 改寫\n（例如展開 View）"]
+    Check{"改寫完的結果\n還能再套 Rule 嗎？"}
+    Depth{"遞迴次數\n超過上限？"}
+    Done["✅ 輸出 Query Object"]
+    Error["❌ 報錯：改寫太深\n（超過 max_rewrite_depth）"]
+
+    Start --> Rewrite
+    Rewrite -->|"有 Rule"| Apply
+    Rewrite -->|"沒有 Rule"| Done
+    Apply --> Check
+    Check -->|"還有"| Depth
+    Check -->|"沒了"| Done
+    Depth -->|"未超過"| Rewrite
+    Depth -->|"超過"| Error
+
+    style Start fill:#e8f5e9,stroke:#388e3c
+    style Done fill:#fff3e0,stroke:#f57c00
+    style Error fill:#ffebee,stroke:#c62828
+```
+
+> **例子**：View A 查 View B，View B 查 View C...
+> ```sql
+> CREATE VIEW v_a AS SELECT * FROM v_b;
+> CREATE VIEW v_b AS SELECT * FROM v_c;
+> CREATE VIEW v_c AS SELECT * FROM users;
+> -- SELECT * FROM v_a
+> -- → 展開 v_a → 裡面有 v_b → 展開 v_b → 裡面有 v_c → 展開 v_c → users
+> -- 這就是遞迴改寫的典型案例
+> ```
+
+> **補充（Senior Dev）**：
+> - `EXPLAIN (ANALYZE, VERBOSE)` 中的 `Output` 欄位，顯示的是 Analyzer 處理**之後**的欄位列表（`*` 已展開、型別已轉換），不是你原始 SQL 寫的樣子。
+> - 如果你好奇 Analyzer 改寫完長什麼樣，可以用 `SET debug_print_rewritten = on` 輸出到 server log。
+> - `CREATE VIEW` 在 PG 內部其實就是建立一條 `_RETURN` Rule。View 不是實體資料，只是一個「查詢模板」。
 
 ## 5. Planner (Query Optimization)
 
-Analyzed Query object 傳入 Planner，生成 **plan tree**（node types 見 `plannodes.h`）。
+前面 Analyzer 已經把 SQL 轉成結構化的 Query 物件了。但 **"怎麼執行"** 還沒決定 —— 這就是 Planner 的工作。
 
-```
-Query → Planner → Plan Tree
+### I. 一句話理解 Planner
+
+> **Planner 就像導航軟體：你告訴它目的地（SQL），它幫你規劃最快路線（執行計畫）。**
+
+假設你要從台北到高雄，導航軟體會比較：
+- 走高鐵（快速但貴）vs 開車（慢但靈活）vs 搭客運（便宜但更慢）
+- Planner 做的事完全一樣：比較不同的 "怎麼讀資料" 的方法，挑成本最低的那個
+
+```mermaid
+flowchart LR
+    subgraph Input["輸入"]
+        Q["Query 物件\n（Analyzer 的輸出）\n\nSELECT * FROM users\nWHERE city = 'Taipei'\nORDER BY created_at"]
+    end
+
+    subgraph PlannerBox["Planner（導航軟體）"]
+        direction TB
+        S["📊 查統計資訊\n（這張表多大？有多少 row？\nindex 有哪些？資料分布？）"]
+        G["💰 估算每個方案的「成本」\n（cost = I/O 成本 + CPU 成本）"]
+        C["✅ 選出成本最低的計畫"]
+    end
+
+    subgraph Output["輸出"]
+        PT["Plan Tree（執行計畫）\n\n1. Index Scan（用 city index）\n2. Sort（依 created_at 排序）\n3. 回傳結果"]
+    end
+
+    Q --> PlannerBox
+    PlannerBox --> PT
+
+    style Input fill:#e8f5e9,stroke:#388e3c
+    style PlannerBox fill:#fff3e0,stroke:#f57c00
+    style Output fill:#e1f5fe,stroke:#0288d1
 ```
 
-### I. 三種掃描策略範例
+### II. 三種讀資料的方法（Scan Strategies）
+
+一張表有很多 row，你要怎麼從硬碟裡找出符合條件的 row？Planner 有三種選擇：
+
+```mermaid
+flowchart TD
+    subgraph Seq["Seq Scan（全表掃描）"]
+        S1["從硬碟第一頁開始"]
+        S2["一頁一頁往後讀"]
+        S3["每讀一頁就檢查每一 row"]
+        S4["符合條件的留下，其餘丟掉"]
+        S1 --> S2 --> S3 --> S4
+    end
+
+    subgraph Idx["Index Scan（索引掃描）"]
+        I1["先查 B-tree Index\n（找到 key 的位置）"]
+        I2["直接跳到對應的 heap page"]
+        I3["讀取那一 row 的完整資料"]
+        I1 --> I2 --> I3
+    end
+
+    subgraph Bmp["Bitmap Scan（點陣圖掃描）"]
+        B1["先查 Index\n（標記所有符合的 row 位置）"]
+        B2["把位置整理成 bitmap\n（避免重複讀同一頁）"]
+        B3["按順序讀取 heap page\n（把 random I/O 變 sequential）"]
+        B1 --> B2 --> B3
+    end
+
+    style Seq fill:#ffebee,stroke:#c62828
+    style Idx fill:#e8f5e9,stroke:#2e7d32
+    style Bmp fill:#fff3e0,stroke:#ef6c00
+```
+
+**類比幫助理解：**
+
+| 掃描方式 | 日常類比 | 適合情境 |
+|----------|---------|---------|
+| **Seq Scan** | 從書的第一頁翻到最後一頁找關鍵字 | 你要找的內容遍布全書（或不確定在哪） |
+| **Index Scan** | 翻目錄 → 直接跳到第 42 頁 | 你只要找一兩個特定條目 |
+| **Bitmap Scan** | 先翻目錄標記所有相關頁碼 → 再一次翻過去 | 要翻很多頁，但不希望來回亂跳傷硬碟 |
+
+**Planner 怎麼選？看一個例子：**
 
 ```sql
-CREATE TABLE planz (id integer, data text);
-EXPLAIN ANALYZE SELECT * FROM planz WHERE id = 42;
+-- 假設 users 表有 100 萬 row、city 欄位有 index
+SELECT * FROM users WHERE city = 'Taipei';
 ```
 
-Without index（Seq Scan）：
-```
- Seq Scan on planz  (cost=0.00..34.00 rows=2400 width=4)
+```mermaid
+flowchart TD
+    Stats["查統計資訊\n────────\n• Taipei 佔 40% row → 40 萬 row\n• 整表 100 萬 row\n• Index 存在，分布均勻"]
+
+    Estimate["估算成本\n────────\nSeq Scan 成本 ≈ 40 萬 row × 連續讀取\n（低 unit cost × 高 row 數）\n\nIndex Scan 成本 ≈ 40 萬 row × 隨機讀取\n（高 unit cost × 高 row 數）"]
+
+    Decision{"哪個成本低？"}
+    SeqPick["選 Seq Scan\n（40% 覆蓋率太高，\n隨機讀取 40 萬次不划算）"]
+    IdxPick["選 Index Scan\n（只取極少 row，\n隨機讀取幾次很划算）"]
+
+    Stats --> Estimate --> Decision
+    Decision -->|"覆蓋率高"| SeqPick
+    Decision -->|"覆蓋率低"| IdxPick
+
+    style SeqPick fill:#ffebee,stroke:#c62828
+    style IdxPick fill:#e8f5e9,stroke:#2e7d32
 ```
 
-With index（Bitmap Heap Scan）：
+### III. 多張表時：怎麼 Join？
+
+單表查詢很簡單，但真實世界一定有 JOIN。Planner 要決定兩件事：
+
+> 1. **Join 順序**：A JOIN B JOIN C，先 JOIN 誰？
+> 2. **Join 方法**：用什麼演算法把兩張表合在一起？
+
+```mermaid
+flowchart TD
+    subgraph Order["問題 1：Join 順序"]
+        O1["SELECT * FROM a\nJOIN b ON a.id = b.a_id\nJOIN c ON b.id = c.b_id\nWHERE a.name = 'Henry'"]
+        O2["方案 A：a → b → c\n（a 先過濾只剩 1 row →\nb 只取相關 row → c 只取相關 row）"]
+        O3["方案 B：c → b → a\n（c 全表 100 萬 row →\nb JOIN 100 萬 → a JOIN 100 萬）"]
+        O4["✅ 方案 A 成本遠低於方案 B"]
+        O1 --> O2
+        O1 --> O3
+        O2 --> O4
+        O3 --> O4
+    end
+
+    style Order fill:#e8f5e9,stroke:#388e3c
 ```
- Bitmap Heap Scan on planz  (cost=4.20..13.67 rows=6 width=36)
-   Recheck Cond: (id = 42)
-   ->  Bitmap Index Scan on planz_id_index
-         (cost=0.00..4.20 rows=6 width=0)
-         Index Cond: (id = 42)
+
+**三種 Join 方法：**
+
+以下三種 Join，指的是 PG **內部怎麼實作** `JOIN ... ON`。不管你的 SQL 寫 `INNER JOIN`、`LEFT JOIN`、`CROSS JOIN`，Planner 都會從這三種演算法中選一種來執行。你不需要在 SQL 裡指定用哪種——Planner 自動選。
+
+**一句話先講完三種的差別：**
+
+| 方法 | 一句話比喻 | SQL 開發者要記的 |
+|------|-----------|-----------------|
+| **Nested Loop** | 像翻電話簿找人：拿名單上每個人名，去電話簿從頭翻到尾找電話 | 有一邊很小（幾 row）就很快 |
+| **Hash Join** | 像查字典：先把小表建成查詢表，大表直接 O(1) 查 | 兩邊都大、沒 index 時的首選 |
+| **Merge Join** | 像兩個照字母排好的名單，同步往下對 | 兩邊都照 join key 排好序時最快 |
+
+```mermaid
+flowchart TD
+    subgraph NL["Nested Loop Join\n（巢狀迴圈）"]
+        NL1["for each row in 左表:"]
+        NL2["    for each row in 右表:"]
+        NL3["        if 條件符合 → 輸出"]
+        NL1 --> NL2 --> NL3
+    end
+
+    subgraph HJ["Hash Join\n（雜湊合併）"]
+        HJ1["1. 把較小的表建 Hash Table\n（key = join 欄位, value = row）"]
+        HJ2["2. 掃描大表，對每一 row\n查 Hash Table 找配對"]
+        HJ3["3. Hash 查詢 O(1)，很快"]
+        HJ1 --> HJ2 --> HJ3
+    end
+
+    subgraph MJ["Merge Join\n（合併排序）"]
+        MJ1["1. 兩表先各自照 join 欄位排序\n（如果已有 index 就免排）"]
+        MJ2["2. 像拉鍊一樣，兩個有序佇列\n同步推進，找出配對"]
+        MJ1 --> MJ2
+    end
+
+    style NL fill:#e3f2fd,stroke:#1565c0
+    style HJ fill:#fff3e0,stroke:#ef6c00
+    style MJ fill:#f3e5f5,stroke:#7b1fa2
 ```
 
-Planner 根據 cost model 在 `IndexScan` 與 `SeqScan` 之間選擇。
+| Join 方法 | 一句話 | 適合情境 | 啟動速度 |
+|-----------|--------|---------|---------|
+| **Nested Loop** | 雙層 for 迴圈 | 左表很小（如過濾後剩幾 row） | 立刻有輸出 |
+| **Hash Join** | 小表建 HashMap → 大表去查 | 無 index，兩表都很大 | 要等 Hash Table 建完 |
+| **Merge Join** | 兩個已排序的隊伍同步前進 | 兩邊已依 join key 排好序 | 要等排序完成 |
 
-| 概念 | 說明 |
-|------|------|
-| 演算法 | cost-based（`geqo` 參數控制 table 數量超過閾值時切換為 genetic algorithm） |
-| 輸出 | plan tree，每個 node 對應一種 execution strategy |
-| Debug | `SET debug_print_plan = on` |
+### IV. Planner 的「成本」到底是什麼？
 
-> 補充（Senior Dev）：Planner 的核心成本參數：
+Planner 不是用 "秒" 來估算，而是用一個**沒有單位的數字**。這個數字大致反映執行所需的 I/O + CPU 資源：
+
+```
+total_cost = (讀取頁數 × 每頁成本) + (處理 row 數 × 每 row 成本)
+```
+
+**關鍵參數（GUC）—— Planner 對世界的假設：**
+
+```mermaid
+flowchart TD
+    subgraph IO["I/O 成本（硬碟讀取）"]
+        direction LR
+        SC["seq_page_cost = 1.0\n連續讀 1 頁的代價\n（基準值）"]
+        RC["random_page_cost = 4.0\n隨機讀 1 頁的代價\n（= 連續讀的 4 倍）"]
+    end
+
+    subgraph CPU["CPU 成本（資料處理）"]
+        direction LR
+        CT["cpu_tuple_cost = 0.01\n處理 1 row 的 CPU 代價"]
+        CIT["cpu_index_tuple_cost = 0.005\n處理 1 筆 index entry 的代價"]
+        CO["cpu_operator_cost = 0.0025\n執行 1 次比對/運算的代價"]
+    end
+
+    subgraph Memory["記憶體假設"]
+        EC["effective_cache_size = 4GB\nPlanner 假設 OS 快取\n已經裝了這麼多資料\n\n⚠️ 不真的分配記憶體！\n只是讓 Planner 在估算時\n「認為」這些資料已在記憶體中"]
+    end
+
+    IO --> CPU --> Memory
+
+    style IO fill:#e3f2fd,stroke:#1565c0
+    style CPU fill:#e8f5e9,stroke:#2e7d32
+    style Memory fill:#fff3e0,stroke:#ef6c00
+```
+
+> **為什麼這很重要？** 如果你的 DB 跑在 SSD 上，`random_page_cost = 4.0` 就太悲觀了（SSD 的 random I/O 很快）。不改的話 Planner 會**過度偏好 Seq Scan**，明明用 Index 更快卻不選。SSD 環境建議調成 `1.1 ~ 1.5`。
+
+### V. 當表太多時：從「精算」變「估算」
+
+Planner 的預設策略是**窮舉搜尋所有可能的 Join 順序**（Dynamic Programming），保證找到最優解。但這在太多表時會爆炸：
+
+```
+2 張表 → 2 種順序
+5 張表 → 120 種順序
+10 張表 → 362 萬種順序  ← 還能窮舉
+12 張表 → 4.79 億種順序  ← 太慢了！
+```
+
+```mermaid
+flowchart TD
+    Count{"有幾張表要 JOIN？"}
+    DP["窮舉搜尋\n（Dynamic Programming）\n保證找到最優解\n但表越多越慢（指數成長）"]
+    GEQO["遺傳演算法\n（Genetic Query Optimizer）\n用演化計算「找近似最優」\n不求完美，只求快"]
+    Plan1["✅ 最優計畫"]
+    Plan2["✅ 接近最優計畫\n（可能是最優，不保證）"]
+
+    Count -->|"< 12 張表（geqo_threshold）"| DP
+    Count -->|">= 12 張表"| GEQO
+    DP --> Plan1
+    GEQO --> Plan2
+
+    style DP fill:#e8f5e9,stroke:#2e7d32
+    style GEQO fill:#fff3e0,stroke:#ef6c00
+```
+
+> 如果你在跑 OLAP / 資料倉儲查詢（常常 JOIN 很多表），可以調高 `geqo_threshold` 讓 Planner 跑窮舉更久、換取更好的計畫。但注意：Plan Time 會指數級上升。
+
+### VI. Planner 階段總覽
+
+```mermaid
+flowchart TD
+    Q["Query 物件\n（從 Analyzer 來）"]
+
+    subgraph PlannerFlow["Planner 內部流程"]
+        S1["1. 查統計資訊\n（pg_statistic）\n\n- 表有多少 row？\n- Index 有哪些？\n- 每個欄位的值如何分布？"]
+        S2["2. 估算每種 Scan 成本\n（Seq / Index / Bitmap）\n\n- 依照 cost 參數計算\n- 比較各方案成本"]
+        S3["3. 決定 Join 順序\n\n- N 張表 → N! 種可能\n- ≤12 張：窮舉最優\n- >12 張：遺傳演算法近似"]
+        S4["4. 決定 Join 方法\n（NestLoop / Hash / Merge）\n\n- 依表大小、有無 index 選擇"]
+        S5["5. 選出總成本最低的 Plan\n\n- 輸出 Plan Tree\n- 每個 node 是一個執行步驟"]
+    end
+
+    PT["Plan Tree\n（交給 Executor 執行）"]
+
+    Q --> S1 --> S2 --> S3 --> S4 --> S5 --> PT
+
+    style Q fill:#e8f5e9,stroke:#388e3c
+    style PlannerFlow fill:#fff3e0,stroke:#f57c00
+    style PT fill:#e1f5fe,stroke:#0288d1
+```
+
+> **補充（Senior Dev）**：`effective_cache_size` **不分配任何記憶體**，只是 Planner 用來計算 "有多少 page 可能在 OS cache 中" 的假設。設越大，Planner 越傾向 Index Scan（因為它「認為」大部分 index page 已經在記憶體中，讀取成本低）。實際值應設為 `shared_buffers + OS filesystem cache`，一般建議設為總 RAM 的 50%~75%。
 >
-> | GUC | 預設 | 影響 |
-> |-----|------|------|
-> | `random_page_cost` | 4.0 | random disk read 成本（SSD 建議 1.1-1.5） |
-> | `seq_page_cost` | 1.0 | sequential disk read 成本 |
-> | `cpu_tuple_cost` | 0.01 | 處理每個 row 的 CPU 成本 |
-> | `cpu_index_tuple_cost` | 0.005 | 處理每個 index entry 的成本 |
-> | `effective_cache_size` | 4GB | planner 假設在 OS page cache 中的 page 數 |
->
-> `effective_cache_size` 不分配任何 memory，只是讓 planner **假設這麼多 data 已在 cache**。值越大，planner 越傾向用 Index Scan。應設為 `shared_buffers + OS filesystem cache` 的總和（通常是總 RAM 的 50-75%）。
->
-> `geqo` (Genetic Query Optimizer) 的預設觸發閾值是 `geqo_threshold = 12`。對於 OLAP / data warehouse，你可能需要調高讓 exhaustive search 跑久一點以獲取更好的 plan。
->
-> `join_collapse_limit` 和 `from_collapse_limit` 控制 join order 的搜索範圍。預設值 `8` 對大多數場景足夠；10+ table join 可以逐步調高（注意 plan time 會呈指數增長）。
+> `join_collapse_limit` 和 `from_collapse_limit` 控制 Planner 在 Join Order 搜尋上的自由度。預設 `8` 對大多數場景夠用；如果你有 10+ table JOIN，可以逐步調高，但 Plan Time 會呈指數增長。
 
 ## 6. Executor
 
-Plan tree 傳入 Executor 後，最終進入 `execMain.c:ExecutePlan`。
+**一句話講完**：Planner 畫好施工藍圖（Plan Tree），Executor 就是真正「動手施工」的角色。
 
-### I. Volcano Model（Pull-based）
+### I. 先建立直覺：Executor 在做什麼？
 
-Executor 採用 **pull-based iterator model**（Volcano model）。每個 plan node 都是一個 iterator，由 parent node 從 child node "pull" 資料：
+假設這條 SQL：
 
-```
-ExecutePlan → 遞迴呼叫 execProcNode(node)
-    → 每個 node 輸出 tuple
-    → parent node 以此為 input
-    → root node 輸出 = final query result
+```sql
+SELECT id, name FROM users WHERE age > 18 ORDER BY id LIMIT 10;
 ```
 
-執行順序是 top-down（pull）+ bottom-up（return tuple）。
+Planner 給的施工藍圖長這樣（從上往下讀）：
 
-### II. Executor State Nodes
+```
+Limit（只要 10 筆）
+  └─ Sort（依 id 排序）
+       └─ Filter（age > 18）
+            └─ SeqScan（把 users 表每一行都讀出來）
+```
 
-Executor 為每個 plan node 建立對應的 executor state node（`execnodes.h`）。
+Executor 的工作就是把這張藍圖「真的跑一遍」——實實在在去硬碟讀資料、過濾、排序、截斷，最後把 10 行結果交出來。
 
-| 概念 | Source | 說明 |
-|------|--------|------|
-| Plan Node | `plannodes.h` | planner 的輸出，"what to do" |
-| Executor Node | `execnodes.h` | executor 的 runtime state，"where we are" |
-| Entry | `execProcnode.c:ExecProcNode` | switch-case dispatch 每個 node type 的分發邏輯 |
+### II. 核心模型：Volcano Model（Pull-Based 迭代器）
 
-> 補充（Senior Dev）：Volcano model 的核心是每個 node 實現 `ExecInitNode`、`ExecProcNode`、`ExecEndNode` 三個接口。這使得 plan tree 可以任意嵌套組合（如 `Sort → HashAgg → SeqScan`），每個 node 只關心從 child pull 資料再做自己的處理。
->
-> PG 9.6+ 引入 Parallel Query：`Gather` node 作為 plan tree 的 root，底下的 partial plan 被 `N` 個 parallel worker 同時執行。`ExecGather` 從每個 worker 的 `TupleQueue` pull tuple 合併輸出。
->
-> PG 11+ 引入 JIT compilation（基於 LLVM）：ExecProcNode 的 tight loop（如 `WHERE` clause evaluation）在滿足 `jit_above_cost` 閾值時被 JIT compile 為 native code，對 CPU-bound query 的加速顯著（通常 10-30%）。
->
-> 關於 Portal：
-> - **Unnamed Portal**：`exec_simple_query` 建立的預設 portal，一次性執行全部 plan
-> - **Named Portal**：`DECLARE CURSOR` 建立，可分段 fetch
-> - Portal 本質是 executor state 的 holder，記錄目前執行到 plan tree 的哪個位置
+Executor 最核心的設計叫做 **Volcano Model**（也稱 pull-based iterator model）。把它想像成一條「**接力賽 + 反向吸管**」：
+
+- **每個 node 都是一個迭代器**，它只做一件事：**吐出下一筆資料（tuple）**
+- **上層 node 找下層 node 要資料**（pull），而不是下層往上推（push）
+- 請求一路往下傳到最底層（讀硬碟）→ 資料一路往上傳回最頂層（回傳 client）
+
+```mermaid
+flowchart TD
+    Root["🔵 Limit Node\n「給我下一筆（要 10 次）」"]
+    Sort["🟢 Sort Node\n「我先跟底下全部要完、\n排好序，再依序往上給」"]
+    Filter["🟡 Filter Node\n「給我下一筆 → 檢查 age>18？\n是就往上傳、不是就丟掉」"]
+    Scan["🔴 SeqScan Node\n「真的去硬碟讀下一行」"]
+
+    Root -->|"1. pull: 給我下一筆"| Sort
+    Sort -->|"2. pull: 給我下一筆（很多次）"| Filter
+    Filter -->|"3. pull: 給我下一筆"| Scan
+    Scan -.->|"4. return: {id=5, name=Bob}"| Filter
+    Filter -.->|"5. return: age=22 ✓ 通過"| Sort
+    Sort -.->|"6. return: 排序後的第 1 筆"| Root
+
+    style Root fill:#bbdefb,stroke:#1976d2
+    style Sort fill:#c8e6c9,stroke:#388e3c
+    style Filter fill:#fff9c4,stroke:#f9a825
+    style Scan fill:#ffcdd2,stroke:#c62828
+```
+
+**三種 node 的行為差異**：
+
+```mermaid
+flowchart LR
+    subgraph PassThrough["🟢 透傳型（Filter、Limit）"]
+        P1["pull child 一筆"]
+        P2["處理（過濾/計數）"]
+        P3["往上傳（或丟掉）"]
+        P1 --> P2 --> P3
+    end
+
+    subgraph Blocking["🟡 阻塞型（Sort、HashAgg）"]
+        B1["pull child 全部"]
+        B2["一口氣處理（排序/建 hash）"]
+        B3["再依序往上傳"]
+        B1 --> B2 --> B3
+    end
+
+    subgraph Leaf["🔴 葉子型（SeqScan、IndexScan）"]
+        L1["直接讀硬碟/記憶體"]
+        L2["往上傳"]
+        L1 --> L2
+    end
+
+    style PassThrough fill:#c8e6c9,stroke:#2e7d32
+    style Blocking fill:#fff9c4,stroke:#f57f17
+    style Leaf fill:#ffcdd2,stroke:#c62828
+```
+
+> **關鍵差異**：「阻塞型」node（Sort、HashAgg）必須先把 child 的資料**全部**讀完才能開始輸出——這就是為什麼 `ORDER BY` 在大表上會很慢，因為 Sort node 在輸出第一筆之前，得先把所有資料都拉進來排好。
+
+### III. Plan Node（藍圖）vs Executor State Node（施工現場）
+
+Planner 輸出的是「藍圖」（Plan Tree，寫著「這裡要排序、那裡要過濾」），但藍圖沒有記錄「排到第幾行了」。
+
+Executor 接手後，會為每個藍圖 node 建立對應的「施工現場記錄」（Executor State Node），記錄「跑到哪了」。
+
+```mermaid
+flowchart TD
+    subgraph Plan["📋 Plan Tree（藍圖）"]
+        P_Root["Limit Node\nplan: 只要 10 筆"]
+        P_Sort["Sort Node\nplan: 照 id 排序"]
+        P_Filter["Filter Node\nplan: age > 18"]
+        P_Scan["SeqScan Node\nplan: 掃描 users 表"]
+    end
+
+    subgraph Exec["🏗️ Executor State Tree（施工現場）"]
+        E_Root["Limit State\n已經輸出: 3 筆\n還要: 7 筆"]
+        E_Sort["Sort State\n暫存: 已排好 5000 筆\n下次給第 4 筆"]
+        E_Filter["Filter State\n本輪統計: 讀了 8000 筆\n通過了 5000 筆"]
+        E_Scan["SeqScan State\n目前讀到: 第 8001 筆\n總共: 100000 筆"]
+    end
+
+    P_Root -.->|"對應"| E_Root
+    P_Sort -.->|"對應"| E_Sort
+    P_Filter -.->|"對應"| E_Filter
+    P_Scan -.->|"對應"| E_Scan
+
+    P_Root --> P_Sort --> P_Filter --> P_Scan
+    E_Root --> E_Sort --> E_Filter --> E_Scan
+
+    style Plan fill:#e3f2fd,stroke:#1565c0
+    style Exec fill:#fff3e0,stroke:#e65100
+```
+
+> **一句話區分**：Plan Tree 是「要做什麼」，Executor State Tree 是「做到哪裡了」。
+
+### IV. 每個 Node 的三個生命週期
+
+無論哪種 node，Executor 都用同一套 SOP 來操作它：
+
+```mermaid
+flowchart LR
+    Init["🔧 初始化\n分配記憶體、開啟檔案\n準備工作環境"]
+    Proc["▶️ 執行\n不斷 pull child → 處理 → 往上傳\n（一個迴圈跑到沒資料為止）"]
+    End["🧹 清理\n關閉檔案、釋放記憶體\n收拾乾淨"]
+
+    Init --> Proc --> End
+
+    style Init fill:#e8f5e9,stroke:#388e3c
+    style Proc fill:#bbdefb,stroke:#1976d2
+    style End fill:#f3e5f5,stroke:#7b1fa2
+```
+
+這就是為什麼不同 node 可以像積木一樣任意組合——只要每個 node 都遵循這三個步驟，無論你疊 `Sort → HashAgg → SeqScan` 還是 `Limit → IndexScan`，Executor 都照樣運作。
+
+### V. Portal：執行進度的「書籤」
+
+當你查詢還沒跑完但想暫停（例如用 Cursor 一段一段 fetch 結果），PG 需要知道「上次跑到哪裡了」。這個記錄就叫 **Portal**。
+
+```mermaid
+flowchart LR
+    subgraph Book["📖 Portal = 書籤"]
+        B1["記錄目前執行到\nPlan Tree 的哪個位置"]
+        B2["記錄每個 node 的\nExecutor State 狀態"]
+        B3["下次 fetch 時\n從書籤位置繼續"]
+    end
+
+    subgraph Types["兩種 Portal"]
+        T1["未命名 Portal\n（一般查詢自動建立）\n一次性跑完就丟"]
+        T2["命名 Portal\n（DECLARE CURSOR 建立）\n可以分段 fetch"]
+    end
+
+    Book --> Types
+
+    style Book fill:#fff9c4,stroke:#f9a825
+```
+
+### VI. 進階特性：平行查詢（Parallel Query）
+
+大查詢可以用多個 worker 同時跑以加速：
+
+```mermaid
+flowchart TD
+    Gather["🟣 Gather Node（總管）\n從所有 worker 收集結果\n合併後往上傳"]
+
+    W1["🔵 Worker 1\n獨立跑 partial plan\n（處理表的前 1/3）"]
+    W2["🔵 Worker 2\n獨立跑 partial plan\n（處理表的中 1/3）"]
+    W3["🔵 Worker 3\n獨立跑 partial plan\n（處理表的後 1/3）"]
+
+    Gather -->|"pull 下一筆"| W1
+    Gather -->|"pull 下一筆"| W2
+    Gather -->|"pull 下一筆"| W3
+
+    style Gather fill:#e1bee7,stroke:#8e24aa
+    style W1 fill:#bbdefb,stroke:#1976d2
+    style W2 fill:#bbdefb,stroke:#1976d2
+    style W3 fill:#bbdefb,stroke:#1976d2
+```
+
+> 情境：`SELECT count(*) FROM big_table` → Planner 在 plan tree 頂部放一個 Gather node，底下三個 worker 各自掃 1/3 的表，各自算出 partial count，Gather 再彙總。
+
+### VII. 進階特性：JIT 編譯（Just-In-Time Compilation）
+
+某些查詢的瓶頸是 CPU（例如 `WHERE` 條件裡有複雜的數學運算），每次處理一行都要重新解釋執行。
+
+JIT 把這些「熱點迴圈」在執行期直接編譯成機器碼，跳過解釋執行的 overhead：
+
+```mermaid
+flowchart LR
+    Without["❌ 無 JIT\n每筆 row 都要：\n讀指令 → 解釋 → 執行\n（像朗讀 vs 默讀）"]
+    With["✅ 有 JIT\n熱點迴圈編譯成機器碼\n直接跑 native code\n（快 10-30%）"]
+
+    Without -->|"編譯"| With
+
+    style Without fill:#ffebee,stroke:#c62828
+    style With fill:#e8f5e9,stroke:#2e7d32
+```
+
+> JIT 不是萬靈丹——它對 **CPU-bound** 的查詢有效（大量數學運算、複雜 WHERE），對 **I/O-bound** 的查詢（瓶頸在讀硬碟）幾乎無感。
+
+### VIII. Executor 完整流程總覽
+
+```mermaid
+flowchart TD
+    Start["📋 Planner 交付 Plan Tree（藍圖）"]
+    Build["🏗️ 建立 Executor State Tree\n（為每個 plan node 建立施工現場記錄）"]
+    Init["🔧 依序初始化每個 node\n（分配記憶體、開啟檔案）"]
+
+    Loop["▶️ 進入主迴圈\nRoot node pull 下一筆 →\n請求一路往下傳到最底層 →\n資料一路往上回傳 →\n輸出給 client"]
+
+    End{"沒有更多資料了？"}
+    Clean["🧹 依序清理每個 node\n（關檔、釋放記憶體）"]
+    Done["✅ 查詢結束"]
+
+    Portal["📖 Portal（書籤）\n記錄目前跑到哪\n讓分段 fetch 變可能"]
+    Gather["🟣 Gather Node（平行）\n多 worker 同時跑"]
+    JIT["⚡ JIT 編譯\n熱點迴圈 → 機器碼"]
+
+    Start --> Build --> Init --> Loop
+    Loop --> End
+    End -->|"是"| Clean --> Done
+    End -->|"否"| Loop
+
+    Loop -.->|"暫停/分段"| Portal
+    Loop -.->|"平行加速"| Gather
+    Loop -.->|"CPU 加速"| JIT
+
+    style Start fill:#e3f2fd,stroke:#1565c0
+    style Build fill:#fff3e0,stroke:#e65100
+    style Init fill:#e8f5e9,stroke:#388e3c
+    style Loop fill:#bbdefb,stroke:#1976d2
+    style End fill:#fff9c4,stroke:#f9a825
+    style Clean fill:#f3e5f5,stroke:#7b1fa2
+    style Done fill:#c8e6c9,stroke:#388e3c
+    style Portal fill:#fce4ec,stroke:#c62828
+    style Gather fill:#e1bee7,stroke:#8e24aa
+    style JIT fill:#b2dfdb,stroke:#00695c
+```
 
 ## 7. Client Response
 
-Result tuple 在 `ExecutePlan` 內部發送給 client。
+前面 Executor 已經把所有資料都算出來了 —— 但這些資料要「送去哪裡」？這就是最後一個階段的工作。
 
-流程：
-1. `ExecProcNode` 產生每個 tuple
-2. Tuple 傳給 destination receiver 的 callback function
-3. 最常見的 receiver 是 regular client receiver
-4. 用 `printtup.c:printtup` 將 tuple 格式化為 wire protocol message 發送
+### I. 一句話理解
 
-> 補充（Senior Dev）：Destination receiver 不只一種。除了 client receiver 外還有：
-> - **SPI receiver**：PL/pgSQL function 內部用，tuple 存到 `SPITupleTable`
-> - **Materialize receiver**：`Tuplestore`，用於 CTE (`WITH`)、cursor materialization
-> - **COPY receiver**：`COPY TO` 輸出
->
-> 理解 destination receiver 的抽象能幫你理解為什麼 `SELECT count(*)` 的 executor 不會把全部 row 送回 client：Aggregate node 攔截了所有 tuple 只輸出最終的 count=1 row，所以中間 tuple 根本沒經過 `printtup`。
->
-> PG 14 引入了 pipeline mode（`libpq` 支援），client 可以在一條 connection 上連續發出多個 query 而不用等待前一個完成，大幅提升高延遲網路下的吞吐量。
+> **Executor 負責「算出結果」，Client Response 階段負責「把結果送出去」。**
 
-## 8. 關鍵 Source File 索引
+聽起來很簡單，但 PG 在這層做了一個重要的設計 —— **結果不一定是送回 client**。結果可以寫入暫存、餵給另一個查詢、匯出成檔案。PG 用一個叫做「**Destination Receiver**」的抽象層來統一處理這些不同去向。
 
-| Module | Source File(s) | 作用 |
-|--------|---------------|------|
-| Wire Protocol | `src/include/libpq/`、`libpq` | client-server message format |
-| Backend Entry | `src/backend/tcop/postgres.c` | `exec_simple_query`、message dispatch |
-| Postmaster | `src/backend/postmaster/postmaster.c` | process forking, supervision |
-| Parser | `src/backend/parser/`、`gram.y`、`scan.l` | raw SQL → parse tree |
-| Parse Nodes | `src/include/nodes/parsenodes.h` | `SelectStmt`, `InsertStmt`, `Query` |
-| Analyzer/Rewrite | `src/backend/parser/analyze.c` | `transformStmt`, view rewriting |
-| Planner | `src/backend/optimizer/plan/createplan.c` | cost model, strategy selection |
-| Plan Nodes | `src/include/nodes/plannodes.h` | `SeqScan`, `IndexScan`, `BitmapHeapScan` |
-| Executor Entry | `src/backend/executor/execMain.c` | `InitPlan`, `ExecutePlan` |
-| Executor Dispatch | `src/backend/executor/execProcnode.c` | `ExecProcNode`, `ExecInitNode` |
-| Executor Nodes | `src/include/nodes/execnodes.h` | runtime state for each plan node |
-| Result Output | `src/backend/access/common/printtup.c` | `printtup`, wire protocol serialization |
-| Portal | `src/backend/tcop/pquery.c` | `PortalRun`, cursor management |
+### II. 直覺類比：得來速餐廳
 
+用一個日常場景來理解整條路徑：
+
+```mermaid
+flowchart TD
+    subgraph Kitchen["👨‍🍳 廚房 = Executor"]
+        K1["廚師照食譜做菜\n一道一道做出來"]
+        K2["每道菜做完\n放上出餐檯"]
+        K1 --> K2
+    end
+
+    subgraph Dispatcher["📋 出餐檯 = Destination Receiver"]
+        D1{"這道菜\n要送去哪？"}
+        D2["🍽️ 內用 → 端到客人桌上\n（= Client Receiver）"]
+        D3["📦 外帶 → 裝進餐盒\n（= COPY Receiver）"]
+        D4["🥘 備料 → 放冰箱等下再用\n（= Materialize Receiver）"]
+        D5["🔪 給另一個廚師 → 傳過去\n（= SPI Receiver）"]
+    end
+
+    subgraph Client["💻 Client（你的 App）"]
+        C1["收到資料\n顯示在畫面上"]
+    end
+
+    K2 --> D1
+    D1 --> D2 --> C1
+    D1 --> D3
+    D1 --> D4
+    D1 --> D5
+
+    style Kitchen fill:#fff3e0,stroke:#e65100
+    style Dispatcher fill:#e3f2fd,stroke:#1565c0
+    style Client fill:#e8f5e9,stroke:#2e7d32
+```
+
+### III. 四種 Receiver（結果的不同去向）
+
+每一筆查詢結果都會走其中一條路：
+
+```mermaid
+flowchart TD
+    Tuple["📦 Executor 算出的一筆結果\n（一行資料）"]
+
+    subgraph R1["🟢 1. Client Receiver（最常見）"]
+        direction LR
+        R1A["格式化為網路封包\n→ 透過 TCP 送回你的 App"]
+        R1B["🎯 場景：你在 psql 或 App 裡\n直接執行 SELECT"]
+    end
+
+    subgraph R2["🟡 2. SPI Receiver（內部調用）"]
+        direction LR
+        R2A["結果存進內部暫存表\n供 PL/pgSQL 函數使用"]
+        R2B["🎯 場景：你在一個 Function 裡\n寫 SELECT ... INTO variable"]
+    end
+
+    subgraph R3["🟣 3. Materialize Receiver（暫存）"]
+        direction LR
+        R3A["結果暫存到記憶體/硬碟\n供後續查詢重複使用"]
+        R3B["🎯 場景：WITH CTE、\nCursor 的分段讀取"]
+    end
+
+    subgraph R4["🔵 4. COPY Receiver（匯出）"]
+        direction LR
+        R4A["結果直接寫成\nCSV/文字檔"]
+        R4B["🎯 場景：COPY ... TO '/tmp/data.csv'"]
+    end
+
+    Tuple --> R1
+    R1 --> R2 --> R3 --> R4
+
+    style R1 fill:#c8e6c9,stroke:#2e7d32
+    style R2 fill:#fff9c4,stroke:#f57f17
+    style R3 fill:#e1bee7,stroke:#8e24aa
+    style R4 fill:#bbdefb,stroke:#1976d2
+```
+
+### IV. 關鍵案例：為什麼 `COUNT(*)` 不回傳全部資料？
+
+這是最能體現 Receiver 設計價值的一個問題。假設：
+
+```sql
+SELECT count(*) FROM users WHERE age > 18;
+-- users 表有 100 萬筆，符合條件的有 40 萬筆
+```
+
+**新手直覺**：PG 先把 40 萬筆讀出來 → 算完總數 → 再丟回 client。
+
+**實際運作**：
+
+```mermaid
+flowchart TD
+    subgraph ExecutorFlow["Executor 內部"]
+        Scan["🔴 SeqScan Node\n讀取 users 表\n→ 輸出 age>18 的 40 萬筆"]
+        Agg["🟡 Aggregate Node（Count）\n攔截所有 40 萬筆\n→ 只算出一個數字：400,000"]
+    end
+
+    subgraph Response["Client Response 階段"]
+        Send["🟢 Client Receiver\n只收到一筆資料\n→ { count: 400000 }\n→ 格式化 → 送回 App"]
+    end
+
+    Scan -->|"40 萬筆 row"| Agg
+    Agg -->|"只有 1 筆"| Send
+
+    Note["💡 關鍵：中間 40 萬筆\n從來沒離開過 PG 內部！\nAggregate Node 在 Executor 內部\n就把它們消化掉了。\nClient Receiver 只看到\n最後的 1 筆結果。"]
+
+    Agg -.-> Note
+
+    style Scan fill:#ffcdd2,stroke:#c62828
+    style Agg fill:#fff9c4,stroke:#f57f17
+    style Send fill:#c8e6c9,stroke:#2e7d32
+    style Note fill:#f5f5f5,stroke:#9e9e9e
+```
+
+> 這就是 Receiver 抽象層的威力：**Executor 不知道、也不在乎結果最後要去哪**。Executor 只管把資料「交出去」，至於這筆資料是被送回 client、存起來、還是被 Aggregate Node 吞掉 —— 那是 Receiver 決定的。
+
+### V. 送回 Client 的最後一步：Wire Protocol 格式化
+
+當 Receiver 是「送回 client」時，最後一步是把 PG 內部的資料結構轉換成**網路可以傳輸的格式**（Wire Protocol）。
+
+```mermaid
+flowchart LR
+    subgraph Internal["PG 內部格式"]
+        I1["Tuple（Row）\n────────\n{id: 1, name: 'Alice',\n age: 25}"]
+    end
+
+    subgraph Format["格式化（序列化）"]
+        F1["把每個欄位的值\n轉成 binary 或文字"]
+        F2["加上 message type\n（告訴 client 這是資料）"]
+        F3["加上 message length\n（讓 client 知道封包邊界）"]
+    end
+
+    subgraph Wire["網路傳輸"]
+        W1["透過 TCP Socket\n送回你的 App"]
+    end
+
+    I1 --> F1 --> F2 --> F3 --> W1
+
+    style Internal fill:#e8f5e9,stroke:#388e3c
+    style Format fill:#fff3e0,stroke:#f57c00
+    style Wire fill:#e1f5fe,stroke:#0288d1
+```
+
+**Wire Protocol 訊息格式（簡化）**：
+
+```
+┌──────────┬───────────────┬─────────────────────┐
+│ 1 byte   │   4 bytes     │     variable        │
+│ 訊息類型  │  訊息長度      │     訊息內容          │
+│ (T=資料)  │  (含自己的長度) │  (欄位1, 欄位2, ...) │
+└──────────┴───────────────┴─────────────────────┘
+```
+
+> **類比**：就像寄快遞 —— 訊息類型 =「內容物：資料」、訊息長度 =「箱子大小」、訊息內容 =「箱子裡裝的實際資料」。Client 收到後根據類型判斷「這是資料」、根據長度知道「要讀多少 bytes」、然後解讀內容。
+
+### VI. 完整流程總覽：從 Executor 到你的 App
+
+把 Executor 和 Client Response 串在一起看：
+
+```mermaid
+flowchart TD
+    subgraph Exec["Executor（算出結果）"]
+        E1["Plan Tree 的 Root Node\n不斷 pull child → 得到結果"]
+        E2["每得到一筆結果\n就呼叫 Receiver 的 callback\n「這筆給你，看你要送哪去」"]
+    end
+
+    subgraph Recv["Receiver（決定去向）"]
+        R1{"這筆結果\n該去哪裡？"}
+        R2["→ 送回 Client\n（一般 SELECT）"]
+        R3["→ 存進 SPI 暫存區\n（Function 內部）"]
+        R4["→ 寫入暫存\n（CTE / Cursor）"]
+        R5["→ 寫出檔案\n（COPY TO）"]
+    end
+
+    subgraph Wire["Wire Protocol（格式化 + 傳輸）"]
+        W1["把 PG 內部格式\n→ 轉成網路訊息"]
+        W2["塞進 TCP Socket"]
+    end
+
+    subgraph App["你的 App"]
+        A1["從 TCP Socket 讀取訊息"]
+        A2["解析訊息 → 還原成資料"]
+        A3["顯示在螢幕上"]
+    end
+
+    E1 --> E2 --> R1
+    R1 --> R2 --> W1 --> W2 --> A1 --> A2 --> A3
+    R1 --> R3
+    R1 --> R4
+    R1 --> R5
+
+    style Exec fill:#fff3e0,stroke:#e65100
+    style Recv fill:#e3f2fd,stroke:#1565c0
+    style Wire fill:#f3e5f5,stroke:#7b1fa2
+    style App fill:#e8f5e9,stroke:#2e7d32
+```
+
+### VII. 兩種查詢模式在回應階段的差異
+
+還記得 Client Request 階段提過的 Simple Query 和 Extended Query 嗎？它們在回應階段的行為也不同：
+
+```mermaid
+flowchart TD
+    subgraph Simple["Simple Query（一次整條 SQL）"]
+        S1["送 SQL → PG 全部跑完"]
+        S2["一次把所有結果送回 client"]
+        S3["結束"]
+        S1 --> S2 --> S3
+    end
+
+    subgraph Extended["Extended Query（Parse → Bind → Execute）"]
+        E1["Parse：只解析，不執行\n（得到解析後的查詢模板）"]
+        E2["Bind：綁定參數值"]
+        E3["Execute：執行"]
+        E4["可以重複 Bind + Execute\n（同一模板、不同參數）\n每次 Execute 只回傳該次的結果"]
+        E1 --> E2 --> E3 --> E4
+    end
+
+    style Simple fill:#e8f5e9,stroke:#388e3c
+    style Extended fill:#e1f5fe,stroke:#0288d1
+```
+
+> **延伸（PG 14+ Pipeline Mode）**：client 可以在同一條連線上連續發出多個查詢，不需要等前一個查詢的結果回來才發下一個。就像在餐廳裡連續點好幾道菜，廚房可以同時準備，不用等一道菜吃完才點下一道。
+
+### VIII. 一句話總結 Client Response
+
+```
+Executor 算出結果
+      ↓
+Receiver 決定結果去哪（送回 client？暫存？匯出？）
+      ↓
+若要送回 client → Wire Protocol 格式化 → TCP 傳輸
+      ↓
+你的 App 收到資料 → 顯示在畫面上
+```
 ---
 
 # 二、CBO 與 pg_hint_plan：何時需要 Hint？
