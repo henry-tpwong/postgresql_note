@@ -1315,167 +1315,429 @@ Receiver 決定結果去哪（送回 client？暫存？匯出？）
 
 ## 1. 背景：CBO 是否每次都能產生最優 Plan？
 
-PostgreSQL 使用 Cost-Based Optimizer（CBO）。當關聯表數量超過 `geqo_threshold`（預設 12）時，會改用 Genetic Query Optimizer（GEQO）以避免窮舉帶來的 planning 開銷，但 GEQO 結果不保證最優。
+### I. CBO 是什麼？
 
-### I. CBO 的成本計算因子
+還記得前一章 Planner 是「導航軟體」嗎？Planner 會比較好幾條路線（execution plan），選成本最低的。這個「成本估算引擎」就叫 **Cost-Based Optimizer（CBO）**。
 
-來源：`src/backend/optimizer/path/costsize.c`
+```mermaid
+flowchart LR
+    subgraph Input["📊 輸入：資訊來源"]
+        I1["表的實體大小\n（幾 GB、幾 row）"]
+        I2["成本參數設定\n（SSD 還是 HDD？）"]
+        I3["統計資訊\n（每個欄位的值分布）"]
+        I4["可用記憶體\n（sort/hash 能用的空間）"]
+    end
 
-| 因子類別 | 具體項目 | 影響 |
-|---------|---------|------|
-| 物理屬性 | table 的 data block 數量 | 影響 scan block 成本 |
-| 物理屬性 | table 的 row 數量 | 影響 CPU 處理 row 成本 |
-| 成本因子 | `seq_page_cost` / `random_page_cost` | 連續 vs 隨機讀取單個 block 的成本 |
-| 成本因子 | `cpu_tuple_cost` / `cpu_index_tuple_cost` | CPU 處理 heap/index 中一條 row 的成本 |
-| 成本因子 | `cpu_operator_cost` | 執行一個 operator 或 function 的成本 |
-| Memory | `work_mem` 等 | 影響 Index Scan 的計算成本 |
-| 統計資訊 | correlation | 影響 Index Scan 成本估算 |
-| 統計資訊 | column width、null fraction、n_distinct、MCV、histogram buckets | 影響選擇性（selectivity） |
-| 函數屬性 | 建立 function / operator 時設置的 cost | 影響含 function call 的查詢成本 |
+    subgraph CBO["🧠 CBO（成本估算引擎）"]
+        C1["計算每種 Scan 方案的 I/O 成本"]
+        C2["計算每種 Join 順序+方法的總成本"]
+        C3["比較所有候選方案"]
+    end
 
-### II. CBO 的盲區
+    subgraph Output["✅ 輸出"]
+        O1["選出總成本最低的\n執行計畫（Plan Tree）"]
+    end
 
-**a. 已考慮但可能滯後的因素（auto-analyze 自動更新）：**
+    I1 --> C1
+    I2 --> C1
+    I3 --> C2
+    I4 --> C2
+    C1 --> C3
+    C2 --> C3
+    C3 --> O1
 
-`pg_class.relpages` / `pg_class.reltuples`、`pg_statistic` 統計資訊——自動 analyze 有延遲，bulk INSERT/DELETE 後可能嚴重失準。
+    style Input fill:#e8f5e9,stroke:#388e3c
+    style CBO fill:#fff3e0,stroke:#f57c00
+    style Output fill:#e1f5fe,stroke:#0288d1
+```
 
-**b. 靜態配置因素（不會自動調整）：**
+> **白話**：CBO 不是寫死的規則（例如「有 index 就一定用」），而是去**計算**哪個方案最省資源。計算結果準不準，取決於它拿到的「輸入資訊」正不正確。
 
-- OS cache 實際可用記憶體（`effective_cache_size` 是靜態設定）
-- Function / operator cost（函數內部邏輯變更後不自動更新）
+但當表太多時（≥ 12 張），CBO 也會妥協——從「窮舉保證最優」改成「遺傳演算法求近似」，不保證最優解。
 
-**c. 未考慮的因素：**
+### II. CBO 計算成本時看哪些因子？
 
-- Block device read-ahead（一次讀取預讀 128KB，但 CBO 按逐個 block 計算）
-- `seq_page_cost` / `random_page_cost` 可針對 tablespace 設置，但不會動態追蹤 read-ahead 變更
+CBO 的成本公式綜合了以下七類資訊。你不需要記住每個參數，但要知道**它考慮了哪些面向**：
 
-**d. Generic plan cache（`choose_custom_plan`）：**
+```mermaid
+flowchart TD
+    subgraph Physical["🏗️ 物理屬性（表的真實大小）"]
+        P1["表佔幾個 data block？"]
+        P2["表有多少 row？"]
+        P3["→ 直接影響讀取成本"]
+    end
 
-PostgreSQL 比對 cached plan 的平均成本與 custom plan 的成本：若 cached plan 成本更高，會改用 custom plan。前提是**統計資訊必須準確**。
+    subgraph CostParams["💰 成本參數（單位代價）"]
+        P4["連續讀 1 頁要花多少？（seq_page_cost）"]
+        P5["隨機讀 1 頁要花多少？（random_page_cost）"]
+        P6["處理 1 行資料要花多少？（cpu_tuple_cost）"]
+        P7["處理 1 筆 index 要花多少？"]
+        P8["執行 1 次運算要花多少？"]
+    end
 
-### III. 何時需要 Hint
+    subgraph Memory["🧠 記憶體限制"]
+        P9["work_mem：sort/hash 能用多少記憶體？"]
+        P10["不夠就會 spill to disk\n→ 成本暴增"]
+    end
 
-大多數情況下，合理配置 `random_page_cost`、定期 `ANALYZE`、調整 `default_statistics_target` 就足夠。需要 Hint 的場景：
+    subgraph Stats["📊 統計資訊（值分布）"]
+        P11["每個值出現幾次？（n_distinct）"]
+        P12["最常出現的值？（MCV）"]
+        P13["值的分布長怎樣？（histogram）"]
+        P14["空值有多少？（null fraction）"]
+        P15["column 寬度"]
+        P16["值與實體順序的相關性（correlation）"]
+    end
 
-- 靜態配置與實際不符（如 function cost 過時）
-- 特定查詢的 optimizer 估計與實際偏差巨大
-- 除錯：想對比不同 plan 的實際效率
-- 緊急情況：production 中某個查詢突然選擇了差的 plan
+    subgraph Func["🔧 函數屬性"]
+        P17["自訂函數有設定 cost 嗎？"]
+        P18["→ 影響含 function call 的查詢"]
+    end
 
-> 補充（Senior Dev）：Hint 是把雙面刃。寫在 application code 中的 hint 會在資料成長後過時（plan rot），導致原本正確的 hint 變成效能殺手。應優先嘗試非侵入式方案（調整 `enable_*` GUC、extended statistics、調整 `random_page_cost`），hint 作為最後手段。
+    Physical --> CostParams --> Memory --> Stats --> Func
+
+    style Physical fill:#e3f2fd,stroke:#1565c0
+    style CostParams fill:#fff3e0,stroke:#ef6c00
+    style Memory fill:#f3e5f5,stroke:#7b1fa2
+    style Stats fill:#e8f5e9,stroke:#2e7d32
+    style Func fill:#fce4ec,stroke:#c62828
+```
+
+> **新手最常踩的坑**：`random_page_cost` 預設是 **4.0**（假設你的硬碟是傳統 HDD，random I/O 比 sequential I/O 慢 4 倍）。但如果你用的是 SSD 或雲端硬碟，這個值沒調的話，CBO 會「誤以為」random I/O 很慢，**過度偏好 Seq Scan**，即使 Index 更快也不選。
+
+### III. CBO 的盲區：什麼時候估算會失準？
+
+CBO 不是全知全能的。以下三種情況會讓它的成本估算偏離現實：
+
+```mermaid
+flowchart TD
+    subgraph Blind1["⚠️ 盲區 1：統計資訊過時"]
+        B1A["大量 INSERT/DELETE 後"]
+        B1B["還沒跑 ANALYZE（或 auto-analyze 還沒觸發）"]
+        B1C["→ 表的 row 數、值分布都錯了"]
+        B1D["→ CBO 基於錯誤資訊做決策"]
+    end
+
+    subgraph Blind2["⚠️ 盲區 2：靜態設定與現實不符"]
+        B2A["effective_cache_size 是手動設的\n不會自動追蹤 OS 實際 cache 大小"]
+        B2B["random_page_cost 手動設的\n不會自動偵測是 SSD 還是 HDD"]
+        B2C["自訂函數的 cost 值是建立時寫死的\n函數內容改了但 cost 沒更新"]
+    end
+
+    subgraph Blind3["⚠️ 盲區 3：CBO 根本沒考慮的因素"]
+        B3A["硬碟的 read-ahead 機制\n（一次讀 128KB，不是逐頁讀）"]
+        B3B["（CBO 假設每頁都是單獨讀取）\n→ 實際 sequential 讀取比 CBO 估算的還快"]
+    end
+
+    subgraph Blind4["⚠️ 盲區 4：Plan Cache 陷阱"]
+        B4A["前 5 次用 custom plan（每次重新估算）"]
+        B4B["第 6 次開始比對：generic plan vs custom plan\n如果 generic plan 成本更低 → 用 cached plan"]
+        B4C["但這個比對也是基於統計資訊\n→ 統計不準 → 可能選到慢的 cached plan"]
+    end
+
+    Blind1 --> Blind2 --> Blind3 --> Blind4
+
+    style Blind1 fill:#fff3e0,stroke:#ef6c00
+    style Blind2 fill:#fce4ec,stroke:#c62828
+    style Blind3 fill:#e3f2fd,stroke:#1565c0
+    style Blind4 fill:#f3e5f5,stroke:#7b1fa2
+```
+
+> **ANALYZE 實例：為什麼統計過時會害 Planner 選錯？**
+>
+> 假設你有一張 `orders` 表，原本有 10 萬筆訂單，`status` 欄位有 index。某天你一口氣 INSERT 了 90 萬筆新訂單（狀態都是 'pending'），然後立刻查：
+> ```sql
+> SELECT * FROM orders WHERE status = 'completed';
+> ```
+>
+> ```mermaid
+> flowchart LR
+>     Before["❌ 沒跑 ANALYZE\n──────────\npg_statistic 記錄：\n• 表只有 10 萬 row\n• 'completed' 佔 80% → 8 萬 row\n\nPlanner 判斷：\n「8 萬 / 10 萬 = 80%\n隨機讀 8 萬次不划算」\n→ 選 Seq Scan"]
+>     Reality["🔍 但實際情況是\n──────────\n• 表現在 100 萬 row\n• 'completed' 還是 8 萬 row\n• 比例從 80% 暴跌到 8%"]
+>     After["✅ 跑完 ANALYZE 後\n──────────\npg_statistic 更新：\n• 表有 100 萬 row\n• 'completed' 只佔 8%\n\nPlanner 判斷：\n「8% 用 Index Scan OK」\n→ 這次選對了\n（但如果 data 再變\n還是要再跑 ANALYZE）"]
+>
+>     Before --> Reality --> After
+>
+>     style Before fill:#ffebee,stroke:#c62828
+>     style Reality fill:#fff3e0,stroke:#ef6c00
+>     style After fill:#c8e6c9,stroke:#2e7d32
+> ```
+>
+> `ANALYZE` 就是在更新這些統計數字（row 數、每個值的比例、分布等），讓 Planner 基於「最新的現實」做決策，而不是基於「過時的記憶」。PG 有 **auto-analyze**（當表的變動比例超過 `autovacuum_analyze_scale_factor` 時自動觸發），但如果你剛做完大批 INSERT/DELETE，建議手動跑一次：
+> ```sql
+> ANALYZE orders;
+> ```
+
+### IV. 什麼時候才需要 Hint？
+
+大部分情況下，**不需要 Hint**。先試以下三個步驟，Hint 是最後手段：
+
+```mermaid
+flowchart TD
+    Problem["🤔 查詢效能不好\n懷疑 CBO 選錯 plan"]
+
+    Step1["✅ 步驟 1：檢查基礎配置\n──────────\n• 定期跑 ANALYZE 了嗎？\n• random_page_cost 適合你的硬碟嗎？\n  （SSD → 1.1~1.5，不要用預設 4.0）\n• effective_cache_size 合理嗎？\n  （建議設總 RAM 的 50-75%）"]
+    Step1OK{"效能改善了？"}
+    Done1["🎉 搞定"]
+
+    Step2["✅ 步驟 2：改善統計資訊\n──────────\n• 提高 default_statistics_target\n  （讓 histogram 更精細）\n• 針對多欄位相關性\n  用 CREATE STATISTICS（PG 10+）"]
+    Step2OK{"效能改善了？"}
+    Done2["🎉 搞定"]
+
+    Step3["✅ 步驟 3：Session-level GUC 微調\n──────────\n• SET enable_nestloop = off\n• SET enable_seqscan = off\n• 調整 work_mem\n（只影響當前 session，不改 code）"]
+    Step3OK{"效能改善了？"}
+    Done3["🎉 搞定"]
+
+    Hint["⚠️ 最後手段：pg_hint_plan\n──────────\n• 寫在 SQL 註解裡的 hint\n• Query-level 精細控制\n• 但會隨資料成長過時（plan rot）\n• 優先試 hint table（PG 12+）\n  而非 inline hint"]
+
+    Problem --> Step1 --> Step1OK
+    Step1OK -->|"是"| Done1
+    Step1OK -->|"否"| Step2 --> Step2OK
+    Step2OK -->|"是"| Done2
+    Step2OK -->|"否"| Step3 --> Step3OK
+    Step3OK -->|"是"| Done3
+    Step3OK -->|"否"| Hint
+
+    style Problem fill:#e1f5fe,stroke:#0288d1
+    style Done1 fill:#c8e6c9,stroke:#2e7d32
+    style Done2 fill:#c8e6c9,stroke:#2e7d32
+    style Done3 fill:#c8e6c9,stroke:#2e7d32
+    style Hint fill:#ffebee,stroke:#c62828
+```
+
+> **補充（Senior Dev）**：Hint 是把雙面刃。寫在 application code 中的 inline hint 會在資料成長後過時（plan rot），導致原本正確的 hint 變成效能殺手。應優先嘗試非侵入式方案（調整 `enable_*` GUC、extended statistics、調整 `random_page_cost`），hint 作為最後手段。
+>
+> PG 12+ 支援 **hint table**（`hint_plan.hints`），可以在 table 中管理 hint 而無需修改 SQL text，是比 inline hint 更好的選擇。
 
 ## 2. pg_hint_plan 簡介
 
-`pg_hint_plan` 是 PostgreSQL extension，利用 PG 開放的 hook 介面實現 Oracle-style SQL hint。
+### I. pg_hint_plan 是什麼？
 
-### I. 安裝（PG 9.4 示範）
+`pg_hint_plan` 是一個 PostgreSQL 擴充套件（extension），讓你能夠**在某一條 SQL 裡直接指定執行計畫**（例如「這條查詢強制用 Hash Join」），而不影響其他查詢。
 
-```bash
-wget http://iij.dl.sourceforge.jp/pghintplan/62456/pg_hint_plan94-1.1.3.tar.gz
-tar -zxvf pg_hint_plan94-1.1.3.tar.gz
-cd pg_hint_plan94-1.1.3
-export PATH=/opt/pgsql/bin:$PATH
-gmake clean && gmake && gmake install
+```mermaid
+flowchart TD
+    App["📝 你的 SQL\n（裡面寫了 hint 註解）"]
+    PG["🐘 PostgreSQL\nParser → Analyzer"]
+    Normal["🔄 一般查詢：\nPlanner 自己決定 plan"]
+    HPE["🔧 pg_hint_plan 介入\n讀取 hint → 強制改寫 plan"]
+    Exec["▶️ Executor 執行"]
+
+    App --> PG
+    PG -->|"沒有 hint"| Normal --> Exec
+    PG -->|"有 /*+ hint */"| HPE --> Exec
+
+    style App fill:#fff9c4,stroke:#f9a825
+    style PG fill:#e1f5fe,stroke:#0288d1
+    style Normal fill:#e8f5e9,stroke:#388e3c
+    style HPE fill:#fff3e0,stroke:#ef6c00
+    style Exec fill:#f3e5f5,stroke:#7b1fa2
 ```
 
-```ini
-# postgresql.conf
-shared_preload_libraries = 'pg_hint_plan'
-pg_hint_plan.enable_hint = on
-pg_hint_plan.debug_print = on
-pg_hint_plan.message_level = log
+> **白話**：pg_hint_plan 就像在 SQL 旁邊貼一張便條紙，告訴 Planner「這條照我說的做」。其他沒貼便條紙的查詢，Planner 還是自己決定。
+
+安裝很簡單（啟用 extension + 設定檔加一行 `shared_preload_libraries`），不需要改任何原始碼。PG 12+ 還支援 **hint table**（把 hint 存在資料表裡統一管理，不用改 SQL 文字）。
+
+### II. 兩種調整 Planner 的方式：GUC vs Hint
+
+| | GUC 參數 | pg_hint_plan Hint |
+|---|---|---|
+| **作用範圍** | 整個 session（所有查詢） | 單一條 SQL |
+| **寫在哪** | `SET enable_nestloop = off;` | `/*+ HashJoin(a b) */` 註解裡 |
+| **範例** | 「這個 session 全部不准用 Nested Loop」 | 「只有這一行 JOIN 用 Hash Join」 |
+| **會影響其他查詢嗎** | ✅ 會 | ❌ 不會 |
+
+```mermaid
+flowchart TD
+    subgraph GUC["🔧 GUC 參數（Session-Level）"]
+        G1["SET enable_nestloop = off;"]
+        G2["SELECT * FROM a JOIN b ...\n→ 強制不用 Nested Loop"]
+        G3["SELECT * FROM x JOIN y ...\n→ 也被強制不用 Nested Loop"]
+        G4["⚠️ 副作用：同一 session 內\n所有查詢都受影響"]
+        G1 --> G2
+        G1 --> G3
+        G2 --> G4
+        G3 --> G4
+    end
+
+    subgraph Hint["🎯 pg_hint_plan Hint（Query-Level）"]
+        H1["/*+ HashJoin(a b) */\nSELECT * FROM a JOIN b ...\n→ 只有這條用 Hash Join"]
+        H2["SELECT * FROM x JOIN y ...\n→ Planner 自由選擇\n  可能還是用 Nested Loop"]
+        H3["✅ 精準控制：只影響一條 SQL\n其他查詢不受干擾"]
+        H1 --> H3
+        H2 --> H3
+    end
+
+    style GUC fill:#fff3e0,stroke:#ef6c00
+    style Hint fill:#e8f5e9,stroke:#2e7d32
 ```
 
-```sql
-CREATE EXTENSION pg_hint_plan;
+### III. Hint 可以做什麼？
+
+pg_hint_plan 提供的 hint 分成三大類：
+
+```mermaid
+flowchart TD
+    subgraph Scan["🔍 控制掃描方式（Scan Hints）"]
+        S1["SeqScan(table)\n強制全表掃描"]
+        S2["IndexScan(table [index])\n強制用某個 index"]
+        S3["IndexOnlyScan(table [index])\n強制 Index Only Scan"]
+        S4["BitmapScan(table [index])\n強制 Bitmap Scan"]
+        S5["NoSeqScan(table)\n禁止全表掃描"]
+    end
+
+    subgraph Join["🔗 控制 Join 方式（Join Hints）"]
+        J1["NestLoop(a b)\n強制 Nested Loop"]
+        J2["HashJoin(a b)\n強制 Hash Join"]
+        J3["MergeJoin(a b)\n強制 Merge Join"]
+        J4["Leading(a b c)\n強制 Join 順序\n（先 a→b 再 join c）"]
+    end
+
+    subgraph Other["🔧 其他控制"]
+        O1["Rows(table #100)\n直接修正 row estimate\n（騙 Planner 這張表只有 100 row）"]
+        O2["Set(work_mem '1GB')\n在 Planner 執行期間\n暫時覆蓋某個 GUC 參數"]
+    end
+
+    Scan --> Join --> Other
+
+    style Scan fill:#e3f2fd,stroke:#1565c0
+    style Join fill:#e8f5e9,stroke:#2e7d32
+    style Other fill:#fff3e0,stroke:#ef6c00
 ```
 
-> PG 12+ 支援 **hint table**（`hint_plan.hints`），可在 table 中管理 hint 而無需修改 SQL text：
-> ```sql
-> INSERT INTO hint_plan.hints (norm_query_string, application_name, hints)
-> VALUES ('SELECT * FROM orders WHERE create_time > $1', '', 'IndexScan(orders idx_orders_time)');
-> ```
-
-### II. Hint vs GUC Switch 對比
-
-**原生 GUC 開關：**
-
-```sql
-SET enable_nestloop = off;
-EXPLAIN SELECT a.*, b.* FROM a, b WHERE a.id = b.id AND a.id < 10;
--- 結果：Hash Join（禁用了 Nested Loop）
-```
-
-**pg_hint_plan hint：**
-
-```sql
-/*+
-  HashJoin(a b)
-  SeqScan(b)
-*/
-EXPLAIN SELECT a.*, b.* FROM a, b WHERE a.id = b.id AND a.id < 10;
-```
-
-Hint 相較 GUC 的優勢：GUC 是 session-level，hint 是 query-level，粒度更精細。
-
-### III. 完整 Hint 列表
-
-| Hint | 作用 |
-|------|------|
-| `SeqScan(table)` | 強制 Seq Scan |
-| `TidScan(table)` | 強制 TID Scan |
-| `IndexScan(table [index...])` | 強制 Index Scan |
-| `IndexOnlyScan(table [index...])` | 強制 Index Only Scan |
-| `BitmapScan(table [index...])` | 強制 Bitmap Scan |
-| `NoSeqScan(table)` / `NoIndexScan(table)` 等 | 禁止某種 scan |
-| `NestLoop(table ...)` / `HashJoin(...)` / `MergeJoin(...)` | 強制 join 方式 |
-| `Leading(table table [table...])` | 強制 Join Order |
-| `Rows(table ... correction)` | 修正 join result 的 row estimate |
-| `Set(GUC-param value)` | 在 planner 執行期間設定 GUC 參數 |
-
-> 實務中最常用的三個 hint：
-> 1. **`Leading`** — 修復 join order 錯誤
-> 2. **`Rows`** — 直接修正 row estimate
-> 3. **`Set`** — 臨時覆蓋 `enable_*` 或 `work_mem`
+> **實務中最常用的三個 hint**：
+> 1. **`Leading`** — 修復 join order 錯誤（最常見）
+> 2. **`Rows`** — 直接修正 row estimate，騙 Planner 選對的 plan
+> 3. **`Set`** — 臨時覆蓋 `enable_*` 或 `work_mem`，只影響這一條查詢
 
 ## 3. CBO 成本計算的完整鏈路
 
+### I. 從統計資訊到最終計畫的六步驟
+
+CBO 的計算不是一步完成，而是像流水線一樣，從最底層的資訊逐步往上推導：
+
+```mermaid
+flowchart TD
+    S1["📊 步驟 1：讀取統計資訊\n──────────\n• 這張表有多大？（data block 數、row 數）\n• 每個欄位的值怎麼分布？（histogram、MCV）\n• 有哪些 index 可以用？"]
+    S2["💰 步驟 2：套用成本參數\n──────────\n• 連續讀 1 頁的成本（seq_page_cost）\n• 隨機讀 1 頁的成本（random_page_cost）\n• 處理 1 行資料的 CPU 成本\n• 可用記憶體（work_mem）"]
+    S3["🔍 步驟 3：估算每種 Scan 成本\n──────────\n• Seq Scan：全表掃描要讀幾頁？\n• Index Scan：走 index 要幾次隨機讀？\n• Bitmap Scan：index + 整理後順序讀"]
+    S4["🔗 步驟 4：列舉所有 Join 順序\n──────────\n• ≤12 張表：窮舉所有可能順序\n• >12 張表：用遺傳演算法求近似"]
+    S5["🧩 步驟 5：對每個 Join 選方法\n──────────\n• Nested Loop（適合小表）\n• Hash Join（適合無 index 的大表）\n• Merge Join（適合已排序的表）"]
+    S6["✅ 步驟 6：選出總成本最低的計畫\n──────────\n• 比較所有候選方案的 total cost\n• 輸出最終的 Plan Tree"]
+
+    S1 --> S2 --> S3 --> S4 --> S5 --> S6
+
+    style S1 fill:#e8f5e9,stroke:#388e3c
+    style S2 fill:#fff3e0,stroke:#ef6c00
+    style S3 fill:#e3f2fd,stroke:#1565c0
+    style S4 fill:#f3e5f5,stroke:#7b1fa2
+    style S5 fill:#fce4ec,stroke:#c62828
+    style S6 fill:#c8e6c9,stroke:#2e7d32
 ```
-table statistics (pg_class, pg_statistic)
-         ↓
-cost factors (seq_page_cost, random_page_cost, cpu_*_cost)
-         ↓
-scan cost estimation (costsize.c)
-         ↓
-join order enumeration (dynamic programming / GEQO)
-         ↓
-join method selection (NestLoop / HashJoin / MergeJoin)
-         ↓
-final plan selection (lowest total cost)
+
+### II. Plan Cache：為什麼同一條 SQL 第二次執行更快？
+
+#### 一句話先講完
+
+> **Custom Plan** = 每次根據「這次的參數值」重新規劃（慢在規劃，但計畫精準）
+> **Generic Plan** = 不管參數值是什麼，都用同一個「通用計畫」（省規劃時間，但可能不適合這次的參數）
+>
+> **前 5 次強制用 custom plan 是 PG 的預設行為**（寫死在原始碼中，不是舉例），第 6 次才開始比對要不要切換到 generic plan。
+
+#### 用日常例子理解
+
+假設你每天早上問導航：「從我家到 ___ 怎麼走？」
+
+```mermaid
+flowchart TD
+    subgraph Custom["🔧 Custom Plan（每次重新規劃）"]
+        C1["Day 1：『到 台北101』\n→ 導航根據現在路況\n→ 規劃最優路線 → 出發"]
+        C2["Day 2：『到 淡水』\n→ 導航根據現在路況\n→ 重新規劃最優路線 → 出發"]
+        C3["Day 3：『到 台北101』\n→ 導航還是重新規劃\n→ 因為地點跟上上禮拜一樣\n  但路況可能不同"]
+        C1 --- C2 --- C3
+    end
+
+    subgraph Generic["📦 Generic Plan（通用快取計畫）"]
+        G1["前 5 天：每次都重新規劃\n→ PG 在觀察這些行程的\n  『平均成本』"]
+        G2["第 6 天：PG 總結出一個\n  『不管去哪都適用』的路線\n→ 例如：先上國道一號再說"]
+        G3["之後每一天：直接走國道一號\n→ 不用再問導航\n→ 省下規劃時間\n→ 但可能不是最優路線"]
+        G1 --> G2 --> G3
+    end
+
+    style Custom fill:#e3f2fd,stroke:#1565c0
+    style Generic fill:#fff3e0,stroke:#ef6c00
 ```
 
-### I. plan cache 的 choose_custom_plan 邏輯
+#### 用 SQL 舉一個具體例子
 
-來源：`src/backend/utils/cache/plancache.c`
+```sql
+-- 先定義一個參數化查詢
+PREPARE my_query AS
+  SELECT * FROM orders WHERE status = $1;
 
-- **custom plan**：每次重新規劃
-- **generic plan**：使用緩存的通用 plan（首次 5 次執行使用 custom，第 6 次開始比較成本）
+-- 前 5 次：每次都用 Custom Plan
+EXECUTE my_query('completed');   -- 第1次：'completed' 佔 80% → 規劃：Seq Scan 最划算
+EXECUTE my_query('cancelled');   -- 第2次：'cancelled' 佔 1%  → 規劃：Index Scan 最划算
+EXECUTE my_query('pending');     -- 第3次：'pending' 佔 15%  → 規劃：Bitmap Scan 最划算
+EXECUTE my_query('completed');   -- 第4次
+EXECUTE my_query('cancelled');   -- 第5次
+```
 
-選擇邏輯：若 `cached_plan_cost > avg_custom_plan_cost`，改用 custom plan。
+第 6 次開始，PG 建立一個 **Generic Plan**，然後做比較：
+
+```mermaid
+flowchart TD
+    GenericP["📦 Generic Plan\n──────────\nPG 算出一個通用計畫\n（假設 PG 選了 Seq Scan）\n\n把前 5 次 custom plan\n『實際花的成本』平均\nvs\n這個 generic plan 的『估算成本』"]
+
+    Compare{"Generic 成本\n≤ Custom 平均成本？"}
+
+    UseG["✅ 用 Generic Plan\n──────────\n之後不管 $1 傳什麼參數\n一律用 Seq Scan\n\n省規劃時間\n但每次執行可能不是最佳"]
+
+    UseC["❌ 不用 Generic\n──────────\n代表參數值差異太大\n通用計畫不適合\n→ 每次都重新 Custom Plan"]
+
+    Bad["⚠️ 陷阱案例\n──────────\n假設前 5 次\n有 4 次傳 'completed'（多數 row）\n→ custom 平均成本偏 Seq Scan\n→ generic plan = Seq Scan\n\n第 6 次傳 'cancelled'（極少 row）\n→ 仍然用 Seq Scan！\n→ 明明 Index Scan 快 100 倍\n→ 卻被 generic plan 綁死了"]
+
+    GenericP --> Compare
+    Compare -->|"是"| UseG
+    Compare -->|"否"| UseC
+    UseG --> Bad
+
+    style GenericP fill:#fff3e0,stroke:#ef6c00
+    style UseG fill:#c8e6c9,stroke:#2e7d32
+    style UseC fill:#e3f2fd,stroke:#1565c0
+    style Bad fill:#ffebee,stroke:#c62828
+```
+
+> **重點**：Custom Plan 和 Generic Plan 的差別不在「對或錯」，而在 **「參數值差異大不大」**。如果每個參數值對應的 row 數量都差不多（例如 `WHERE id = $1`，每個 id 都是 1 row），Generic Plan 就很好用。但如果參數值差異極大（如 `status`：'completed' 有 100 萬 row、'cancelled' 只有 10 row），Generic Plan 就會出事。
+
+> PG 12+ 可以設定 `plan_cache_mode = force_custom_plan`，強制每次都重新規劃，適合參數值分布極端不均的場景。
 
 ## 4. 替代方案與最佳實踐
 
-> 在使用 pg_hint_plan 之前，應先嘗試以下方案，由輕到重：
+在揮舞 pg_hint_plan 這把刀之前，先走完這個階梯——從最不侵入的方案開始，一步一步往上：
 
-| 優先級 | 方案 | 適用場景 |
-|--------|------|---------|
-| 1 | 調整 `random_page_cost` / `seq_page_cost` | SSD 環境 cost factor 不準確 |
-| 2 | 增加 `default_statistics_target` | 單一 column 統計資訊不足 |
-| 3 | CREATE STATISTICS（PG 10+ extended stats） | 多 column 之間有相關性 |
-| 4 | `SET enable_nestloop = off` 等 GUC | 臨時性調整，不修改 code |
-| 5 | 調整 `join_collapse_limit` / `from_collapse_limit` | 顯式 JOIN 順序被限制時 |
-| 6 | pg_hint_plan hint table（PG 12+） | 需長期、可控的 plan 修正 |
-| 7 | pg_hint_plan inline hint | 最後手段 |
+```mermaid
+flowchart TD
+    L1["🥇 第 1 步：調準成本參數\n──────────\n• 調整 random_page_cost（SSD → 1.1~1.5）\n• 調整 effective_cache_size\n（總 RAM 的 50~75%）\n\n✅ 零風險，影響所有查詢"]
+    L2["🥈 第 2 步：改善統計精度\n──────────\n• 提高 default_statistics_target\n（讓 histogram buckets 更多）\n\n✅ 只增加 ANALYZE 時間\n不影響查詢效能"]
+    L3["🥉 第 3 步：多欄位相關統計\n──────────\n• CREATE STATISTICS（PG 10+）\n（告訴 Planner：欄位 A 和欄位 B\n的數據有關聯性）\n\n✅ 解決「單欄統計各自準\n但合在一起就不準」的問題"]
+    L4["🔧 第 4 步：Session GUC 微調\n──────────\n• SET enable_nestloop = off\n• SET enable_seqscan = off\n• 調整 work_mem\n\n⚠️ 影響同 session 所有查詢\n用完記得恢復"]
+    L5["🔗 第 5 步：調整 Join 搜尋範圍\n──────────\n• 調高 join_collapse_limit\n• 調高 from_collapse_limit\n（讓 Planner 有更多\nJoin 順序可以考慮）\n\n⚠️ Plan Time 會指數成長"]
+    L6["📋 第 6 步：Hint Table（PG 12+）\n──────────\n• 把 hint 存在資料表\n• 不修改 SQL 文字\n• 集中管理、可審計\n\n⚠️ 比 inline hint 好維護"]
+    L7["⚠️ 最後手段：Inline Hint\n──────────\n• 寫在 SQL 註解裡\n• 單條查詢精細控制\n\n❌ 風險最高：plan rot\n資料成長後 hint 可能變毒藥\n且藏在程式碼裡難以發現"]
+
+    L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7
+
+    style L1 fill:#c8e6c9,stroke:#2e7d32
+    style L2 fill:#e8f5e9,stroke:#388e3c
+    style L3 fill:#e3f2fd,stroke:#1565c0
+    style L4 fill:#fff3e0,stroke:#ef6c00
+    style L5 fill:#fff9c4,stroke:#f9a825
+    style L6 fill:#fce4ec,stroke:#c62828
+    style L7 fill:#ffebee,stroke:#b71c1c
+```
+
+> **一句話記住**：前三步（調參數、改善統計、多欄位統計）解決 90% 的問題。GUC 和 Hint 是針對特定 query 的緊急手段，不是日常標配。
 
 ---
 
@@ -1485,113 +1747,184 @@ final plan selection (lowest total cost)
 
 ## 1. 核心問題：GROUP BY 為什麼有時用 Sort？
 
-Optimizer 選擇 Agg 策略的唯一標準是 cost。`GROUP BY` 有兩種 aggregation strategy：
+### I. 兩種聚合策略的直覺比喻
 
-| Strategy | 說明 |
-|----------|------|
-| **GroupAgg (AGG_SORTED)** | 先 Sort 再分組聚合。input 已有序時 skip Sort（如來自 index scan） |
-| **HashAgg (AGG_HASHED)** | 建 hash table 聚合。需等全部 input 就緒才開始輸出 |
+`GROUP BY` 有兩種執行方式，各用不同場景：
 
-兩者 total CPU cost 在 cost 模型中相同，但 **GroupAgg startup cost 更低**（可 on-the-fly 輸出），HashAgg startup cost = input total cost（必須等所有 input 讀完）。
+```mermaid
+flowchart TD
+    subgraph GroupAgg["🔵 GroupAgg（先排序再分組）"]
+        GA1["1. 先把資料照 GROUP BY 欄位排序\n（如果資料本身就排好序了→跳過）"]
+        GA2["2. 依序往下讀\n同一個 group 的值連續出現\n→ 每換一個 group 就輸出上一組的結果"]
+        GA3["⚡ 可以邊讀邊輸出\n（第一組算完就能馬上回傳）"]
+        GA1 --> GA2 --> GA3
+    end
 
-### I. 實驗：work_mem 影響策略選擇
+    subgraph HashAgg["🟠 HashAgg（建雜湊表分組）"]
+        HA1["1. 把資料全部讀進來\n建一個 Hash Table\n（key = group 值, value = 聚合進度）"]
+        HA2["2. 全部讀完後\n一口氣輸出所有 group 的結果"]
+        HA3["🐢 必須等所有資料都讀完\n才能開始輸出"]
+        HA1 --> HA2 --> HA3
+    end
+
+    style GroupAgg fill:#e3f2fd,stroke:#1565c0
+    style HashAgg fill:#fff3e0,stroke:#ef6c00
+```
+
+> **關鍵差異**：GroupAgg 可以「邊做邊輸出」（startup cost 低），HashAgg 必須「全部做完才輸出」（startup cost 高）。這對 **LIMIT** 查詢影響很大——如果只需要前 10 筆，GroupAgg 可能算到第 3 組就夠了，HashAgg 卻得先讀完整張表。
+
+### II. Planner 怎麼選？
+
+```mermaid
+flowchart TD
+    Input{"資料進來時\n已經排好序了嗎？\n（例如來自 Index Scan）"}
+    Yes["✅ 選 GroupAgg\n（省掉 Sort 步驟\n直接分組 → 超快）"]
+    No{"work_mem 夠大嗎？\n（Hash Table 放得下嗎？）"}
+    Enough["🟠 選 HashAgg\n（Hash Table 全在記憶體中\nGroup 運算 O(1)）"]
+    NotEnough["🔵 選 GroupAgg\n（Hash Table 會 spill 到硬碟\n→ disk I/O 成本暴增\n→ 不如排序 + 分組）"]
+
+    Input -->|"是"| Yes
+    Input -->|"否"| No
+    No -->|"夠"| Enough
+    No -->|"不夠"| NotEnough
+
+    style Yes fill:#c8e6c9,stroke:#2e7d32
+    style Enough fill:#fff3e0,stroke:#ef6c00
+    style NotEnough fill:#e3f2fd,stroke:#1565c0
+```
+
+### III. 實驗：work_mem 真的會影響選擇
+
+同一條查詢，只改 `work_mem`，Planner 的選擇就變了：
 
 ```sql
 CREATE TABLE t1 (c1 INT, c2 INT, c3 INT, c4 INT);
 INSERT INTO t1 SELECT generate_series(1, 100000), 1, 1, 1;
+SELECT c1, count(*) FROM t1 GROUP BY c1;
 ```
 
-**work_mem = 4MB → external sort + GroupAgg（392ms）：**
+```mermaid
+flowchart LR
+    subgraph Case1["work_mem = 4MB"]
+        C1R["🔵 GroupAgg（392ms）\n──────────\nSort Method: external sort\nDisk: 2544kB\n（記憶體不夠排序\n→ spill 到硬碟）"]
+    end
 
-```
-Sort Method: external sort  Disk: 2544kB
-```
+    subgraph Case2["work_mem = 1GB"]
+        C2R["🟠 HashAgg（104ms）\n──────────\n無 Sort step\nHash Table 全在記憶體中"]
+    end
 
-**work_mem = 1GB → HashAggregate（104ms）：**
+    subgraph Case3["work_mem = 1GB + 強關 HashAgg"]
+        C3R["🔵 GroupAgg（68ms）\n──────────\nSort Method: quicksort\nMemory: 7760kB\n（全部在記憶體內排序\n但 Planner 還是選了 HashAgg）"]
+    end
 
-```
-HashAggregate  -- 無 Sort step，total execution 104ms
-```
-
-**強制關閉 HashAgg → quicksort + GroupAgg（68ms）：**
-
-```
-Sort Method: quicksort  Memory: 7760kB  -- 反而比 HashAgg 快
-```
-
-但在正常 GUC 設定下 optimizer 選 HashAgg，因為 cost 估算更低。
-
-## 2. 原始碼分析：cost_agg() — 兩種策略的 Cost 計算
-
-來源：`src/backend/optimizer/path/costsize.c`
-
-**AGG_SORTED（GroupAgg）**：
-
-```c
-startup_cost = input_startup_cost;           // Sort 的 startup cost
-total_cost   = input_total_cost;             // Sort 的 total cost
-total_cost  += aggcosts->transCost.per_tuple * input_tuples;
-total_cost  += (cpu_operator_cost * numGroupCols) * input_tuples;
-total_cost  += aggcosts->finalCost * numGroups;
+    style Case1 fill:#e3f2fd,stroke:#1565c0
+    style Case2 fill:#fff3e0,stroke:#ef6c00
+    style Case3 fill:#e8f5e9,stroke:#2e7d32
 ```
 
-**AGG_HASHED（HashAgg）**：
+> **重點**：case 3 告訴我們——Planner 選的**不一定是實際上最快的**。Quicksort + GroupAgg 只要 68ms，但 CBO 的 cost 模型認為 HashAgg 更划算（104ms）。這是因為 CBO 用「模型估算」而非「實際測量」來做決策。遇到這種情況，可以考慮用 `SET enable_hashagg = off` 或 Hint 來強制走 GroupAgg。
 
-```c
-startup_cost = input_total_cost;             // 必須等所有 input
-startup_cost += aggcosts->transCost.per_tuple * input_tuples;
-total_cost   = startup_cost;
-total_cost  += aggcosts->finalCost * numGroups;
+## 2. 兩種策略的成本公式（為什麼 CBO 這樣選）
+
+CBO 不是「覺得」哪個好就選哪個，而是用公式算出一個數字，選數字小的。
+
+```mermaid
+flowchart TD
+    subgraph GA["🔵 GroupAgg 的成本公式"]
+        GA_Startup["startup_cost = \n（來自 child node 的 startup cost）\n\n→ 如果 child 是 Sort：Sort 一開始就能\n   輸出第一筆 → startup 很低\n→ 如果 child 是 Index Scan：資料已排好序\n   → startup 極低甚至為 0"]
+        GA_Total["total_cost = startup_cost\n+（每 row 處理成本 × row 數）\n+（group 比對成本 × row 數）\n+（每個 group 最終化成本 × group 數）"]
+    end
+
+    subgraph HA["🟠 HashAgg 的成本公式"]
+        HA_Startup["startup_cost = \n（child node 的 **total** cost）\n\n→ 必須等 child 把**所有**資料\n   都交出來才能開始建 Hash Table\n→ startup 很高"]
+        HA_Total["total_cost = startup_cost\n+（每 row 處理成本 × row 數）\n+（每個 group 最終化成本 × group 數）"]
+    end
+
+    Diff["💡 關鍵差異\n──────────\n• GroupAgg 的 startup = child 的 **startup**\n• HashAgg 的 startup = child 的 **total**\n\n→ 這兩個數字可以差幾千倍！\n→ 所以 LIMIT 查詢傾向 GroupAgg"]
+    SortBonus["🎁 額外紅利\n──────────\n當 input 已經排好序時\n（如來自 index scan）\nGroupAgg 的 Sort 步驟直接跳過\n→ total_cost 大幅降低\n→ 遠低於 HashAgg"]
+
+    GA --> Diff
+    HA --> Diff
+    Diff --> SortBonus
+
+    style GA fill:#e3f2fd,stroke:#1565c0
+    style HA fill:#fff3e0,stroke:#ef6c00
+    style Diff fill:#f3e5f5,stroke:#7b1fa2
+    style SortBonus fill:#c8e6c9,stroke:#2e7d32
 ```
 
-**關鍵差異**：HashAgg 的 startup_cost = `input_total_cost`。GroupAgg 的 startup_cost = `input_startup_cost`（可越早輸出，對 LIMIT 查詢有利）。
+> **一句話記住**：GroupAgg 和 HashAgg 的 total CPU cost 是一樣的，差在 startup cost。如果你只需要前 N 筆（LIMIT），GroupAgg 早早就能開始輸出；HashAgg 得等全部資料讀完。
 
-原始碼註釋：
+## 3. Sort 本身也有三種策略
+
+當 GroupAgg 需要先排序時，排序本身也有三種方式，Planner 根據情況自動選擇：
+
+```mermaid
+flowchart TD
+    Sort{"需要排序的資料量\nvs 可用記憶體？"}
+
+    External["💾 外部排序（External Disk Sort）\n──────────\n• 資料量 > work_mem\n• 分批排序 → 寫入暫存檔\n• 最後合併多個暫存檔\n• ⚠️ 有 disk I/O，慢"]
+
+    Heap["📦 堆排序（Bounded Heap Sort）\n──────────\n• 只需要 LIMIT N 筆\n• 維護一個大小為 N 的 heap\n• 全表掃一遍 → 只保留前 N 筆\n• ✅ 記憶體只需裝 N 筆"]
+
+    Quick["⚡ 快速排序（Quicksort）\n──────────\n• 資料量 ≤ work_mem\n• 全部在記憶體內排序\n• ✅ 無 disk I/O，最快"]
+
+    Sort -->|"資料量 > work_mem"| External
+    Sort -->|"只要前 N 筆（LIMIT）"| Heap
+    Sort -->|"其他（資料量 ≤ work_mem）"| Quick
+
+    style External fill:#ffebee,stroke:#c62828
+    style Heap fill:#fff3e0,stroke:#ef6c00
+    style Quick fill:#c8e6c9,stroke:#2e7d32
 ```
-* AGG_SORTED and AGG_HASHED have exactly the same total CPU cost,
-* but AGG_SORTED has lower startup cost. If the input path is
-* already sorted appropriately, AGG_SORTED should be preferred.
-```
 
-> 當 input 已有序時（如來自 BTREE index scan 或 merge join），AGG_SORTED 可以跳過 Sort step，此時 GroupAgg 的 total cost 會顯著低於 HashAgg。
-
-## 3. cost_sort() — Sort 策略的成本分岔
-
-來源：`src/backend/optimizer/path/costsize.c`
-
-```
-1. output_bytes > sort_mem_bytes  →  external disk sort (polyphase merge)
-2. tuples > 2 × output_tuples  →  bounded heap sort (LIMIT 場景)
-3. 其他 →  quicksort (全部 in-memory)
-```
+> **白話**：有足夠記憶體 → 全部在記憶體排（最快）。記憶體不夠 → 分批排再合併（有 disk I/O）。只要前 N 筆 → 用 heap 只保留前 N 筆（省記憶體又省時間）。
 
 ## 4. GroupAgg vs HashAgg 選擇的實戰考量
 
-| 維度 | GroupAgg | HashAgg |
-|------|----------|---------|
-| requires sort | 是（除非 input 已有序） | 否 |
-| startup cost | 低 | 高（=input total cost） |
-| memory risk | 取決於 sort 階段 memory | 取決於 #distinct groups |
-| LIMIT 友好 | 是（early output） | 否（需建完整 hash table） |
-| 大量 distinct groups | 不適合 | 適合（若 hash table fits memory） |
-| input 已有序 | **最佳**（skip sort） | 仍需建 hash table |
+```mermaid
+flowchart TD
+    Q["🤔 我該選哪個？"]
 
-> 當 `work_mem` 不足造成 HashAgg 的 hash table spill 到 disk 時，成本會急劇上升。可透過 `SET enable_hashagg = off` 強制切換 GroupAgg 對比真實 performance。
+    subgraph GA_When["🔵 選 GroupAgg 的場景"]
+        G1["✅ input 已經排好序（Index Scan）\n→ 直接 skip Sort，超快"]
+        G2["✅ 查詢有 LIMIT（只要前幾筆）\n→ 可以 early output\n→ 算到第 N 組就停了"]
+        G3["✅ work_mem 不夠大\n→ Hash Table 會 spill to disk\n→ 排序反而比較可控"]
+    end
+
+    subgraph HA_When["🟠 選 HashAgg 的場景"]
+        H1["✅ 大量 distinct groups\n→ GroupAgg 要排很多行\n→ HashAgg 用 hash table O(1) 查"]
+        H2["✅ 沒有合適的 index\n→ input 沒排好序\n→ GroupAgg 必須額外 Sort\n→ HashAgg 直接建 hash table"]
+        H3["✅ work_mem 夠大\n→ Hash Table 全在記憶體\n→ 不需要 spill to disk"]
+    end
+
+    Fallback["⚠️ 如果 HashAgg spill to disk\n──────────\n用 SET enable_hashagg = off\n強制切換 GroupAgg 測試\n對比實際效能後決定"]
+
+    Q --> GA_When
+    Q --> HA_When
+    HA_When --> Fallback
+
+    style GA_When fill:#e3f2fd,stroke:#1565c0
+    style HA_When fill:#fff3e0,stroke:#ef6c00
+    style Fallback fill:#fce4ec,stroke:#c62828
+```
 
 ## 5. 相關參數與版本演進
 
 | 參數 | 預設 | 說明 |
 |------|------|------|
-| `enable_hashagg` | on | 允許 optimizer 選擇 HashAgg |
-| `work_mem` | 4MB | sort 與 hash table 的 memory 上限 |
-| `hash_mem_multiplier` | 2.0 (PG 16+) | Hash 操作的 memory = `work_mem × hash_mem_multiplier` |
+| `enable_hashagg` | on | 允許 Planner 選擇 HashAgg（關掉就強制 GroupAgg） |
+| `work_mem` | 4MB | sort 與 hash table 共用的記憶體上限 |
+| `hash_mem_multiplier` | 2.0 (PG 16+) | Hash 操作可用 `work_mem × 此倍數` 的記憶體 |
 
-| 功能 | 版本 |
-|------|------|
-| parallel hash join / hashagg | PG 11+ |
-| disk-based HashAgg | PG 13+ |
-| plan-time hash sizing | PG 14+ |
-| hash_mem_multiplier | PG 16 |
+```mermaid
+timeline
+    title GROUP BY 相關功能演進
+    PG 11 : parallel hash agg\n多 worker 平行聚合
+    PG 13 : disk-based HashAgg\nHash Table 可 spill to disk
+    PG 14 : plan-time hash sizing\nPlanner 能估算 hash 記憶體用量
+    PG 16 : hash_mem_multiplier\nHash 可用更多記憶體
+```
 
 ---
 
@@ -1602,66 +1935,120 @@ total_cost  += aggcosts->finalCost * numGroups;
 
 ## 1. 四種寫法與 Execution Plan
 
+查詢「id 在某個清單裡」有四個寫法，但 PG 內部的處理方式完全不同：
+
 ```sql
 -- 1) IN 列表
 SELECT * FROM t2 WHERE id IN (1,2,3,100,1000,0);
 
--- 2) =ANY(ARRAY) → optimizer 內部改寫為 ScalarArrayOpExpr
+-- 2) =ANY(ARRAY)
 SELECT * FROM t2 WHERE id = ANY ('{1,2,3,100,1000,0}'::integer[]);
 
--- 3) =ANY(VALUES) → 產生 HashAggregate + Nested Loop
+-- 3) =ANY(VALUES)
 SELECT * FROM t2 WHERE id = ANY (VALUES (1),(2),(3),(100),(1000),(0));
 
--- 4) JOIN VALUES → Nested Loop（不產生 HashAggregate）
+-- 4) JOIN VALUES
 SELECT t2.* FROM t2 JOIN (VALUES (1),(2),(3),(100),(1000),(0)) AS t(id) ON t2.id = t.id;
+```
+
+```mermaid
+flowchart TD
+    subgraph W1["寫法 1：IN (...)"]
+        W1P["Planner 把清單當成\n一組常數值\n直接納入 Scan 條件"]
+        W1R["🔍 執行：Index Scan\n（少量值）或 Bitmap Scan（大量值）\n\nPG 14+：>9 個值自動改用 hash table"]
+    end
+
+    subgraph W2["寫法 2：=ANY(ARRAY[...])"]
+        W2P["Planner 視為\n「單一 array 變數」\n不知道裡面有幾個元素"]
+        W2R["🔍 執行：Bitmap Heap Scan\n→ 先讀符合任意條件的 page\n→ 再逐行比對 array 內容\n\n⚠️ 大陣列時 Filter 開銷極大"]
+    end
+
+    subgraph W3["寫法 3：=ANY(VALUES(...))"]
+        W3P["Planner 視為\n「子查詢結果集」\n先對 VALUES 去重"]
+        W3R["🔍 執行：HashAgg + Nested Loop\n→ 先把 VALUES 去重（可 hash/sort）\n→ 再逐值精確查 index\n\n✅ 對大清單穩定性最佳"]
+    end
+
+    subgraph W4["寫法 4：JOIN VALUES(...)"]
+        W4P["與寫法 3 類似\n但不保證去重"]
+        W4R["🔍 執行：Nested Loop\n→ 同上，但可能產生重複 row\n\n⚠️ 若 VALUES 有重複值\n結果可能重複"]
+    end
+
+    W1 --> W2 --> W3 --> W4
+
+    style W1 fill:#e8f5e9,stroke:#2e7d32
+    style W2 fill:#ffebee,stroke:#c62828
+    style W3 fill:#e3f2fd,stroke:#1565c0
+    style W4 fill:#fff3e0,stroke:#ef6c00
 ```
 
 ## 2. Datadog 實戰案例：22s → 263ms（100x 提速）
 
-### I. 原始問題
+```mermaid
+flowchart TD
+    Problem["🆘 問題\n──────────\n1500 萬 row 的表\n查 11,000 個 primary key\n→ 花了 22 秒"]
 
-15 百萬 row 的表，查詢 11,000 個 primary key 時花了 22 秒。執行計劃核心節點是 **Bitmap Heap Scan + Filter**，Filter 逐行檢查 11,000 個 key 的 membership。
+    Root["🔍 根因\n──────────\n寫法：=ANY(ARRAY[...])\nPlanner 選了 Bitmap Heap Scan\n→ 把符合「任意 key」的 page 全讀出來\n→ 再逐行比對 key 是否在 array 中\n→ 11,000 個 key × 大量 row\n→ Filter overhead 爆炸"]
 
-### II. 根因
+    Fix["✅ 解法：只改一行\n──────────\n=ANY(ARRAY[...])\n→ 改成\n=ANY(VALUES(...))\n→ Planner 改選\nNested Loop Index Scan\n→ 逐 key 精確查 index\n→ 不用大量 Filter 比對"]
 
-大陣列 `=ANY(ARRAY[...])` 讓 optimizer 選擇 **Bitmap Heap Scan + Filter** 而非 **Index Scan**。Bitmap 將所有符合條件的 page 讀出，然後在 Filter 階段逐行比對 key ∈ array → 產生巨大的 Recheck overhead。
+    Result["🎉 結果\n──────────\n22s → 263ms\n→ 100x 加速\n\n只改了一行程式碼"]
 
-### III. 解法（一行差異）
+    Problem --> Root --> Fix --> Result
 
-```sql
--- Before: 22s
-WHERE c.key = ANY (ARRAY[15368196, ...])
--- After: 263ms (100x faster)
-WHERE c.key = ANY (VALUES (15368196), ...)
+    style Problem fill:#ffebee,stroke:#c62828
+    style Root fill:#fff3e0,stroke:#ef6c00
+    style Fix fill:#e8f5e9,stroke:#2e7d32
+    style Result fill:#c8e6c9,stroke:#388e3c
 ```
 
-新計劃使用 **Nested Loop Index Scan**（一次性逐 key 精確查表）。
+> **教訓**：不是 Index 沒用，而是 Planner 被 `=ANY(ARRAY[...])` 誤導了——它把 array 當成一個「整體變數」，不知道裡面有 11,000 個值。改成 `=ANY(VALUES(...))` 後，Planner 才意識到這是「子查詢」→ 選擇逐 key 查 index。
 
 ## 3. PG 14 實測：work_mem 對 VALUES 策略的影響
 
-`=ANY(VALUES(...))` 的效能受 **work_mem** 影響：低 work_mem 時 VALUES 去重用 external sort → disk I/O，高 work_mem 時用 in-memory HashAggregate。但即使 external sort，仍遠快於 Bitmap Heap Scan + Filter 方案。
+`=ANY(VALUES(...))` 內部會先對 VALUES 去重（否則重複的值會浪費一次 index 查詢）。去重的方式受 `work_mem` 影響：
 
-> PG 14 起引入 `MIN_ARRAY_SIZE_FOR_HASHED_SAOP`（預設 9），當 `IN` 列表超過 9 個元素時，optimizer 自動將 `INDEX = ANY(ARRAY[...])` 從 sequential scan 切換為 hash table probe，大幅改善中等大小 IN 列表的效能。
+```mermaid
+flowchart LR
+    Values["📋 VALUES 清單\n（可能含重複值）"]
+
+    dedup{"work_mem\n夠大嗎？"}
+    Hash["✅ In-Memory HashAgg\n（去重極快）"]
+    Sort["💾 External Sort 去重\n（有 disk I/O\n但還是比 BitmapScan 快）"]
+
+    Values --> dedup
+    dedup -->|"夠"| Hash
+    dedup -->|"不夠"| Sort
+
+    style Hash fill:#c8e6c9,stroke:#2e7d32
+    style Sort fill:#fff3e0,stroke:#ef6c00
+```
+
+> PG 14 起改善了大陣列的處理：當 `IN` 列表超過 9 個元素時，Planner 自動改用 hash table probe 而非 sequential scan，讓中等大小的 `=ANY(ARRAY[...])` 也不再是地雷。
 
 ## 4. 效能矩陣：何時用哪種寫法
 
-| 寫法 | 適合場景 | 注意 |
-|------|---------|------|
-| `IN (1,2,3)` | ≤ 9 個元素（PG 14+ 自動 hash） | 不適合動態拼接 |
-| `=ANY(ARRAY[...])` | ≤ 數百個元素 | 大陣列可能選 Bitmap Scan |
-| `=ANY(VALUES(...))` | 數百~數萬個元素 | 大列表穩定性極佳 |
-| `JOIN (VALUES(...))` | 需保留排序 | 不保證唯一回傳 |
+```mermaid
+flowchart TD
+    Q{"清單有幾個元素？"}
+    Q1["≤ 9 個\n→ 用 IN (...)\n最簡單、Planner 自動優化"]
+    Q2["10~500 個\n→ 用 =ANY(ARRAY[...])\n比 VALUES 簡潔，PG 14+ 會優化"]
+    Q3["500~50,000 個\n→ 用 =ANY(VALUES(...))\n穩定性最佳，避免 BitmapScan 陷阱"]
+    Q4[">50,000 個\n→ 建 TEMP TABLE\nINSERT + ANALYZE + JOIN\n讓 Planner 有完整統計資訊"]
 
-### I. 選擇決策
+    Q --> Q1
+    Q --> Q2
+    Q --> Q3
+    Q --> Q4
 
-```
-元素數 ≤ 9     → IN (...)
-元素數 10~500  → =ANY(ARRAY[...])
-元素數 500~50K → =ANY(VALUES(...))
-元素數 > 50K   → TEMPORARY TABLE + JOIN + ANALYZE
+    style Q1 fill:#c8e6c9,stroke:#2e7d32
+    style Q2 fill:#e3f2fd,stroke:#1565c0
+    style Q3 fill:#fff3e0,stroke:#ef6c00
+    style Q4 fill:#fce4ec,stroke:#c62828
 ```
 
 ## 5. Multi-Column IN 的寫法
+
+多欄位的 `IN` 查詢，**只有** `=ANY(VALUES)` 寫法支援：
 
 ```sql
 -- 多列 IN：只有 =ANY(VALUES) 可用
@@ -1670,12 +2057,14 @@ WHERE (col_a, col_b) = ANY(VALUES (1,'x'), (2,'y'), (3,'z'))
 
 ## 6. 版本演進
 
-| 功能 | 版本 |
-|------|------|
-| `=ANY(VALUES)` 基本支援 | PG 8.4+ |
-| `plan_cache_mode = force_custom_plan` | PG 12 |
-| `MIN_ARRAY_SIZE_FOR_HASHED_SAOP` | PG 14 |
-| `enable_presorted_aggs` | PG 17 |
+```mermaid
+timeline
+    title IN / ANY 相關功能演進
+    PG 8.4 : =ANY(VALUES) 基本支援
+    PG 12 : plan_cache_mode\nforce_custom_plan
+    PG 14 : 大 IN 列表自動 hash\n（MIN_ARRAY_SIZE_FOR_HASHED_SAOP）
+    PG 17 : enable_presorted_aggs
+```
 
 ---
 
@@ -1683,130 +2072,274 @@ WHERE (col_a, col_b) = ANY(VALUES (1,'x'), (2,'y'), (3,'z'))
 
 > 來源：[digoal - 论 count 与 offset 使用不当的罪名 (2016-05-06)](https://github.com/digoal/blog/blob/master/201605/20160506_01.md)
 
-## 1. count(\*) 的替代：EXPLAIN Row Estimate
+## 1. count(*) 的替代：不用真的數
 
-### I. 問題
+### I. 問題：典型分頁為什麼慢？
 
-典型分頁流程：先 `count(*)` 算總數 → 算頁數 → 再 `SELECT ... LIMIT N OFFSET M` 取數據。這等於同一批數據掃了兩遍。
+```mermaid
+flowchart TD
+    Page["📄 你的前端分頁\n需要知道：總共有幾頁？"]
+    Count["🐢 count(*)\n→ 掃一遍整張表\n→ 得出總 row 數\n→ 例如：100 萬 row → 花了 2 秒"]
+    Select["🐢 SELECT ... LIMIT N OFFSET M\n→ 再掃一遍\n→ 取出當前頁的資料"]
+    Result["😭 同一批資料掃了兩遍"]
 
-### II. count_estimate() 函數
+    Page --> Count --> Select --> Result
 
-從 `EXPLAIN` 輸出中擷取 planner 的 row estimate，完全避免實際掃描數據：
-
-```sql
-CREATE FUNCTION count_estimate(query text) RETURNS INTEGER AS
-$func$
-DECLARE
-    rec   record;
-    ROWS  INTEGER;
-BEGIN
-    FOR rec IN EXECUTE 'EXPLAIN ' || query LOOP
-        ROWS := SUBSTRING(rec."QUERY PLAN" FROM ' rows=([[:digit:]]+)');
-        EXIT WHEN ROWS IS NOT NULL;
-    END LOOP;
-    RETURN ROWS;
-END
-$func$ LANGUAGE plpgsql;
+    style Count fill:#ffebee,stroke:#c62828
+    style Select fill:#ffebee,stroke:#c62828
+    style Result fill:#ffcdd2,stroke:#c62828
 ```
 
-### III. 精度對比
+### II. 解法：用 Planner 的估算值代替真實計數
 
-```sql
-SELECT count_estimate('SELECT * FROM sbtest1 WHERE id BETWEEN 100 AND 100000');
--- → 102,166
+Planner 在產生執行計畫時，**本來就會估算**會有多少 row。你可以直接拿這個估算值來用，完全不用真的掃資料：
 
-SELECT count(*) FROM sbtest1 WHERE id BETWEEN 100 AND 100000;
--- → 99,901  （誤差 ≈ 2.3%）
+```mermaid
+flowchart LR
+    subgraph Slow["🐢 精確數法（count(*)）"]
+        S1["全表掃描"]
+        S2["花 2 秒"]
+        S3["得到精確數字：99,901"]
+        S1 --> S2 --> S3
+    end
+
+    subgraph Fast["⚡ 估算法（EXPLAIN）"]
+        F1["讀 Planner 的 row estimate"]
+        F2["花 0.001 秒"]
+        F3["得到近似數字：102,166\n（誤差約 2.3%）"]
+        F1 --> F2 --> F3
+    end
+
+    style Slow fill:#ffebee,stroke:#c62828
+    style Fast fill:#c8e6c9,stroke:#2e7d32
 ```
 
-### IV. 精度依賴
+### III. 何時估算可靠？何時不可靠？
 
-> **何時 count_estimate 不可靠？**
-> - 最後一次 `ANALYZE` 後有大規模 INSERT/DELETE
-> - 查詢包含複雜的 multi-column filter
-> - `WHERE` 中有 function call（planner 使用 default selectivity = 0.005）
-> - 剛 `TRUNCATE` + 重新 `INSERT` 但尚未 ANALYZE 的表
->
-> **更輕量的近似 count 方案**：
-> ```sql
-> SELECT reltuples::bigint FROM pg_class WHERE relname = 'your_table';  -- 零成本
-> SELECT n_live_tup FROM pg_stat_user_tables WHERE relname = 'your_table';
-> ```
->
-> **實務建議**：前端頁碼導航的總頁數不需要精確到個位數——用 `reltuples` 或 `count_estimate()`，設定 TTL 緩存（Redis 30-60s）。只有需要精確合規報表才用真實 `count(*)`。
+```mermaid
+flowchart TD
+    Q{"估算值可靠嗎？"}
 
-## 2. OFFSET 效能退化與 CURSOR 對比
+    Good["✅ 可靠（誤差 < 5%）\n──────────\n• 有定期跑 ANALYZE\n• 沒有突然大量 INSERT/DELETE\n• WHERE 條件相對簡單\n• 單一欄位過濾"]
 
-### I. 問題重現
+    Bad["❌ 不可靠\n──────────\n• 最後一次 ANALYZE 後\n  有大量資料變更\n• WHERE 包含自訂函數\n  （Planner 猜不準選擇率）\n• 剛 TRUNCATE + INSERT\n  還沒跑 ANALYZE\n• 複雜的多欄位聯合過濾"]
 
-```sql
--- OFFSET 0：極快 (0.088ms)
--- OFFSET 900000：退化 3700x (462ms)
+    Q --> Good
+    Q --> Bad
+
+    style Good fill:#c8e6c9,stroke:#2e7d32
+    style Bad fill:#ffebee,stroke:#c62828
 ```
 
-Index Scan 掃了 900,100 row 才能跳過 900,000 → 丟棄 → 再取最後 100 row。
+> **實務建議**：前端頁碼導航的總頁數不需要精確到個位數。用 `EXPLAIN` 的 row estimate 或直接查系統表（`SELECT reltuples FROM pg_class WHERE relname = 'your_table'`，零成本、零延遲），設定 Redis TTL 30~60s 做快取。只有財務報表或合規審計才需要真實 `count(*)`。
 
-### II. CURSOR 方案
+## 2. OFFSET 效能退化與三種分頁方案
 
-```sql
-BEGIN;
-DECLARE cur1 CURSOR FOR
-  SELECT * FROM sbtest1 WHERE id BETWEEN 100 AND 1000000 ORDER BY id;
-FETCH 100 FROM cur1;
+### I. 為什麼 OFFSET 越大越慢？
+
+```mermaid
+flowchart TD
+    subgraph Page1["📄 第 1 頁（OFFSET 0）"]
+        P1S["Index Scan 只讀 10 row"]
+        P1R["→ 0.088ms ✅"]
+    end
+
+    subgraph Page2["📄 第 90,001 頁（OFFSET 900,000）"]
+        P2S["Index Scan 掃了 900,100 row\n→ 丟掉前 900,000 row\n→ 只留最後 100 row"]
+        P2R["→ 462ms ❌（慢 3700 倍）"]
+    end
+
+    Why["💡 原因：OFFSET 不是『跳到第 N 筆』\n而是『從頭讀到第 N 筆、全部丟掉』"]
+
+    Page1 --> Why
+    Page2 --> Why
+
+    style Page1 fill:#c8e6c9,stroke:#2e7d32
+    style Page2 fill:#ffebee,stroke:#c62828
 ```
 
-CURSOR 的一次性 MOVE 成本等同 OFFSET，但後續 FETCH 成本極低。但 CURSOR 綁定在 backend connection 上，HTTP 請求之間無法保持，web 場景基本不可行。
+### II. 三種分頁方案對比
 
-### III. 三種分頁方案對比
+```mermaid
+flowchart TD
+    subgraph Offset["1️⃣ OFFSET / LIMIT"]
+        OF1["跳頁方式：從頭讀、丟掉、取後段"]
+        OF2["深頁效能：線性退化（翻越後面越慢）"]
+        OF3["✅ 優點：可任意跳頁\n❌ 缺點：深頁極慢"]
+    end
 
-| 方案 | 深頁效能 | Memory | 長 Transaction | 任意跳頁 |
-|------|---------|--------|---------------|---------|
-| OFFSET/LIMIT | 線性退化 | 低 | 無 | 支援 |
-| CURSOR | MOVE 一次成本，後續 O(1) | 低 | **嚴重** | 方向可控 |
-| Keyset Pagination | O(1) seek | 低 | 無 | **不支援** |
+    subgraph Cursor["2️⃣ CURSOR"]
+        C1["跳頁方式：MOVE 一次性跳過"]
+        C2["深頁效能：MOVE 成本同 OFFSET，但 FETCH 極快"]
+        C3["✅ 優點：適合連續往後翻\n❌ 缺點：長 Transaction\nHTTP 之間無法保持\nWeb 場景不可行"]
+    end
 
-## 3. 自建位點法：當 ORDER BY column 沒有 PK/UK 時
+    subgraph Keyset["3️⃣ Keyset Pagination（位點法）"]
+        K1["跳頁方式：WHERE id > 上次最後一筆 id"]
+        K2["深頁效能：O(1) 定位\n（Index Seek 直接跳到目標位置）"]
+        K3["✅ 優點：任何深度都快\n❌ 缺點：不能直接跳到『第 N 頁』\n只能『上一頁/下一頁』"]
+    end
 
-### I. 問題
+    Offset --> Cursor --> Keyset
 
-當排序欄位不是 PK 或 UK 時，同一 `crt_time` 可能對應多條 row，keyset 位點無法唯一指定。
+    style Offset fill:#ffebee,stroke:#c62828
+    style Cursor fill:#fff3e0,stroke:#ef6c00
+    style Keyset fill:#c8e6c9,stroke:#2e7d32
+```
 
-### II. 解法：強制加入自增 PK 作為 tie-breaker
+## 3. 自建位點法：當 ORDER BY 欄位沒有 PK 時
+
+### I. 為什麼位點會錯亂？用具體資料來看
+
+假設有一張訂單表，照 `created_at` 排序分頁：
 
 ```sql
-CREATE TABLE test1 (
-    pk SERIAL8 PRIMARY KEY,
-    id INT, c1 INT, c2 INT, c3 INT, c4 INT,
-    crt_time TIMESTAMP
+CREATE TABLE orders (
+    id      INT,
+    amount  INT,
+    created_at TIMESTAMP
 );
-CREATE INDEX idx_test1_1 ON test1(c1, crt_time, pk);
-
--- keyset pagination
-SELECT * FROM test1
-WHERE c1 = 1 AND c2 BETWEEN 1 AND 10
-  AND crt_time >= '2018-07-25 18:31:14.860328'
-  AND pk > 1048412
-ORDER BY crt_time, pk LIMIT 10;
+INSERT INTO orders VALUES
+    (1, 100, '2024-01-01 10:00:00'),
+    (2, 200, '2024-01-01 10:00:00'),  -- ← 同一秒！
+    (3, 150, '2024-01-01 10:00:00'),  -- ← 同一秒！
+    (4, 300, '2024-01-01 10:00:01'),
+    (5, 250, '2024-01-01 10:00:01');  -- ← 同一秒！
 ```
 
-### III. 效能對比
+第一頁取 2 筆：
+
+```sql
+SELECT * FROM orders ORDER BY created_at LIMIT 2;
+-- 結果：id=1 (10:00:00), id=2 (10:00:00)
+```
+
+現在要取下一頁。你拿到最後一筆的 `created_at = '2024-01-01 10:00:00'` 當位點：
+
+```sql
+-- ❌ 錯誤寫法
+SELECT * FROM orders
+WHERE created_at > '2024-01-01 10:00:00'
+ORDER BY created_at LIMIT 2;
+-- 結果：id=4 (10:00:01), id=5 (10:00:01)
+--        ^^^^^^ 漏掉了 id=3！
+```
+
+```mermaid
+flowchart TD
+    Data["📊 原始資料（照 created_at 排序）\n──────────\nRow 1: id=1, 10:00:00\nRow 2: id=2, 10:00:00  ← 第 1 頁到這裡\nRow 3: id=3, 10:00:00  ← 同一秒，但被跳過了！\nRow 4: id=4, 10:00:01\nRow 5: id=5, 10:00:01"]
+
+    Why["💡 為什麼？\n──────────\nWHERE created_at > '10:00:00'\n把 Row 3 也排除了\n因為 Row 3 的 created_at\n等於 10:00:00，沒有大於"]
+
+    Fix["✅ 怎麼辦？\n──────────\n需要一個『第二排序關鍵』\n來區分同一秒內的三筆資料\n→ 這就是 tie-breaker"]
+
+    Data --> Why --> Fix
+
+    style Data fill:#e3f2fd,stroke:#1565c0
+    style Why fill:#ffebee,stroke:#c62828
+    style Fix fill:#c8e6c9,stroke:#2e7d32
+```
+
+### II. 解法：用一個唯一且不可變的欄位當 tie-breaker
+
+加上一個自增 PK，改寫成：
+
+```sql
+-- 第 1 頁
+SELECT * FROM orders ORDER BY created_at, id LIMIT 2;
+-- 結果：(1, 10:00:00), (2, 10:00:00)
+
+-- 第 2 頁（正確！）
+SELECT * FROM orders
+WHERE (created_at, id) > ('2024-01-01 10:00:00', 2)
+ORDER BY created_at, id LIMIT 2;
+-- 結果：(3, 10:00:00), (4, 10:00:01)  ← id=3 沒漏掉！
+```
+
+```mermaid
+flowchart TD
+    subgraph Order1["📄 第 1 頁"]
+        O1["ORDER BY created_at, id LIMIT 2\n→ 拿到 id=1, id=2\n→ 記住最後一筆：(10:00:00, 2)"]
+    end
+
+    subgraph Order2["📄 第 2 頁"]
+        O2["WHERE (created_at, id) > ('10:00:00', 2)\n          ^^^^^^^^^  ^\n          時間相等  但 id=3 > 2\n          → Row 3 不會被跳過！"]
+    end
+
+    Order1 --> Order2
+
+    style Order1 fill:#e3f2fd,stroke:#1565c0
+    style Order2 fill:#c8e6c9,stroke:#2e7d32
+```
+
+> **關鍵語法**：`(a, b) > (x, y)` 是 PostgreSQL 的**複合比較**（row comparison）。先比第一個欄位，相等才比第二個。所以 `(10:00:00, 3) > (10:00:00, 2)` 是 TRUE（時間相等、id 較大）。
+
+### III. Index 設計原理：為什麼是 (filter_col, order_col, pk)？
+
+這個 index 的順序不是隨便排的，直接決定了查詢能不能用 Index Seek：
+
+```mermaid
+flowchart TD
+    subgraph GoodIdx["✅ 正確：CREATE INDEX ON orders(filter_col, order_col, pk)"]
+        G1["WHERE filter_col = 'X'\n  AND (order_col, pk) > ('2024-01-01', 12345)\nORDER BY order_col, pk LIMIT 10"]
+        G2["Index 怎麼跑的：\n──────────\n1. 用 filter_col 定位到 X 的起點\n2. 在 X 的範圍內\n   用 (order_col, pk) 跳到指定位點\n3. 往後掃 10 筆 → 停止\n\n🎯 只讀 10 筆 index entry"]
+    end
+
+    subgraph BadIdx["❌ 錯誤：CREATE INDEX ON orders(pk, order_col, filter_col)"]
+        B1["WHERE filter_col = 'X' ..."]
+        B2["Index 怎麼跑的：\n──────────\n1. filter_col 不是 index 第一欄\n→ Index 完全用不到\n→ 只能全表掃描"]
+    end
+
+    GoodIdx --> BadIdx
+
+    style GoodIdx fill:#c8e6c9,stroke:#2e7d32
+    style BadIdx fill:#ffebee,stroke:#c62828
+```
+
+> **規則**：Index 最左邊的欄位必須是 `WHERE` 中用 `=` 過濾的欄位，然後才是 `ORDER BY` 欄位，最後是 tie-breaker。這樣 B-tree 才能精確跳到目標位置。
+
+### IV. 實務細節
+
+**`>=` 還是 `>`？**
+
+| 寫法 | 行為 | 用哪個 |
+|------|------|--------|
+| `WHERE crt_time > '10:00:00'` | 排除等於 10:00:00 的所有 row | ❌ 會漏掉同一秒的其他 row |
+| `WHERE (crt_time, pk) > ('10:00:00', 12345)` | 時間大於 10:00:00，**或**時間相等但 pk 大於 12345 | ✅ 正確 |
+
+**為什麼 PK 不能 UPDATE？**
+
+```mermaid
+flowchart LR
+    subgraph Bad["❌ PK 被 UPDATE 了"]
+        B1["id=2 被改成 id=99\n→ 位點記錄的是 (10:00:00, 2)\n→ 但 id=2 已經不存在了\n→ 位點漂移 → 漏資料或重複資料"]
+    end
+
+    subgraph Good["✅ PK 是 append-only"]
+        G1["PK 只增不減、不改\n→ id=2 永遠是 id=2\n→ 位點永遠有效"]
+    end
+
+    Bad --> Good
+
+    style Bad fill:#ffebee,stroke:#c62828
+    style Good fill:#c8e6c9,stroke:#2e7d32
+```
+
+### V. 效能對比
 
 | 指標 | OFFSET | Keyset | 改善 |
 |------|--------|--------|------|
 | Execution time | 53.4 ms | **0.075 ms** | **712x** |
-| shared_buffers hit | 8,506 | **9** | 945x |
-| Row scanned | 100,010 | **~10** | 10,000x |
+| 掃描 row 數 | 100,010 | **~10** | 10,000x |
 
-### IV. 設計要點
+### VI. 設計要點總結
 
 1. `ORDER BY` 必須包含 tie-breaker（PK）以確保順序唯一
 2. Index key 順序必須是 `(filter_column, order_column, pk)`
 3. PK 必須是 append-only（不可 UPDATE），否則位點會漂移
-
-> **自建 PK 的生產考量**：
-> - PG 10+ 建議用 `GENERATED ALWAYS AS IDENTITY` 替代 `SERIAL`
-> - 大表遷移：`ALTER TABLE ADD COLUMN pk BIGSERIAL PRIMARY KEY` 會鎖全表，需用 `pg_repack` 或建立新表 + 批次遷移
-> - 如果原始業務表已有 business key（如 `order_id + line_item`），優先使用 business key 作為 tie-breaker
+4. 用複合比較 `(a, b) > (x, y)` 而不是分開寫兩個 `WHERE AND`
+5. PG 10+ 建議用 `GENERATED ALWAYS AS IDENTITY` 替代 `SERIAL`
+6. 如果業務表已有 business key（如 `order_id + line_item`），優先用它當 tie-breaker
 
 ---
 
@@ -1815,28 +2348,164 @@ ORDER BY crt_time, pk LIMIT 10;
 > 來源：[digoal - 递归优化CASE (2012-09-14)](https://github.com/digoal/blog/blob/master/201209/20120914_01.md)
 > [digoal - distinct xx和count(distinct xx)的变态递归优化方法 (2016-11-28)](https://github.com/digoal/blog/blob/master/201611/20161128_02.md)
 
-## 1. 問題本質：全表 GROUP BY / DISTINCT 的掃描浪費
+## 1. 問題本質：GROUP BY / DISTINCT 為什麼要掃全表？
 
-### I. 經典問題 SQL
-
-```sql
-SELECT a.skyid, a.giftpackageid, a.giftpackagename, a.intimestamp
-FROM tbl_anc_player_win_log a
-GROUP BY a.skyid, a.giftpackageid, a.giftpackagename, a.intimestamp
-ORDER BY a.intimestamp DESC LIMIT 10;
-```
-
-這個查詢看似取 10 row，但 `GROUP BY` 會先對全表做排序/聚合，然後才取 Top 10。
+### I. 先建立具體場景
 
 ```sql
-SELECT COUNT(DISTINCT sex) FROM sex;  -- sex 只有 'm'/'w' 兩個值
+-- 一張 2000 萬 row 的用戶表
+CREATE TABLE users (
+    id      SERIAL PRIMARY KEY,
+    name    TEXT,
+    sex     TEXT,      -- 只有 'm' 和 'w' 兩種值
+    city    TEXT,
+    age     INT
+);
+
+-- 幫 sex 建一個 B-tree index
+CREATE INDEX idx_users_sex ON users (sex);
 ```
 
-在 2000 萬 row 的表上，即使建立 index，仍需掃完整個 index 才能做完 GROUP BY / DISTINCT —— PostgreSQL Index Only Scan 不支援「看到 unique value 就停」的 lazy aggregation。
+現在執行一個看起來很簡單的查詢：
 
-> B-tree index 的本質限制：B-tree 是 **range-scan oriented**，不支援直接跳到「下一個不同值」。Oracle 的 **Index Skip Scan** 能做這件事，PostgreSQL 直到 PG 17（2024）才加入了部分支援。本文介紹的 recursive CTE 技巧本質上是用 **application-level loop** 模擬了 Skip Scan。
+```sql
+SELECT COUNT(DISTINCT sex) FROM users;
+-- sex 只有 'm' 和 'w' 兩種值，2000 萬 row
+-- 你的期待：讀到 m 和 w 就停 → 0.01ms
+-- 實際結果：掃完 2000 萬 row → 好幾秒
+```
+
+### II. 為什麼 B-tree 不能「看到不同值就停」？
+
+`idx_users_sex` 這個 B-tree index 的內部結構長這樣：
+
+```mermaid
+flowchart TD
+    subgraph BTree["🌳 idx_users_sex 的 B-tree 結構"]
+        BR["🔵 Root\n[min='m', max='w']\n指到兩個 leaf page"]
+        BL1["Leaf Page 1\n──────────\nindex entry: 'm' → heap ptr\nindex entry: 'm' → heap ptr\nindex entry: 'm' → heap ptr\n...（1000 萬個 'm'）..."]
+        BL2["Leaf Page 2\n──────────\nindex entry: 'w' → heap ptr\nindex entry: 'w' → heap ptr\nindex entry: 'w' → heap ptr\n...（1000 萬個 'w'）..."]
+        BR --> BL1
+        BR --> BL2
+    end
+
+    subgraph Scan["🔍 COUNT(DISTINCT sex) 的掃描過程"]
+        S1["從最左邊的 leaf 開始"]
+        S2["看到 'm' → 還沒見過，記錄"]
+        S3["看到 'm' → 見過了，跳過\n看到 'm' → 見過了，跳過\n...（1000 萬次）..."]
+        S4["看到 'w' → 還沒見過，記錄"]
+        S5["看到 'w' → 見過了，跳過\n...（1000 萬次）..."]
+        S6["掃到 leaf 盡頭 → 結束\n\n結果：2 個 distinct 值\n代價：掃了 2000 萬筆 index entry"]
+    end
+
+    BTree --> Scan
+
+    style BTree fill:#e3f2fd,stroke:#1565c0
+    style Scan fill:#ffebee,stroke:#c62828
+```
+
+```mermaid
+flowchart LR
+    subgraph Wish["🤔 我們想要的（Index Skip Scan）"]
+        W1["讀到 'm' → 記錄"]
+        W2["直接跳到下一個不同值\n→ 'w' → 記錄"]
+        W3["下一個不同值是 NULL\n→ 結束\n→ 只讀 2 筆！"]
+        W1 --> W2 --> W3
+    end
+
+    subgraph Reality["😭 B-tree 實際能做到的"]
+        R1["讀到 'm' → 'm' → 'm' → ...\n（只能一個一個往下讀）\n→ 無法『跳過相同值』"]
+    end
+
+    style Wish fill:#c8e6c9,stroke:#2e7d32
+    style Reality fill:#ffebee,stroke:#c62828
+```
+
+> **核心問題**：B-tree 是「**range scan**」導向的結構——它非常擅長「從某個值開始、照順序往下掃」。但它**沒有指針**可以讓你直接跳到「下一個不同值的起點」。這就像一本字典只有「下一頁」按鈕，沒有「下一個字母」按鈕——你要從 A 開頭的第一個字，一頁一頁翻到 B 開頭。
+
+### III. 不只是 COUNT DISTINCT — 所有需要「跳過相同值」的查詢都受害
+
+```sql
+-- 查詢 1：GROUP BY + DISTINCT = 全表跑不掉
+SELECT DISTINCT user_id, item_id, event_time
+FROM event_log
+ORDER BY event_time DESC LIMIT 10;
+-- GROUP BY 先處理全表 → 再去重 → 才取 10 筆
+
+-- 查詢 2：COUNT DISTINCT = 全 index 掃完
+SELECT COUNT(DISTINCT sex) FROM users;
+-- 2000 萬 row 一個都跑不掉
+
+-- 查詢 3：SELECT DISTINCT = 也一樣
+SELECT DISTINCT sex FROM users;
+-- 即使只有 2 種值，還是掃整條 index
+```
+
+### IV. PG 17 原生 Index Skip Scan：終於不用手動 hack 了
+
+如果你用的是 **PG 17+**，簡單的 `SELECT DISTINCT` 查詢可以直接受益於原生 Index Skip Scan，不需要 recursive CTE。
+
+**前提條件**：
+- 查詢只取 **一個** distinct 欄位（例如 `SELECT DISTINCT sex`，不是 `DISTINCT a, b, c`）
+- 該欄位有 B-tree index
+- Index 的第一欄就是該欄位
+
+**啟用方式**：PG 17 預設就開啟了，不需任何設定。用前面的 `users` 表直接測：
+
+```sql
+-- 建表 + index（與前面相同）
+CREATE TABLE users (
+    id   SERIAL PRIMARY KEY,
+    name TEXT,
+    sex  TEXT,
+    city TEXT,
+    age  INT
+);
+CREATE INDEX idx_users_sex ON users (sex);
+
+-- PG 17：原生 Index Skip Scan
+EXPLAIN SELECT DISTINCT sex FROM users;
+```
+
+```mermaid
+flowchart TD
+    PG17["🐘 PG 17 的 EXPLAIN 輸出\n──────────\nUnique\n  ->  Index Skip Scan using idx_users_sex on users"]
+
+    How["🔍 PG 17 內部怎麼做的？\n──────────\n1. 從 leaf page 1 開始\n   看到 'm' → 輸出\n2. 跳過所有 'm'\n   找到下一個不同值 'w' → 輸出\n3. 跳過所有 'w'\n   下一個值是 NULL → 停止\n\n🎯 只讀了 2 個 index leaf\n   而不是 2000 萬個"]
+
+    PG17 --> How
+
+    style PG17 fill:#c8e6c9,stroke:#2e7d32
+    style How fill:#e3f2fd,stroke:#1565c0
+```
+
+> **限制**：PG 17 的 Index Skip Scan 目前只支援**單欄位**的 `SELECT DISTINCT`。多欄位（`DISTINCT a, b`）或 `COUNT(DISTINCT ...)` 暫時還不支援，仍需要本章後續介紹的 recursive CTE 技法。
+
+### V. 本章要做的事：PG < 17 或複雜場景的替代方案
+
+PostgreSQL 直到 PG 17 才加入原生的 Index Skip Scan，且支援有限（只限單欄位 DISTINCT）。對於 PG 17 以前的版本，以及複雜的多欄位 distinct、Top-N per group 等場景，本章介紹的 **recursive CTE 技法**就是用「手動迴圈」來模擬 Skip Scan——對每個 distinct 值只讀一個 index leaf。
 
 ## 2. 技法 1：Subquery 縮小 GROUP BY 範圍
+
+用子查詢先縮小資料範圍，再做 GROUP BY：
+
+```mermaid
+flowchart LR
+    subgraph Before["❌ 原始（97.7ms）"]
+        B1["全表 → GROUP BY\n→ 處理所有 row\n→ 再取 Top 10"]
+    end
+
+    subgraph After["✅ 優化（2.0ms / 49x）"]
+        A1["內層子查詢：Index Scan\n只取最近 1000 筆"]
+        A2["外層：只對這 1000 筆\n做 GROUP BY"]
+        A1 --> A2
+    end
+
+    Before --> After
+
+    style Before fill:#ffebee,stroke:#c62828
+    style After fill:#c8e6c9,stroke:#2e7d32
+```
 
 ```sql
 SELECT * FROM (
@@ -1848,50 +2517,76 @@ GROUP BY user_id, listid, apkid, get_time
 ORDER BY get_time DESC LIMIT 10;
 ```
 
-| 方法 | Plan | Runtime | 提速 |
-|------|------|--------|:---:|
-| 原始 | Seq Scan + Sort + Group | 97.7ms | 1x |
-| Subquery 縮小 | Index Scan Backward + HashAgg | 2.0ms | **49x** |
-
-弊端：內層 `LIMIT` 的值不好估算。
+> 弊端：內層 `LIMIT` 的值不好估算——取太多浪費、取太少可能漏掉結果。
 
 ## 3. 技法 2：Cursor + Array（PL/pgSQL）
 
-用 cursor 逐行 fetch，用 array 做 in-memory dedup，取滿 LIMIT 後停止。
+用游標逐行讀取，在記憶體內去重，**取滿目標數量就停止**：
 
-| 方法 | Runtime | 提速 |
-|------|--------|:---:|
-| 原始 | 97.7ms | 1x |
-| Cursor + array | 0.81ms | **121x** |
+```mermaid
+flowchart TD
+    Cur["📖 Open Cursor\n依 get_time DESC 排序"]
+    Loop["🔄 Loop\nfetch 一筆"]
+    Check{"這筆的組合\n出現過了嗎？\n（用 array 記錄）"}
+    Add["➕ 加入結果集"]
+    Skip["⏭️ 跳過"]
+    Done{"結果集滿 LIMIT 了？"}
+    Stop["✅ 停止（121x faster）"]
 
-> `ANY(array)` 對每條 fetch 做 O(n) 掃描。如果 distinct 組合極多（如數千），可改用 `hstore` 或 `jsonb` key 做 hash-based dedup。
+    Cur --> Loop --> Check
+    Check -->|"沒出現過"| Add --> Done
+    Check -->|"出現過了"| Skip --> Loop
+    Done -->|"還沒"| Loop
+    Done -->|"滿了"| Stop
+
+    style Cur fill:#e3f2fd,stroke:#1565c0
+    style Stop fill:#c8e6c9,stroke:#2e7d32
+```
+
+> 如果 distinct 組合數極多（數千以上），可改用 hash-based dedup 替代 `ANY(array)` 的 O(n) 掃描。
 
 ## 4. 技法 3：Trigger 維護物化表
 
-Trigger 在每次 INSERT 時檢查並維護一張去重物化表。
+```mermaid
+flowchart LR
+    subgraph Insert["✍️ INSERT 時"]
+        I1["Trigger 自動檢查"]
+        I2["組合不存在 → 插入物化表\n組合已存在 → 無視"]
+    end
 
-```sql
--- 查詢直接命中物化表
-SELECT * FROM user_download_uk ORDER BY get_time DESC LIMIT 10;
--- 0.36ms（271x faster）
+    subgraph Query["📖 查詢時"]
+        Q1["直接 SELECT FROM 物化表\n（已經去重完畢）"]
+    end
+
+    Insert --> Query
+
+    style Insert fill:#fff3e0,stroke:#ef6c00
+    style Query fill:#c8e6c9,stroke:#2e7d32
 ```
 
 | 方法 | Runtime | 提速 | 代價 |
 |------|--------|:---:|------|
 | Trigger 物化 | 0.36ms | **271x** | Insert 從 ~4s 升到 ~4.9s（+23%） |
 
+> 適合「查詢遠多於寫入」的場景。
+
 ## 5. 技法 4：Recursive CTE — 核心 Index Skip Scan 模擬
 
-### I. 原理
+```mermaid
+flowchart TD
+    Start["第 0 步：MIN(col)\n→ 找到第一個值\n例：sex = 'm'"]
 
-```
-1. Non-recursive term：用 index scan 取 min(column)
-2. Recursive term：用 index scan 取 「> 上一個值」的 min(column)
-3. 每次遞迴只掃一個 index leaf → O(distinct_values) × O(log N)
-4. Stop condition：WHERE column IS NOT NULL 阻斷 NULL
-```
+    Rec1["第 1 步遞迴：\nWHERE col > 'm'\n→ MIN(col) = 'w'"]
 
-### II. Sparse Column 場景（低基數，如 sex / status）
+    Rec2["第 2 步遞迴：\nWHERE col > 'w'\n→ MIN(col) = NULL\n→ 停止"]
+
+    Done["✅ 結果：['m', 'w']\n只讀了 2 個 index leaf\n而非 2000 萬 row\n→ 36,390x speedup"]
+
+    Start --> Rec1 --> Rec2 --> Done
+
+    style Start fill:#e3f2fd,stroke:#1565c0
+    style Done fill:#c8e6c9,stroke:#2e7d32
+```
 
 ```sql
 WITH RECURSIVE skip AS (
@@ -1902,83 +2597,60 @@ WITH RECURSIVE skip AS (
      FROM skip s WHERE s.sex IS NOT NULL)
 )
 SELECT COUNT(DISTINCT sex) FROM skip;
--- 0.173 ms（原始 47254ms 的 1/273,000，36,390x speedup）
+-- 0.173ms（原始 47,254ms）
 ```
 
-**關鍵：每次遞迴只掃 1 個 index leaf**。
-
-### III. Dense Column 場景（高基數，不適合）
-
-| Scenario | Distinct Values | Original | Recursive CTE | 適合？ |
-|----------|:---:|---------|--------------|:---:|
-| sex | 2 | 47,254ms | **0.17ms** | ✓ |
-| user_id | 10,000,001 | 4,009ms | **186,909ms** | ✗ |
-
-Recursive CTE 的每一層 overhead 約 0.01-0.02ms。因此 distinct count > ~50,000 時成本就會超過全表掃描。
-
-> 快速評估：`SELECT COUNT(DISTINCT col) FROM pg_stats WHERE tablename = 'your_table' AND attname = 'your_col'`。若 distinct_count < 500 → recursive CTE 極有效；> 100,000 → 不適用。
+**適用條件**：distinct values < ~500 時效果極佳。若 distinct > 100,000，遞迴 overhead（每層 ~0.01ms）會超過全表掃描成本。
 
 ## 6. 技法 5：Recursive CTE 做 Top-N Per Group
 
-將問題拆成兩步：遞迴枚舉所有 distinct group → 對每個 group 取 Top N。
+```mermaid
+flowchart TD
+    Step1["📋 步驟 1：遞迴枚舉\n所有 distinct group\n（用 index skip scan）"]
+    Step2["📋 步驟 2：對每個 group\n用 Index Seek 取 Top N\n（WHERE group = v ORDER BY col LIMIT N）"]
+    Step3["📋 步驟 3：合併所有\ngroup 的 Top N 結果\n→ 5,900x speedup"]
 
-```sql
-WITH RECURSIVE skip AS (
-    (SELECT t.username FROM test t ORDER BY t.username LIMIT 1)
-    UNION ALL
-    (SELECT (SELECT MIN(t2.username) FROM test t2
-             WHERE t2.username > s.username)
-     FROM skip s WHERE s.username IS NOT NULL)
-),
-with_data AS (
-    SELECT ARRAY(
-        SELECT t FROM test t
-        WHERE t.username = s.username
-        ORDER BY t.some_ts DESC LIMIT 5
-    ) AS rows
-    FROM skip s WHERE s.username IS NOT NULL
-)
-SELECT (unnest(rows)).* FROM with_data;
--- 1.924 ms（原始 11,329ms，5,900x）
+    Step1 --> Step2 --> Step3
+
+    style Step1 fill:#e3f2fd,stroke:#1565c0
+    style Step2 fill:#fff3e0,stroke:#ef6c00
+    style Step3 fill:#c8e6c9,stroke:#2e7d32
 ```
 
-> LATERAL subquery 的等價寫法（PG 13+ 推薦，可讀性更高）：
-> ```sql
-> SELECT u.username, t.*
-> FROM (SELECT DISTINCT username FROM test) u
-> JOIN LATERAL (
->     SELECT * FROM test t WHERE t.username = u.username
->     ORDER BY t.some_ts DESC LIMIT 5
-> ) t ON true;
-> ```
+> PG 13+ 推薦使用 `LATERAL` 子查詢替代 recursive CTE，可讀性更佳。
 
 ## 7. Recursive CTE 的限制與注意事項
 
-### I. Aggregate Function 不能在 Recursive Term 直接使用
-
-必須將 aggregate 包在 scalar subquery 內。
-
-### II. 中止條件必須明確
-
-每個 recursive CTE 都要有終止保護：`SET max_recursion_depth = 500;`
+- **Aggregate 函數限制**：recursive term 內不能直接使用 `MIN()`、`COUNT()` 等，必須包在子查詢中
+- **中止條件**：務必設 `SET max_recursion_depth = 500` 防止無限迴圈
+- **適合場景**：低基數欄位（distinct < 500）；高基數欄位請用其他技法
 
 ## 8. 技法選擇決策
 
-```
-需要 GROUP BY + ORDER BY + LIMIT？
-├─ Order by column 有 index + 數據均勻？
-│   → 技法 1：Subquery LIMIT 縮小範圍（49x）
-├─ 複雜多列 unique 組合 + 接受 PL/pgSQL？
-│   → 技法 2：Cursor + Array（121x）
-├─ DQL >> DML + 可接受 DML overhead？
-│   → 技法 3：Trigger 物化表（271x）
-├─ 單列 sparse column（distinct < 500）+ COUNT/GROUP？
-│   → 技法 4：Recursive CTE Skip Scan（36,390x）
-├─ Top-N per group（distinct group 少）？
-│   → 技法 5：Recursive CTE + ARRAY unnest（5,900x）
-│   或 LATERAL subquery（PG 13+ 推薦）
-└─ Dense column（distinct > 100K）？
-    → 接受全表 scan，或考慮 BRIN / 分區 / covering index
+```mermaid
+flowchart TD
+    Q["需要 GROUP BY + ORDER BY + LIMIT？"]
+
+    Q1["Order by 欄位有 index？\n→ 技法 1：Subquery 縮小範圍（49x）"]
+    Q2["接受 PL/pgSQL 寫 Function？\n→ 技法 2：Cursor + Array（121x）"]
+    Q3["查詢 ≫ 寫入？\n→ 技法 3：Trigger 物化表（271x）"]
+    Q4["單欄位 + distinct < 500？\n→ 技法 4：Recursive CTE Skip Scan（36,390x）"]
+    Q5["Top-N per group？\n→ 技法 5：Recursive CTE 或 LATERAL（5,900x）"]
+    Q6["distinct > 100,000？\n→ 接受全表 scan\n或考慮 BRIN / 分區 / covering index"]
+
+    Q --> Q1
+    Q --> Q2
+    Q --> Q3
+    Q --> Q4
+    Q --> Q5
+    Q --> Q6
+
+    style Q1 fill:#c8e6c9,stroke:#2e7d32
+    style Q2 fill:#e3f2fd,stroke:#1565c0
+    style Q3 fill:#fff3e0,stroke:#ef6c00
+    style Q4 fill:#c8e6c9,stroke:#2e7d32
+    style Q5 fill:#e3f2fd,stroke:#1565c0
+    style Q6 fill:#fce4ec,stroke:#c62828
 ```
 
 ---
@@ -1987,11 +2659,9 @@ SELECT (unnest(rows)).* FROM with_data;
 
 > 來源：[digoal - CTE 递归查询分組TOP性能提升44倍 (2016-08-15)](https://github.com/digoal/blog/blob/master/201608/20160815_04.md)
 
-## 1. 問題：Window Function 全表掃描
+## 1. 問題：Window Function 強制全表掃描
 
-業務需求：每個 group 取 TOP N（每位歌手下載量 TOP 10、每個城市納稅前 10 名）。
-
-### I. 傳統寫法
+當你需要「每個 group 取 Top N」時，最直覺的寫法是 `ROW_NUMBER()`：
 
 ```sql
 SELECT * FROM (
@@ -2001,90 +2671,75 @@ SELECT * FROM (
 WHERE t.rn <= 10;
 ```
 
-### II. 實驗：10,000 groups / 10M rows
+```mermaid
+flowchart TD
+    Problem["😭 問題：10,000 groups / 1000 萬 row\n→ WindowAgg 掃了全部 1000 萬 row\n→ 淘汰 99%（990 萬 row 被丟棄）\n→ 耗時 20.8 秒"]
 
-```sql
-CREATE TABLE tbl (c1 INT, c2 INT, c3 INT);
-CREATE INDEX idx1 ON tbl (c1, c2);
-INSERT INTO tbl SELECT mod(trunc(random()*10000)::int,10000),
-       trunc(random()*10000000) FROM generate_series(1,10000000);
+    Why["💡 原因\n──────────\nWindowAgg 是 blocking operator\n每一個 partition 都必須\n全部讀完才能編 row_number()\n即使 index 有排序也沒用"]
+
+    Problem --> Why
+
+    style Problem fill:#ffebee,stroke:#c62828
+    style Why fill:#fff3e0,stroke:#ef6c00
 ```
-
-**WindowAgg 掃描了全部 10M row**，淘汰 99%（9.9M row 被 `Rows Removed by Filter` 丟棄）。耗時 **20.8 秒**。
-
-> WindowAgg 是 blocking operator——必須把整個 partition 的 row 讀完才能確定 `row_number()` 排序。即使 index 提供排序，`PARTITION BY c1` 的 boundary 跨越讓 planner 無法做 early termination。
 
 ## 2. 優化方案：Recursive CTE + Per-Group Index Seek
 
-### I. 核心思路
+```mermaid
+flowchart TD
+    S1["📋 步驟 1：Recursive CTE\n枚舉所有 distinct c1 值\n（index skip scan）"]
+    S2["📋 步驟 2：對每個 group\nWHERE c1 = v ORDER BY c2 LIMIT 10\n（Index Seek 只讀 10 row）"]
+    S3["📋 步驟 3：合併結果\n→ 每個 group 只讀 10 row\n而非全部 group 的全部 row"]
 
-1. 用 recursive CTE 取出所有 distinct `c1` 值（index skip scan）
-2. 對每個 `c1` 執行 `SELECT * FROM tbl WHERE c1 = v ORDER BY c2 LIMIT 10`
-3. 每個 group 的查詢只需要讀取 index 中的 10 條 entry（non-blocking）
+    S1 --> S2 --> S3
 
-### II. PL/pgSQL Function 封裝
+    Result["🎉 結果：20,834ms → 464ms（44x）\n掃描 1000 萬 row → 17 萬 row（98% 減少）"]
 
-```sql
-CREATE OR REPLACE FUNCTION f() RETURNS SETOF tbl AS $$
-DECLARE v INT;
-BEGIN
-  FOR v IN
-    WITH RECURSIVE t1 AS (
-      (SELECT min(c1) c1 FROM tbl)
-      UNION ALL
-      (SELECT (SELECT min(tbl.c1) FROM tbl WHERE tbl.c1 > t.c1)
-       FROM t1 t WHERE t.c1 IS NOT NULL)
-    )
-    SELECT * FROM t1
-  LOOP
-    RETURN QUERY SELECT * FROM tbl WHERE c1 = v ORDER BY c2 LIMIT 10;
-  END LOOP;
-END;
-$$ LANGUAGE plpgsql STRICT;
+    S3 --> Result
+
+    style S1 fill:#e3f2fd,stroke:#1565c0
+    style S2 fill:#fff3e0,stroke:#ef6c00
+    style S3 fill:#c8e6c9,stroke:#2e7d32
+    style Result fill:#c8e6c9,stroke:#388e3c
 ```
 
-### III. 效能結果
+> **前提條件**：
+> 1. Group 數量 << 總 row 數（group 少、每個 group 大）
+> 2. Index 必須是 `(group_col, order_col)`
+> 3. TOP N 遠小於 group 內 row 數
 
-| 指標 | Window Function | Recursive CTE + Function |
-|------|----------------|--------------------------|
-| Execution time | 20,834 ms | **464 ms（44x）** |
-| shared_buffers hit | 10,035,535 | 170,407 (98% 減少) |
+## 3. 現代替代方案
 
-> **此方案成立的前提條件**：
-> 1. **Group 數量 << Total row 數**
-> 2. **Index 必須是 `(group_col, order_col)`**
-> 3. **TOP N 遠小於 group 內 row 數**
+```mermaid
+flowchart TD
+    subgraph PG93["PG 9.3+：LATERAL + DISTINCT"]
+        L1["SELECT DISTINCT c1 → 取得所有 group"]
+        L2["LATERAL：對每個 group 取 Top N"]
+        L3["✅ 純 SQL，不需寫 Function"]
+        L1 --> L2 --> L3
+    end
 
-## 3. 現代替代方案（PG 9.3+ / PG 11+ / PG 14+）
+    subgraph PG12["PG 12+：CTE MATERIALIZED + LATERAL"]
+        M1["WITH groups AS MATERIALIZED\n（強制把 distinct group 暫存）"]
+        M2["LATERAL：對每個 group 取 Top N"]
+        M3["✅ Planner 行為可控\n（避免 Planner 改寫成 HashAgg）"]
+        M1 --> M2 --> M3
+    end
 
-### I. LATERAL + DISTINCT（PG 9.3+）
+    PG93 --> PG12
 
-```sql
-SELECT t.*
-FROM (SELECT DISTINCT c1 FROM tbl) groups,
-LATERAL (SELECT * FROM tbl WHERE tbl.c1 = groups.c1 ORDER BY c2 LIMIT 10) t;
+    style PG93 fill:#e3f2fd,stroke:#1565c0
+    style PG12 fill:#c8e6c9,stroke:#2e7d32
 ```
 
-### II. CTE MATERIALIZED 控制（PG 12+）
+| 方案 | PG 版本 | 一句話 |
+|------|---------|--------|
+| Window Function | 8.4+ | 寫法最簡單，但全表掃描 |
+| Recursive CTE + Function | 9.0+ | 效能最好，但要寫 Function |
+| LATERAL + DISTINCT | 9.3+ | 純 SQL 的首選 |
+| CTE MATERIALIZED + LATERAL | 12+ | Planner 行為最可控 |
 
-```sql
-WITH groups AS MATERIALIZED (
-  SELECT DISTINCT c1 FROM tbl
-)
-SELECT t.* FROM groups,
-LATERAL (SELECT * FROM tbl WHERE tbl.c1 = groups.c1 ORDER BY c2 LIMIT 10) t;
-```
-
-### III. 方案對比總結
-
-| 方案 | PG 版本 | 優點 | 劣勢 |
-|------|---------|------|------|
-| Window Function | 8.4+ | 寫法簡單 | 全表掃描 O(G×R) |
-| Recursive CTE + Function | 9.0+ | N << R 時極佳 | 需 function 封裝 |
-| LATERAL + DISTINCT | 9.3+ | 純 SQL | Planner 可能選 HashAgg |
-| CTE MATERIALIZED + LATERAL | 12+ | Planner 行為可控 | 暫存 distinct group 結果 |
-
-> **實際生產選擇**：9.3+ 用 `LATERAL + DISTINCT`，12+ 加 `MATERIALIZED`。Index 設計的黃金組合：`(c1, c2)`——`c1` 用於 group filter，`c2` 用於 order + limit。
+> **生產建議**：PG 12+ 優先使用 `CTE MATERIALIZED + LATERAL`。Index 設計黃金組合：`(group_col, order_col)`。
 
 ---
 
@@ -2092,147 +2747,89 @@ LATERAL (SELECT * FROM tbl WHERE tbl.c1 = groups.c1 ORDER BY c2 LIMIT 10) t;
 
 > 來源：[digoal - PostgreSQL 递归死循环案例及解法 (2016-07-23)](https://github.com/digoal/blog/blob/master/201607/20160723_01.md)
 
-## 1. 問題：Recursive CTE 遇到數據迴圈（Cycle）
+## 1. 問題：Recursive CTE 遇到數據迴圈
 
-WITH RECURSIVE 是處理樹形 / 圖形查詢的標準語法，但如果數據中存在循環引用（例如 `c1 = 1, c2 = 1`，自己指向自己），recursive CTE 會無限迭代，不斷產生中間結果、寫入 temp file，最終耗盡磁盤空間。
+`WITH RECURSIVE` 常用於查詢樹狀結構（組織架構、分類階層等），但數據中如果有**循環引用**，會造成無限遞迴：
 
-### I. 迴圈數據範例
+```mermaid
+flowchart TD
+    Data["📊 資料範例\n──────────\n9→8→7→6→5→4→3→2→1\n               ↖───↙\n            (1 指向自己！)"]
 
-```sql
-CREATE TABLE test(c1 int, c2 int, info text);
-INSERT INTO test VALUES
-    (9,8,'test'), (8,7,'test'), (7,6,'test'),
-    (6,5,'test'), (5,4,'test'), (4,3,'test'),
-    (3,2,'test'), (2,1,'test'), (1,1,'test');  -- ← loop
+    CTE["🔄 Recursive CTE\n──────────\n從 9 開始往下追\n追到 1 之後\n1 又指向 1\n→ 1→1→1→1→... 無限循環"]
+
+    Danger["💥 後果\n──────────\n• 不斷產生中間結果\n• 寫入 temp file\n• 89MB → 575MB → 1GB → 2.4GB...\n• 耗盡磁盤空間\n• log_temp_files 在 query 結束才記錄\n  中途完全無警告"]
+
+    Data --> CTE --> Danger
+
+    style Data fill:#e3f2fd,stroke:#1565c0
+    style CTE fill:#fff3e0,stroke:#ef6c00
+    style Danger fill:#ffebee,stroke:#c62828
 ```
 
-### II. 死循環觸發
+## 2. 解法 1：temp_file_limit 暴力中斷
 
-```sql
-WITH RECURSIVE t(c1, c2, info) AS (
-    SELECT * FROM test WHERE c1 = 9
-    UNION ALL
-    SELECT t2.* FROM test t2 JOIN t ON (t.c2 = t2.c1)
-)
-SELECT count(*) FROM t;
--- 永遠不會結束：9→8→7→6→5→4→3→2→1→1→1→1→...
+設定臨時檔案大小上限，超過就強制報錯：
+
+```mermaid
+flowchart LR
+    Set["SET temp_file_limit = '10MB'"]
+    Run["WITH RECURSIVE t(...)"]
+    Error["❌ ERROR：temporary file\nsize exceeds temp_file_limit"]
+
+    Set --> Run --> Error
+
+    style Set fill:#e3f2fd,stroke:#1565c0
+    style Error fill:#ffebee,stroke:#c62828
 ```
 
-### III. Temp File 暴增過程
+> **缺點**：需要猜測 limit 值；設太大會讓死循環跑很久、設太小可能誤殺正常的大遞迴查詢。
 
-```
-pgsql_tmp8997.5  89M → 575M → 1.0G → 2.4G → ...
-```
+## 3. 解法 2：CYCLE Clause（PG 14+ 根本解）
 
-`log_temp_files` 只在 query 結束時才記錄 log，中途不會有警告。
+PG 14 引入了 SQL 標準的 `CYCLE` 語法，直接在遞迴引擎內部檢測循環：
 
-## 2. 解法 1：`temp_file_limit` 硬限制
+```mermaid
+flowchart TD
+    CTE2["WITH RECURSIVE t(...) AS (...)\nCYCLE c1 SET is_cycle USING path"]
 
-```sql
-SET temp_file_limit = '10MB';
+    Internal["🔍 內部機制\n──────────\n• 維護一個 hash table\n• 追蹤已訪問的節點\n• O(1) 查重"]
+    Result2["✅ 結果\n──────────\n每行多兩個欄位：\n• is_cycle：是否形成循環\n• path：經過的路徑\n\n有循環的行 is_cycle = true\n沒有循環的行繼續往下追"]
 
-WITH RECURSIVE t(...) ...
--- ERROR: 53400: temporary file size exceeds temp_file_limit (10240kB)
-```
+    CTE2 --> Internal --> Result2
 
-### I. pg_hint_plan 逐 Query 指定限制
-
-```sql
-/*+ Set (temp_file_limit '10MB') */
-WITH RECURSIVE t(...) SELECT count(*) FROM t;
+    style CTE2 fill:#e8f5e9,stroke:#2e7d32
+    style Internal fill:#e3f2fd,stroke:#1565c0
+    style Result2 fill:#c8e6c9,stroke:#388e3c
 ```
 
-## 3. 解法 2：`CYCLE` Clause — PG 14+ 根本方案
-
-PG 14 引入了 SQL 標準的 `CYCLE` clause，從遞迴引擎內部檢測 cycle：
-
-```sql
-WITH RECURSIVE t(c1, c2, info) AS (
-    SELECT * FROM test WHERE c1 = 9
-    UNION ALL
-    SELECT t2.* FROM test t2 JOIN t ON (t.c2 = t2.c1)
-)
-CYCLE c1 SET is_cycle USING path
-SELECT * FROM t;
-```
-
-| c1 | c2 | info | is_cycle | path |
-|----|----|------|----------|------|
-| 9 | 8 | test | f | {(9)} |
-| 8 | 7 | test | f | {(9),(8)} |
-| ... | ... | ... | ... | ... |
-| 1 | 1 | test | **t** | {(9),(8),...,(1),(1)} |
-
-> `CYCLE` clause 內部實作維護一個 hash table 追蹤已訪問節點。相比 `temp_file_limit` 的「暴力中斷」，CYCLE 是「優雅終止」——不需要猜測 limit 值，不會誤殺正常的大遞迴查詢。
+> **CYCLE 的優勢**：不需要猜測 limit 值、不會誤殺正常查詢、是「優雅終止」而非「暴力中斷」。
 
 ## 4. Production 防禦體系
 
-### I. 三層防禦
+```mermaid
+flowchart TD
+    L1["🛡️ SQL 層（根本防禦）\n──────────\n• CYCLE clause（PG 14+）\n• 手動 breadcrumb\n  NOT (c1 = ANY(path))（PG < 14）"]
+    L2["🛡️ Session 層（兜底）\n──────────\n• SET LOCAL temp_file_limit = '1GB'\n• 僅影響當前 transaction"]
+    L3["🛡️ DB 層（全域保護）\n──────────\n• temp_file_limit in postgresql.conf\n• 預防性全域上限"]
 
-| 層級 | 機制 | 適用場景 |
-|------|------|---------|
-| **SQL 層**（根本） | `CYCLE` clause (PG 14+) | 所有 recursive CTE 都應加 |
-| **SQL 層**（相容） | 手動 breadcrumb `NOT (c1 = ANY(path))` | PG < 14 |
-| **Session 層**（兜底） | `SET LOCAL temp_file_limit = '1GB'` | 防止未知 CTE 炸庫 |
-| **DB 層**（全域） | `temp_file_limit` in postgresql.conf | 預防性全域上限 |
+    L1 --> L2 --> L3
 
-### II. PG < 14 的手動 Cycle Detection
-
-```sql
-WITH RECURSIVE t(c1, c2, info, path, depth) AS (
-    SELECT *, ARRAY[c1], 0 FROM test WHERE c1 = 9
-    UNION ALL
-    SELECT t2.*, t.path || t2.c1, t.depth + 1
-    FROM test t2
-    JOIN t ON (t.c2 = t2.c1 AND NOT (t2.c1 = ANY(t.path)))
-)
-SELECT * FROM t;
+    style L1 fill:#c8e6c9,stroke:#2e7d32
+    style L2 fill:#fff3e0,stroke:#ef6c00
+    style L3 fill:#e3f2fd,stroke:#1565c0
 ```
 
-> breadcrumb mode 的缺點：(a) 每次遞迴都要 scan 整個 `path` array（O(n)）；(b) `path` array 隨遞迴增長。PG 14 的 `CYCLE` clause 內部用 hash table，O(1) 查重。
+> **PG < 14 手動防禦**：在遞迴條件中加 `NOT (c2 = ANY(path))`，用一個 array 記錄走過的路徑。但缺點是每次遞迴都要掃整個 array（O(n)），不像 CYCLE clause 的 hash table（O(1)）。
 
-### III. `SET LOCAL` vs `SET SESSION`
+### 版本演進
 
-```sql
-SET LOCAL temp_file_limit = '1GB';     -- 僅影響當前 transaction
-SET SESSION temp_file_limit = '1GB';   -- 影響整個 session
-```
-
-建議在 application 層以 `SET LOCAL` 包裹 recursive CTE。
-
-### IV. Temp File 清理機制
-
-- Query 結束時自動清理（無論正常或異常終止）
-- DB startup 時，startup process 會清理殘留 temp file
-- `pg_cancel_backend()` 會觸發清理；`pg_terminate_backend()` 可能留下孤兒 temp file
-
-### V. Temp File 監控（PG 17）
-
-```sql
-SELECT pg_stat_get_temp_files();
-SELECT temp_files, temp_bytes FROM pg_stat_database WHERE datname = current_database();
-```
-
-### VI. PG 14-17 Recursive CTE 相關改進
-
-| 版本 | 改進 |
-|------|------|
-| PG 14 | `CYCLE` clause、`SEARCH` clause（BFS/DFS 排序） |
-| PG 15 | Recursive CTE materialization 策略優化 |
-| PG 16 | Recursive CTE hash table 可 spill to disk |
-| PG 17 | `WORK_MEM` 對 recursive CTE hash table 的精細分配 |
-
-### VII. `SEARCH` Clause 搭配 `CYCLE`（PG 14+）
-
-```sql
-WITH RECURSIVE t(c1, c2, info) AS (
-    SELECT * FROM test WHERE c1 = 9
-    UNION ALL
-    SELECT t2.* FROM test t2 JOIN t ON (t.c2 = t2.c1)
-)
-SEARCH DEPTH FIRST BY c1 SET order_col
-CYCLE c1 SET is_cycle USING path
-SELECT * FROM t ORDER BY order_col;
+```mermaid
+timeline
+    title Recursive CTE 相關功能演進
+    PG 14 : CYCLE clause\nSEARCH clause(BFS/DFS 排序)
+    PG 15 : CTE materialization 策略優化
+    PG 16 : Recursive CTE hash table\n可 spill to disk
+    PG 17 : WORK_MEM 對 recursive CTE\nhash table 精細分配
 ```
 
 ---
