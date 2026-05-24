@@ -18,6 +18,36 @@
 
 ## 1. 核心語法與背景
 
+> **初學者導讀**：FDW（Foreign Data Wrapper，外部資料包裝器）是 PG 內建的跨資料庫查詢機制。你可以把它想像成在本地資料庫中建立一個「窗口」——透過這個窗口，你能直接查詢另一台 PG 伺服器上的表格，就像它們存在本地一樣。`IMPORT FOREIGN SCHEMA` 是這個窗口的「快速建立工具」：你只需要一行指令，它就會自動掃描遠端 schema 中有哪些表格、每個表格有哪些欄位，然後一口氣在本地建立對應的「代理表格」（foreign table）。這省去了手寫數十甚至數百行 `CREATE FOREIGN TABLE` 的麻煩。
+
+> 生活比喻：你在台北辦公室（本地 PG）需要頻繁查詢上海機房（遠端 PG）的 20 張業務表。沒有 `IMPORT FOREIGN SCHEMA` 之前，你得手動為這 20 張表逐一寫建表語句，還要確保每個欄位的型態對應正確。有了它，你只要告訴 PG：「去上海把整個 schema 的表結構都搬過來」，一鍵搞定。
+
+```mermaid
+flowchart LR
+    subgraph L["本地 PG（9.5+）"]
+        FT["foreign table\n（代理表格）"]
+        LS["local_schema"]
+    end
+    subgraph R["遠端 PG 伺服器"]
+        RT["實際表格\n（存有真實資料）"]
+        IS["information_schema.\ncolumns"]
+    end
+    U["IMPORT FOREIGN\nSCHEMA 指令"] -->|"步驟1: 查詢遠端\ninformation_schema"| IS
+    IS -->|"步驟2: 取得欄位定義\n(table name, column, type)"| U
+    U -->|"步驟3: 在本地逐一執行\nCREATE FOREIGN TABLE"| FT
+    FT -->|"使用者查詢時\n自動轉發到遠端"| RT
+```
+
+```mermaid
+flowchart TD
+    A["IMPORT FOREIGN SCHEMA rmt\nFROM SERVER rmt\nINTO local_schema"] 
+    A --> B["連線到遠端伺服器\n（透過事先定義的 FOREIGN SERVER）"]
+    B --> C["查詢遠端的 information_schema.columns\n取得該 schema 內所有表格的欄位定義"]
+    C --> D["遍歷每個表格：\n讀取 table name、column name、data type"]
+    D --> E["在本地逐表執行\nCREATE FOREIGN TABLE ...\n設定欄位對應（column_name mapping）"]
+    E --> F["完成！本地 schema 內出現\n所有對應的 foreign tables\n可直接 SELECT 查詢"]
+```
+
 PostgreSQL 9.5 引入 `IMPORT FOREIGN SCHEMA`，可以將 remote server 上整個 schema 的所有 table（或指定子集）一次性批量創建為 local 的 foreign table。在此之前，需要手寫 DDL 或用自訂 function 從 metadata 中抽取 table name、column name、type 來生成建表語句。
 
 ```sql
@@ -33,6 +63,44 @@ IMPORT FOREIGN SCHEMA remote_schema
 ---
 
 ## 2. 完整操作示範
+
+> **初學者導讀**：在動手之前，先建立整體流程的心理地圖。整個操作分為三個階段：
+> 1. **遠端準備**：在遠端 PostgreSQL 建立 schema、表格和測試資料。
+> 2. **本地配置**：在本地 PG 安裝 postgres_fdw extension、建立連線到遠端的「foreign server」、設定認證（user mapping）。
+> 3. **一鍵導入**：執行 `IMPORT FOREIGN SCHEMA`，批量建立 foreign tables，然後驗證查詢。
+
+> 關鍵點理解：`CREATE SERVER` 不是真的建立一個伺服器，而是定義一個「連線目標」的設定（主機位址、port、資料庫名稱）。`CREATE USER MAPPING` 則是告訴 PG 用什麼帳號密碼去連那個遠端。完成這兩步後，`IMPORT FOREIGN SCHEMA` 才知道要去哪裡、用誰的身份讀取表格結構。
+
+```mermaid
+flowchart TD
+    subgraph R["遠端 PG 9.4.1（Remote）"]
+        RS["Schema: rmt"]
+        T1["Table: rmt\n(id, info, crt_time)"]
+        T2["Table: rmt1\n(id, info, crt_time)"]
+        T3["Table: rmt2\n(id, info, crt_time)"]
+        RS --> T1
+        RS --> T2
+        RS --> T3
+    end
+
+    subgraph L["本地 PG 9.5（Local）"]
+        EXT["CREATE EXTENSION postgres_fdw"]
+        SRV["CREATE SERVER rmt\n→ host: 127.0.0.1:1921"]
+        UM["CREATE USER MAPPING\n→ user: postgres"]
+        IMP["IMPORT FOREIGN SCHEMA rmt\nFROM SERVER rmt INTO r1"]
+        FT1["r1.rmt  (foreign table)"]
+        FT2["r1.rmt1 (foreign table)"]
+        FT3["r1.rmt2 (foreign table)"]
+        EXT --> SRV --> UM --> IMP
+        IMP --> FT1
+        IMP --> FT2
+        IMP --> FT3
+    end
+
+    FT1 -.->|"查詢時自動轉發"| T1
+    FT2 -.->|"查詢時自動轉發"| T2
+    FT3 -.->|"查詢時自動轉發"| T3
+```
 
 環境：remote = PostgreSQL 9.4.1，local = PostgreSQL 9.5。
 
@@ -119,6 +187,25 @@ SELECT count(*) FROM r1.rmt2;   -- 100000
 
 ## 3. LIMIT TO 與 EXCEPT 過濾
 
+> **初學者導讀**：在真實場景中，遠端 schema 可能有 100 張表，但你只需要其中的 3 張。`LIMIT TO` 和 `EXCEPT` 就是為此設計的兩個過濾器——一個是「白名單」（只導入這些），一個是「黑名單」（不要導入這些）。兩者不能同時使用，每次只能選一種策略。
+
+> **何時用哪個？** 如果你只關心少數特定表 → 用 `LIMIT TO`（更安全，不會意外導入不相干的表）。如果你擁有整個 schema 的完整控制權，只是要排除一兩張不需要的表 → 用 `EXCEPT`（更省事）。
+
+```mermaid
+flowchart LR
+    subgraph R["遠端 Schema: rmt"]
+        A["rmt"]
+        B["rmt1"]
+        C["rmt2"]
+        D["其他表..."]
+    end
+    LIMIT["LIMIT TO (rmt)"] -->|"只導入"| A
+    EXCEPT["EXCEPT (rmt)"] -->|"排除 rmt\n導入其餘全部"| B & C
+    style A fill:#4a9,stroke:#333
+    style LIMIT fill:#eef,stroke:#333
+    style EXCEPT fill:#fee,stroke:#333
+```
+
 可以只導入指定 table，或排除特定 table：
 
 ```sql
@@ -140,6 +227,30 @@ IMPORT FOREIGN SCHEMA rmt EXCEPT (rmt) FROM SERVER rmt INTO r1;
 ---
 
 ## 4. 注意事項：View、Materialized View、Foreign Table 也會被導入
+
+> **初學者導讀**：`IMPORT FOREIGN SCHEMA` 不只導入普通表格，它會把遠端 schema 中「所有看起來像表的東西」都導入——包括 view（檢視表）、materialized view（實體化檢視表）、以及遠端自己已有的 foreign table。這對初學者來說可能是驚喜也可能是陷阱：
+> - **驚喜**：你不需要額外操作就能查詢遠端的 view。
+> - **陷阱**：導入的 materialized view 只是一個指向快照資料的 foreign table，查詢時拿到的不是「即時重算」的結果，而是 materialized view 最後一次 refresh 的快照。如果遠端有串聯的 foreign table（遠端 A 的 foreign table 指向更遠的 B），本地導入後也會形成「串聯查詢」，效能會顯著下降。
+
+```mermaid
+flowchart TD
+    subgraph R["遠端 PG"]
+        VT["普通 table"]
+        VW["view\n（虛擬表，查詢時即時計算）"]
+        MV["materialized view\n（儲存快照結果）"]
+        FT_R["foreign table\n（指向另一個遠端）"]
+    end
+
+    IMP["IMPORT FOREIGN SCHEMA"] -->|"全部導入為 foreign table"| L_FT["本地 foreign table"]
+
+    L_FT -->|"查詢 view 時\n遠端即時返回計算結果"| VW
+    L_FT -->|"查詢 materialized view 時\n返回最後一次 refresh 的快照"| MV
+    L_FT -->|"查詢 foreign table 時\n形成串聯查詢（耗時倍增）"| FT_R
+    L_FT -->|"查詢普通表"| VT
+
+    style MV fill:#f9a,stroke:#333
+    style FT_R fill:#f96,stroke:#333
+```
 
 `IMPORT FOREIGN SCHEMA` 不只導入普通 table，**連 remote 端的 view、materialized view、foreign table 都會一併導入**（除非用 `EXCEPT` 排除）。
 
@@ -185,6 +296,33 @@ SELECT * FROM r1.ft1;  -- 返回 remote foreign table 的查詢結果
 
 ## 5. 限制與適用範圍
 
+> **初學者導讀**：本章的核心知識總結如下：
+
+```mermaid
+flowchart TD
+    subgraph SUPPORT["支援情況"]
+        PGFDW["postgres_fdw ✅\n完整支援 IMPORT FOREIGN SCHEMA"]
+        OTHER["其他 FDW ❌\n(mysql_fdw, mongo_fdw, file_fdw)\n需各自實作此介面"]
+    end
+    subgraph IMPORTS["導入內容"]
+        TAB["普通 table ✅"]
+        COL["欄位定義 + NOT NULL ✅"]
+        VW["view / materialized view ✅"]
+        FT["foreign table ✅"]
+    end
+    subgraph SKIP["不導入的內容"]
+        PK["PRIMARY KEY ❌"]
+        UN["UNIQUE ❌"]
+        CK["CHECK ❌"]
+        FK["FOREIGN KEY ❌"]
+    end
+    subgraph RISKS["潛在風險"]
+        PWD["user mapping 密碼明文存在\npg_user_mapping 目錄中"]
+        VER["跨 PG major version 時\ntype name 可能不相容"]
+        CHAIN["多層 FDW 串聯\n效能嚴重下降"]
+    end
+```
+
 - 目前只有 `postgres_fdw` 支援 `IMPORT FOREIGN SCHEMA` 語法。其他 FDW（如 `mysql_fdw`、`mongo_fdw`、`file_fdw`）需要各自 implement 此接口，否則會報 `feature not supported`。
 - 官方 commit（`59efda3e`）由 Ronan Dunklau 和 Michael Paquier 提交，核心變更在於提供 server-side infrastructure，讓各 FDW 可以選擇性 implement。
 
@@ -206,6 +344,59 @@ SELECT * FROM r1.ft1;  -- 返回 remote foreign table 的查詢結果
 ---
 
 ## 1. 背景與架構
+
+> **初學者導讀**：在深入 pg_pathman 之前，先建立一個關鍵理解：PostgreSQL 的 partition（分區）功能經歷了三代演進：
+> 1. **第一代（PG 9.x 及之前）**：使用 table inheritance（繼承）+ CHECK constraint + trigger，把一張大表「手動拆成」多張小表。查詢時靠 PG 的 constraint exclusion 機制決定掃哪些子表，但這個決策是逐表檢查的（O(N)），分區越多越慢。
+> 2. **第二代（PG 10-11）**：引入 declarative partitioning（宣告式分區），不再需要手寫 trigger，但底層的 partition pruning（分區過濾）仍然有限。
+> 3. **pg_pathman（PG 9.5+ 的第三方方案）**：不走 PG 內建的繼承機制，而是利用 Custom Scan API 直接接管查詢計畫的生成。它用 binary search 或 hash lookup 定位分區，速度從 O(N) 降到 O(log N) 或 O(1)。
+
+```mermaid
+flowchart LR
+    subgraph TRAD["傳統方案（PG 內建繼承）"]
+        direction TB
+        TQ["查詢: WHERE id = 500"]
+        TAPP["Append node\n逐表掃描"]
+        T1["分區1\nCHECK id 1-100 ❌"]
+        T2["分區2\nCHECK id 101-200 ❌"]
+        T3["分區3\nCHECK id 201-300 ❌"]
+        T4["分區4\nCHECK id 301-400 ❌"]
+        T5["分區5 ✅\n找到目標"]
+        TQ --> TAPP
+        TAPP --> T1 & T2 & T3 & T4 & T5
+        style T1 fill:#faa,stroke:#333
+        style T2 fill:#faa,stroke:#333
+        style T3 fill:#faa,stroke:#333
+        style T4 fill:#faa,stroke:#333
+        style T5 fill:#4a9,stroke:#333
+    end
+
+    subgraph PATH["pg_pathman 方案"]
+        direction TB
+        PQ["查詢: WHERE id = 500"]
+        PRT["RuntimeAppend\nBinary Search O(log N)"]
+        P1["分區5 ✅\n直接命中目標"]
+        PQ --> PRT --> P1
+        style P1 fill:#4a9,stroke:#333
+    end
+```
+
+```mermaid
+flowchart TD
+    subgraph ARCH["pg_pathman 架構"]
+        HOOK["ProcessUtility_hook\n（攔截 COPY 指令）"]
+        PLANNER["planner_hook\n（攔截查詢計畫生成）"]
+        EXEC["ExecutorStart_hook\n（執行期動態選分區）"]
+        FILTER["PartitionFilter HOOK\n（攔截 INSERT 指令）"]
+        BG["Background Worker\n（非阻塞資料遷移）"]
+        CACHE["Memory Cache\n從 pathman_config 載入分區定義"]
+    end
+
+    APP["使用者 SQL 查詢"] --> PLANNER
+    PLANNER -->|"替換 Append → RuntimeAppend"| EXEC
+    FILTER -->|"跳過 trigger\n直接路由到目標分區"| TARGET["目標分區表"]
+    HOOK -->|"COPY 直接寫入\n目標分區"| TARGET
+    BG -->|"批次遷移資料\n不鎖定主表"| TARGET
+```
 
 ### I. 傳統分區表的問題
 
@@ -232,8 +423,6 @@ pg_pathman 由 PostgreSQL 核心貢獻者 Oleg Bartunov 所在的 **postgrespro*
 | COPY 優化 | `ProcessUtility_hook` → 直接寫入目標分區 |
 | 並發遷移 | background worker，鎖競爭時 retry（sleep + retry loop） |
 
-![pg_pathman Architecture](images/pg_pathman_arch.png)
-
 > 補充（Senior Dev）：Custom Scan API（PG 9.5+）是 pg_pathman 能繞過繼承+約束方案的關鍵。它允許 extension 註冊自訂的 plan node，在 planner 和 executor 層取代標準的 `Append` / `MergeAppend` node。`RuntimeAppend` 的核心優勢是 **runtime partition pruning**：planner 階段不決定掃哪些 partition，executor 階段根據實際查詢參數值（包括 subquery 的結果）動態選擇——這是傳統 `constraint_exclusion` 做不到的。
 >
 > 關於 shared_preload_libraries 順序：由於 pg_pathman 使用了 PG 內部的多個 HOOK（`ProcessUtility_hook`、`planner_hook`、`ExecutorStart_hook`），如果其他 extension（如 `pg_stat_statements`、`auto_explain`）也使用相同 HOOK，pg_pathman **必須排在最後**註冊，否則 HOOK chain 可能斷裂。
@@ -241,6 +430,44 @@ pg_pathman 由 PostgreSQL 核心貢獻者 Oleg Bartunov 所在的 **postgrespro*
 ---
 
 ## 2. 核心特性
+
+> **初學者導讀**：pg_pathman 的 13 項核心特性可以歸納為三大類：
+> - **寫入加速**：特性 5/7/13 — 繞過傳統 trigger 機制，讓 INSERT、COPY 和分區鍵 UPDATE 直接命中目標分區。
+> - **查詢加速**：特性 4/6 — 用二分搜尋（Range）或雜湊查表（Hash）取代逐表檢查，連子查詢條件都能正確定位分區。
+> - **維運便利**：特性 2/8/10/11/12 — 自動擴展、非阻塞遷移、動態分割合併，降低 DBA 的人工負擔。
+
+```mermaid
+mindmap
+  root((pg_pathman\n13項核心特性))
+    寫入加速
+      PartitionFilter HOOK
+        繞過 trigger
+        直接路由 INSERT
+      COPY Hook
+        COPY 直接寫目標分區
+      分區鍵 UPDATE
+        自動遷移行到正確分區
+    查詢加速
+      RuntimeAppend
+        Binary Search O(log N)
+        替代 Append 逐表掃描
+      RuntimeMergeAppend
+        替代 MergeAppend
+      Subquery Pruning
+        WHERE col = (SELECT ...)
+        動態決定掃哪些分區
+    維運便利
+      自動分區擴展
+        新值超出範圍時自動建新分區
+      非阻塞遷移
+        後台 worker 逐批搬資料
+      分區 Split/Merge
+        線上分割與合併
+      FDW 分區
+        分區可放在遠端伺服器
+      自訂 Callback
+        分區建立時自動建 index
+```
 
 | # | 特性 | 說明 |
 |:-:|------|------|
@@ -261,6 +488,30 @@ pg_pathman 由 PostgreSQL 核心貢獻者 Oleg Bartunov 所在的 **postgrespro*
 ---
 
 ## 3. 安裝與配置
+
+> **初學者導讀**：pg_pathman 是一個需要編譯安裝的 C 語言 extension（非純 SQL）。它必須在 PostgreSQL 啟動前就載入到記憶體中（透過 `shared_preload_libraries` 設定），因為它需要在 PG 啟動時掛載多個內部 hook（攔截點），才能在查詢執行時介入並改寫執行計畫。這與一般只需 `CREATE EXTENSION` 就能用的 SQL-only extension（如 `pgcrypto`）有本質差異。
+
+> **shared_preload_libraries 順序很重要！** pg_pathman 必須排在最後。原因是多個 extension 可能都想掛載同一個 hook（例如 planner_hook）。PG 的 hook 機制是單向鏈表——排在後面的 extension 會覆蓋前面的。但如果後面的 extension 沒有正確呼叫前一個 hook，鏈就會斷掉，導致其他 extension 失效。pg_pathman 內部有正確的 hook chain 處理，所以排在最後即可。
+
+```mermaid
+flowchart TD
+    subgraph INSTALL["安裝步驟"]
+        S1["1. git clone\n從 GitHub 下載原始碼"]
+        S2["2. make + make install\n編譯 C 原始碼並安裝到 PG lib 目錄"]
+        S3["3. 編輯 postgresql.conf\nshared_preload_libraries = '..., pg_pathman'"]
+        S4["4. pg_ctl restart\n重啟 PostgreSQL 讓新設定生效"]
+        S5["5. CREATE EXTENSION pg_pathman\n在目標資料庫內啟用"]
+        S1 --> S2 --> S3 --> S4 --> S5
+    end
+
+    subgraph HOOKS["啟動時掛載的 Hook"]
+        H1["ProcessUtility_hook\n攔截 COPY/DROP 等 DDL 操作"]
+        H2["planner_hook\n攔截查詢計畫生成"]
+        H3["ExecutorStart_hook\n執行期動態選分區"]
+    end
+
+    S4 --> HOOKS
+```
 
 ```bash
 git clone https://github.com/postgrespro/pg_pathman
@@ -293,6 +544,26 @@ CREATE EXTENSION pg_pathman;
 ---
 
 ## 4. 內部結構：Catalog Tables & Views
+
+> **初學者導讀**：pg_pathman 最巧妙的設計之一是「不改動 PG 內建系統表」。傳統分區方案需要把分區資訊寫進 `pg_inherits`（繼承關係表）和 `pg_constraint`（約束表），這在升級 PG 版本或遷移 extension 時很容易出問題。pg_pathman 把分區定義全部存在自己建立的 `pathman_config` 表中，並且在記憶體中快取一份，查詢時直接從記憶體查——這比從系統表讀取快得多。
+
+```mermaid
+flowchart TD
+    subgraph META["pg_pathman 內部 Metadata"]
+        PC["pathman_config\n（分區定義主表）\n- 主表 OID（哪張表被分區）\n- 分區欄位名\n- 分區類型（1=Hash, 2=Range）\n- Range 間隔值"]
+        PCP["pathman_config_params\n（可選參數覆蓋表）\n- 是否啟用主表掃描\n- 是否自動擴展\n- 自訂初始化回呼函數"]
+        PL["pathman_partition_list（View）\n查詢所有分區及其邊界"]
+        CT["pathman_concurrent_part_tasks（View）\n查詢正在執行的背景遷移任務"]
+        CACHE["Memory Cache\n（啟動時從 config 表載入\n查詢時直接從記憶體讀取）"]
+    end
+
+    PC --> CACHE
+    PCP --> CACHE
+    CACHE --> PL
+    CACHE --> CT
+
+    style CACHE fill:#4a9,stroke:#333,color:#fff
+```
 
 ### I. pathman_config（分區定義主表）
 
@@ -335,9 +606,48 @@ SELECT * FROM pathman_concurrent_part_tasks;
 
 ## 5. Range 分區管理 API
 
+> **初學者導讀**：Range 分區適合時間序列資料——例如按月份或年份分割訂單表。每個分區負責一個連續範圍內的資料（如 2024 年 1 月的資料在分區 1，2 月在分區 2...）。pg_pathman 提供兩種建立方式：
+> - **方式一（指定起始值 + 間隔 + 個數）**：告訴它「從 1 月開始、每月一個分區、建 12 個」，由它自動計算結束值。
+> - **方式二（指定起始值 + 結束值 + 間隔）**：告訴它明確的開始和結束，由它自動計算需要多少個分區。
+> 
+> 核心 API 函數及其作用：
+> - **建立分區**：從起始值按照固定間隔時間（如每月）自動建立一組連續的 range 分區
+> - **非阻塞遷移**：在背景逐批搬移主表中的現有資料到正確的分區，不鎖定主表，應用程式可以繼續讀寫
+> - **禁用主表**：遷移完成後告訴查詢計畫器「不用再掃描主表了」，確保查詢只命中分區表
+> - **分裂分區**：將一個已有的 range 分區從中間切開，變成兩個更小的分區（資料自動重新分配）
+> - **合併分區**：將兩個相鄰的 range 分區合併成一個（前提是範圍連續）
+> - **向後新增**：在現有分區鏈的尾端再新增一個分區（使用原始設定的間隔大小）
+> - **向前新增**：在現有分區鏈的頭端再新增一個分區
+
+```mermaid
+flowchart TD
+    subgraph CREATE["建立 Range 分區（兩種方式）"]
+        A["方式一：指定 start + interval + count\n例：從 10/25 起，每月一個，共 24 個"]
+        B["方式二：指定 start + end + interval\n例：從 10/25 到 12/25，每月一個"]
+    end
+
+    subgraph MIGRATE["資料遷移流程"]
+        C["Step 1: 建立主表\n（分區欄位必須 NOT NULL）"]
+        D["Step 2: 插入既有資料"]
+        E["Step 3: 建立分區定義\n（不立即遷移資料）"]
+        F["Step 4: 非阻塞遷移\n（背景 worker 逐批搬資料）"]
+        G["Step 5: 禁用主表\n（確保查詢只命中分區）"]
+        C --> D --> E --> F --> G
+    end
+
+    subgraph MAINTAIN["分區維護操作"]
+        SPLIT["分裂\n一個 ↦ 兩個"]
+        MERGE["合併\n兩個 ↦ 一個"]
+        APPEND["向後新增一個"]
+        PREPEND["向前新增一個"]
+    end
+
+    CREATE --> MIGRATE --> MAINTAIN
+```
+
 ### I. 建立 Range 分區
 
-**方式一：指定起始值 + interval + 分區數**
+**方式一：指定起始值 + interval + 分區數**（核心 API：建立 range 分區）
 
 ```sql
 create_range_partitions(
@@ -461,6 +771,34 @@ SELECT prepend_range_partition('part_test'::regclass);
 
 ## 6. Hash 分區管理 API
 
+> **初學者導讀**：Hash 分區與 Range 分區的核心差異在於「資料如何決定要去哪個分區」：
+> - **Range 分區**：根據分區欄位的值落在哪個範圍內來決定（如 2024-06-15 落在 6 月分區）。適合有順序性的資料，查詢時常用範圍條件（BETWEEN、>=、<）。
+> - **Hash 分區**：對分區欄位的值做雜湊計算，根據雜湊結果分配到不同分區。適合需要均勻分散的場景（如按 user_id 分區），但不支援範圍查詢的 pruning。
+>
+> pg_pathman 的 Hash 分區有一個巧妙設計：**使用者不需要在 WHERE 中寫雜湊表達式**。你只需要寫 `WHERE crt_time = '2024-01-01'`，pg_pathman 內部會自動計算雜湊值並定位到正確的分區——這對使用者完全透明。
+
+```mermaid
+flowchart TD
+    subgraph HASH["Hash 分區原理"]
+        Q["查詢: WHERE crt_time = '2024-01-01'"]
+        HF["內部雜湊函數\n將 crt_time 轉換為雜湊值"]
+        MOD["雜湊值 % 分區數\n（如 128 個分區則 mod 128）"]
+        PIDX["得到分區編號\n如: 分區 70"]
+        SCAN["只掃描分區 70"]
+        Q --> HF --> MOD --> PIDX --> SCAN
+    end
+
+    subgraph COMPARE["Range vs Hash 定位速度"]
+        RNG["Range 分區\n二分搜尋 O(log N)\n適合時間序列、有序查詢"]
+        HSH["Hash 分區\n雜湊查找 O(1)\n適合均勻分散、等值查詢"]
+    end
+
+    style HF fill:#4a9,stroke:#333,color:#fff
+    style PIDX fill:#4a9,stroke:#333,color:#fff
+```
+
+**建立 Hash 分區的核心 API：**
+
 ```sql
 create_hash_partitions(
     relation         REGCLASS,   -- 主表 OID
@@ -497,6 +835,28 @@ Hash 分區的特點：
 ---
 
 ## 7. 效能對比數據
+
+> **初學者導讀**：這是最能體現 pg_pathman 價值的章節。兩個數字說明一切：寫入速度快 4 倍、子查詢也能正確定位分區（傳統方案根本不支援）。關鍵原因：
+> - **寫入快**：傳統方案的 trigger 對每一行 INSERT 都要執行 PL/pgSQL 函數來判斷該去哪個分區，這是逐行處理的。pg_pathman 在 C 層面的 hook 中直接攔截 INSERT 指令，一次性決定目標分區並重寫執行計畫，效能天差地別。
+> - **子查詢 pruning**：傳統方案的 constraint exclusion 發生在查詢計畫階段，那時候子查詢的結果還沒出來，所以無法判斷。pg_pathman 的 RuntimeAppend 把決策延後到執行階段，此時子查詢已經有結果了，自然能正確定位。
+
+```mermaid
+flowchart LR
+    subgraph INSERT_PERF["INSERT 效能對比（2000 萬行，64 連線）"]
+        TRAD["傳統 Trigger 方案\nTPS: 54,517"]
+        PATH["pg_pathman PartitionFilter\nTPS: 223,484"]
+        TRAD -.->|"4.1 倍"| PATH
+        style PATH fill:#4a9,stroke:#333,color:#fff
+        style TRAD fill:#faa,stroke:#333
+    end
+
+    subgraph QUERY["子查詢 Pruning 對比"]
+        TQ["傳統方案\nWHERE id = (SELECT ...)\n❌ 掃描所有分區"]
+        PQ["pg_pathman RuntimeAppend\nWHERE id = (SELECT ...)\n✅ 只掃一個分區"]
+        style PQ fill:#4a9,stroke:#333,color:#fff
+        style TQ fill:#faa,stroke:#333
+    end
+```
 
 ### I. Insert 效能（2000 萬 row 表，64 connections）
 
@@ -547,15 +907,28 @@ WHERE id = ANY (SELECT * FROM some_table LIMIT 10);
 --          ...
 ```
 
-![Performance Comparison](images/pg_pathman_perf.png)
-
 > 補充（Senior Dev）：Prepared statement 與 simple query 在 pg_pathman 下的行為差異：prepared statement 時，custom scan 的 pruning 在 `EXPLAIN` 中不可見（顯示為掃描所有分區），但 `EXPLAIN ANALYZE` 中顯示實際只掃了一個分區。這是因為 prepared statement 的 plan 在 bind 階段才獲得參數值，planner 的 static plan 保守地包含所有分區，executor 的 RuntimeAppend 在執行時才做 pruning。從 perf top 來看，prepared statement 下的 LWLock 競爭更高（尤其 `LWLockAcquire`），與 `LockReleaseAll` 在每個 bind 週期都觸發有關。
 
 ---
 
 ## 8. Callback 機制
 
-可在分區建立時自動觸發自訂 function（如自動建立 index、設定 table storage parameter）：
+> **初學者導讀**：當 pg_pathman 自動建立一個新分區（例如寫入超出範圍的資料觸發自動擴展），新分區預設只是一個空的表格，沒有 index、沒有 storage 參數。Callback（回呼函數）就是為了解決這個問題：你可以註冊一個自訂函數，每當新分區建立時，pg_pathman 會自動呼叫它，讓你在新分區上自動建立 index、設定 fillfactor 等。
+
+```mermaid
+flowchart TD
+    A["新資料寫入\n超出既有分區範圍"] --> B["pg_pathman 自動建立新分區"]
+    B --> C["檢查是否有註冊 callback"]
+    C -->|"有"| D["呼叫自訂 callback 函數\n傳入分區資訊 (JSONB)"]
+    D --> E["callback 執行自訂邏輯\n例如: CREATE INDEX, SET fillfactor"]
+    C -->|"無"| F["新分區為空表\n無 index 等設定"]
+    E --> G["新分區就緒\n資料寫入"]
+    F --> G
+
+    style D fill:#4a9,stroke:#333,color:#fff
+```
+
+註冊 callback 的核心步驟（設定分區初始化函數）：
 
 ```sql
 -- 註冊 callback
@@ -579,6 +952,27 @@ $$ LANGUAGE plpgsql;
 ---
 
 ## 9. 注意事項與限制
+
+> **初學者導讀**：在使用 pg_pathman 之前，有幾個「踩坑點」需要特別注意：
+> 1. **分區欄位必須是 NOT NULL**：NULL 值無法確定屬於哪個分區（哪個範圍都不包含 NULL，哪個 hash bucket 也不對應 NULL），所以 pg_pathman 強制要求 NOT NULL。
+> 2. **EXPLAIN 可能誤導你**：使用 prepared statement 時，`EXPLAIN`（不帶 ANALYZE）會顯示掃描所有分區，讓你以為沒做 pruning。但 `EXPLAIN ANALYZE` 會顯示真實行為（只掃一個分區）。原因是 prepared statement 的參數值在執行時才知道，planner 在計畫階段只能保守地全部包含。
+> 3. **必須排在 shared_preload_libraries 最後**：因為它要掛載多個 PostgreSQL 內部 hook，如果排在前面，後面的 extension 可能覆蓋它的 hook，導致功能失效。
+
+```mermaid
+flowchart TD
+    subgraph MUST["必要條件"]
+        N1["PG 9.5+（需要 Custom Scan API）"]
+        N2["分區欄位 NOT NULL"]
+        N3["shared_preload_libraries 中\npg_pathman 排最後"]
+    end
+    subgraph CAUTION["注意事項"]
+        C1["EXPLAIN 可能誤導\nprepared statement 下\n顯示掃所有分區"]
+        C2["非阻塞遷移 vs 立即遷移\n建議用非阻塞版\n避免長時間鎖表"]
+        C3["分區上限\n自動擴展無上限時\n可能產生過多分區\n建議定期合併"]
+        C4["PG 10+ 內建分區\npg_pathman 仍可使用\n但功能逐漸重疊"]
+    end
+    MUST -->|"滿足後使用"| CAUTION
+```
 
 | 事項 | 說明 |
 |------|------|
@@ -618,6 +1012,33 @@ $$ LANGUAGE plpgsql;
 ---
 
 ## 1. 環境準備與安裝
+
+> **初學者導讀**：在進入 pg_shard 的具體操作前，先建立一個高層次的心智模型——分散式資料庫的核心概念：
+> - **Shard（分片）**：把一張大表的資料切成多份，每份放在不同機器上。切的方法通常是對某個欄位（如 customer_id）做雜湊，決定每行資料歸哪個 shard。
+> - **Master/Coordinator（主節點）**：負責接收 SQL 查詢、解析後決定要發給哪些 worker、收集結果回傳給用戶。
+> - **Worker（工作節點）**：實際存放 shard 資料的機器，只聽 master 的指令執行查詢。
+> - **Replica（副本）**：同一個 shard 的多份拷貝，放在不同 worker 上。當一個 worker 掛掉，可以從另一個 worker 的副本繼續服務。
+
+```mermaid
+flowchart TD
+    subgraph CLUSTER["pg_shard 叢集架構"]
+        MASTER["Master（主節點）\n- 接收 SQL 查詢\n- 解析並路由到 worker\n- 彙整結果回傳\n- 管理 metadata"]
+        W1["Worker 1 (port 1922)\n存放部分 shard 資料"]
+        W2["Worker 2 (port 1923)\n存放部分 shard 資料"]
+        W3["Worker 3 (port 1924)\n存放部分 shard 資料"]
+        W4["Worker 4 (port 1925)\n存放部分 shard 資料"]
+        MASTER -->|"查詢路由"| W1 & W2 & W3 & W4
+    end
+
+    subgraph DATA["資料分佈示意（Hash Sharding on customer_id）"]
+        TBL["customer_reviews 總表\n（分佈式表，共 16 個 shard）"]
+        S1["Shard 0-3 在 Worker 1/2"]
+        S2["Shard 4-7 在 Worker 2/3"]
+        S3["Shard 8-11 在 Worker 3/4"]
+        S4["Shard 12-15 在 Worker 4/1"]
+        TBL --> S1 & S2 & S3 & S4
+    end
+```
 
 ### I. GCC 版本要求
 
@@ -664,6 +1085,33 @@ make clean; make; make install
 
 ## 2. 叢集配置
 
+> **初學者導讀**：在開始使用 pg_shard 之前，必須先建立一個「叢集」——也就是告訴 master 節點有哪些 worker 可以存放資料。這跟單機 PG 的根本差異在於：pg_shard 需要知道資料該存到哪台機器上。配置包含三個步驟：
+> 1. **定義 worker 列表**（pg_worker_list.conf）：告訴 master 有哪些 worker 節點可用。
+> 2. **設定認證**（pg_hba.conf）：確保 master 可以無密碼連線到所有 worker（在本地測試環境中）。
+> 3. **載入 extension**：在 master 的 shared_preload_libraries 中加入 pg_shard，讓它在 PG 啟動時掛載 hook。
+
+```mermaid
+flowchart TD
+    subgraph SETUP["叢集配置步驟"]
+        S1["1. 建立 pg_worker_list.conf\n寫入所有 worker 的 host:port"]
+        S2["2. 設定 pg_hba.conf\n在所有 worker 設 trust 認證"]
+        S3["3. 修改 postgresql.conf\nshared_preload_libraries = 'pg_shard'"]
+        S4["4. 重啟 Master\npg_ctl restart"]
+        S5["5. 在所有節點建立一致的\nrole / database / schema"]
+        S6["6. CREATE EXTENSION pg_shard\n在 master 端啟用"]
+        S1 --> S2 --> S3 --> S4 --> S5 --> S6
+    end
+
+    subgraph RESULT["配置完成後的拓撲"]
+        M["Master\n(port 1921)"]
+        W1A["Worker 1\n(port 1922)"]
+        W2A["Worker 2\n(port 1923)"]
+        W3A["Worker 3\n(port 1924)"]
+        W4A["Worker 4\n(port 1925)"]
+        M -->|"讀寫路由"| W1A & W2A & W3A & W4A
+    end
+```
+
 ### I. 拓撲：1 Master + 4 Worker
 
 ```bash
@@ -707,6 +1155,36 @@ CREATE EXTENSION pg_shard;
 ---
 
 ## 3. 建立分佈式表
+
+> **初學者導讀**：在 pg_shard 中，將一張普通表變成「分佈式表」需要三個步驟，每一步都對應一個核心概念：
+> 1. **建立普通表結構**：跟一般 CREATE TABLE 一模一樣，但要注意——分佈鍵（distribution column）的選擇極其重要，它決定了資料如何散佈到各個 shard。好的分佈鍵應該讓資料均勻分散（避免熱點），且查詢時常用在 WHERE 和 JOIN 條件中。
+> 2. **註冊為分佈式表**：告訴 pg_shard 這張表要分佈，以及用哪個欄位做分佈鍵（此例用 customer_id）。pg_shard 內部會將 customer_id 做雜湊計算，映射到 int32 的數值空間。
+> 3. **建立實際的 shard**：在 worker 節點上建立實際存放資料的表格（shard table）。每個 shard 管理一個區段的雜湊值範圍。例如 16 個 shard 就把整個 int32 空間（約 43 億個值）均分為 16 段，每段約 2.68 億個值。
+
+```mermaid
+flowchart TD
+    subgraph STEPS["三步驟建立分佈式表"]
+        A["Step 1: CREATE TABLE\n定義表結構\n（跟一般建表一樣）"]
+        B["Step 2: 註冊為分佈式表\n指定分佈鍵（distribution column）\n用於決定每行資料去哪個 shard"]
+        C["Step 3: 建立 worker shard\n在 worker 節點上實際建表\n指定 shard 數量 + replica 數量"]
+        A --> B --> C
+    end
+
+    subgraph HASHING["雜湊分佈原理"]
+        ROW["一行資料\ncustomer_id = 'ABC123'"]
+        HASH_FN["雜湊函數\n將 customer_id 轉為 int32 值"]
+        RANGE["對應到 shard 的範圍\n例如值落在 -536870918 ~ -268435464\n→ Shard 10006"]
+        WORKER["Shard 10006 的兩個副本\n分別在 Worker 3 和 Worker 4"]
+        ROW --> HASH_FN --> RANGE --> WORKER
+    end
+
+    subgraph META["Metadata 三張表"]
+        PART["pgs_distribution_metadata.partition\n記錄: 哪張表、分佈方法(hash)、分佈鍵"]
+        SHARD["pgs_distribution_metadata.shard\n記錄: 每個 shard 的 hash 值範圍"]
+        PLACE["pgs_distribution_metadata.shard_placement\n記錄: 每個 shard 實際放在哪個 worker"]
+        PART --> SHARD --> PLACE
+    end
+```
 
 ### I. 建立測試表
 
@@ -857,6 +1335,37 @@ SELECT * FROM pgs_distribution_metadata.shard_placement;
 
 ## 4. 限制（Limitations）
 
+> **初學者導讀**：pg_shard 是一個「早期產品」，它的限制非常多，但這些限制恰恰幫助我們理解分散式資料庫的核心挑戰：
+> - **為什麼不支援子查詢和 prepared statement？** 因為 pg_shard 需要完整解析 SQL 語句才能決定路由——子查詢的結果在解析時還不知道，而 prepared statement 的參數值在執行時才知道。現代 Citus 透過 adaptive executor（自適應執行器）解決了這些問題。
+> - **為什麼不支援跨 shard 的分散式交易？** 因為要確保跨機器的資料一致性，需要兩階段提交（2PC）等分散式協議，這在 pg_shard 的設計範圍之外。Citus 從 6.0 開始支援 2PC。
+> - **Master 單點瓶頸**：所有查詢都要經過 master 節點轉發，當流量大時 master 的網路頻寬和 CPU 會成為瓶頸。這也是為什麼後來 Citus 推出了 MX 模式（每個 worker 也能直接接受查詢）。
+
+```mermaid
+flowchart TD
+    subgraph SHORT["短期限制（v1.2.2，後續版本預計解決）"]
+        S1["不支援 DDL (ALTER TABLE)\n需手動在所有 worker 執行"]
+        S2["不支援 DROP TABLE\n無自動清理 shard 機制"]
+        S3["不支援 INSERT INTO ... SELECT ..."]
+    end
+
+    subgraph ARCH["架構層級限制（設計決定，不打算支援）"]
+        A1["❌ 跨 shard 分散式交易\n(A→B 轉帳，shard key 不同)"]
+        A2["❌ 非分佈鍵的唯一約束/外鍵"]
+        A3["❌ 分散式 JOIN\n（需改用 CitusDB）"]
+    end
+
+    subgraph BUG["使用層級限制"]
+        B1["❌ 子查詢 (Subquery)"]
+        B2["❌ 非常數表達式 (now(), random())"]
+        B3["❌ Prepared Statement / Bind Variable"]
+        B4["❌ Extended Query Protocol\n（pgbench -M extended 失敗）"]
+    end
+
+    subgraph BOTTLENECK["架構瓶頸"]
+        BN["Master 單點瓶頸\n所有查詢必經 master\n無對等備援"]
+    end
+```
+
 ### I. 不支援子查詢
 
 ```sql
@@ -948,6 +1457,44 @@ Master 同時處理查詢路由和 metadata 管理，容易成為 network bandwi
 ---
 
 ## 5. Shard 修復（Repair）
+
+> **初學者導讀**：分散式系統中「機器掛掉」是日常事件，不是意外。pg_shard 的修復流程是理解分散式資料庫高可用性的絕佳入門：
+> 1. **自動容錯**：當一個 worker 掛掉，pg_shard 會自動把查詢路由到健康的 replica，使用者查詢不受影響（只會看到警告訊息）。
+> 2. **資料不一致**：但如果在故障期間有寫入操作，故障 worker 上的 shard 副本就不會收到這些新資料——形成資料落後。
+> 3. **全量修復**：pg_shard 的修復是「全量複製」策略——從健康副本把整個 shard 的資料完整複製到故障副本。這在 shard 很大時非常耗時，且修復期間無法對故障 shard 寫入。現代 Citus 已經改用基於 WAL（預寫日誌）的增量同步來解決這個問題。
+
+```mermaid
+flowchart TD
+    subgraph FAIL["階段 1: Worker 故障"]
+        F1["Worker 1922 掛掉"]
+        F2["pg_shard 自動路由\n到健康 replica"]
+        F3["查詢正常返回\n但有 WARNING 訊息"]
+        F1 --> F2 --> F3
+    end
+
+    subgraph WRITE["階段 2: 故障期間寫入"]
+        W1["pgbench 持續寫入"]
+        W2["1922 上的 shard 副本\n收不到新資料"]
+        W3["資料不一致：\n健康副本有新資料\n故障副本缺少新資料"]
+        W1 --> W2 --> W3
+    end
+
+    subgraph REPAIR["階段 3: 修復流程"]
+        R1["重啟故障 Worker (1922)"]
+        R2["查詢 shard_state = 3 的 shard\n（需要修復）"]
+        R3["從健康副本 (source)\n全量複製到故障副本 (target)"]
+        R4["驗證: shard_state 恢復為 1\n資料數量一致"]
+        R1 --> R2 --> R3 --> R4
+    end
+
+    FAIL --> WRITE --> REPAIR
+
+    subgraph WARN["修復注意事項"]
+        N1["⚠️ source/target 不能搞反\n（有狀態檢查保護）"]
+        N2["⚠️ 全量複製，shard 大時很慢"]
+        N3["⚠️ 修復期間無法寫入故障 shard"]
+    end
+```
 
 ### I. 模擬 Worker 故障
 
