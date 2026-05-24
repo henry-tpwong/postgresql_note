@@ -1,7 +1,7 @@
 # PostgreSQL 深度學習筆記
 
-> 整理自 [digoal (德哥) blog](https://github.com/digoal/blog)，輔以 PG 9~18 版本演進更新與 Senior Developer 實戰見解。
-> 每份 `*_Deep_Dive.md` 由多篇原始筆記合併而成，依由淺到深排列，含標題層級（`# 一、` → `## 1.` → `### I.`）與 Mermaid 圖輔助說明。
+> 部分內容參考自 [digoal (德哥) blog](https://github.com/digoal/blog)，經大幅改寫、補充 PG 9~18 版本演進、Mermaid 圖與新手導向說明。
+> 適合 Developer 閱讀，著重觀念理解而非深入原始碼。每份 md 均由多篇原始筆記合併而成，依由淺到深排列，含標題層級（`# 一、` → `## 1.` → `### I.`）與 Mermaid 圖輔助說明。
 
 ---
 
@@ -9,16 +9,18 @@
 
 | 章節 | 檔案 | 主題 |
 |------|------|------|
-| **資料型別** | [`datatype/PostgreSQL_Datatype_Deep_Dive.md`](datatype/PostgreSQL_Datatype_Deep_Dive.md) | Float vs Numeric 效能對比（360x）、SIMD 向量化、`AT TIME ZONE` 語法解析與型別轉換陷阱 |
-| **JSON/JSONB** | [`json/PostgreSQL_JSON_Deep_Dive.md`](json/PostgreSQL_JSON_Deep_Dive.md) | JSONB Value Types、Type I/O 機制、陣列提取與 GIN Index、JSONPath / SQL/JSON / json_table（PG 12→17） |
-| **全文檢索** | [`fulltext/PostgreSQL_Fulltext_Deep_Dive.md`](fulltext/PostgreSQL_Fulltext_Deep_Dive.md) | zhparser 中文分詞、Whole-Row FTS（Generated Column）、record_out + SCWS 逗號問題與解法 |
-| **擴充功能** | [`extensions/PostgreSQL_Extensions_Deep_Dive.md`](extensions/PostgreSQL_Extensions_Deep_Dive.md) | IMPORT FOREIGN SCHEMA 跨庫連線、pg_pathman 高效分區（Custom Scan API）、pg_shard 分散式分片（Citus 前身） |
-| **Vacuum / Bloat** | [`vacuum/PostgreSQL_Vacuum_Deep_Dive.md`](vacuum/PostgreSQL_Vacuum_Deep_Dive.md) | Bloat 8 大成因與測試驗證、預防措施、VACUUM FULL vs pg_repack vs pg_squeeze 三方案對比 |
-| **監控與追溯** | 已合併至上述章節 | 慢查詢追溯體系、`track_commit_timestamp` 用途與效能影響 |
-| **系統底層** | [`system/PostgreSQL_System_Deep_Dive.md`](system/PostgreSQL_System_Deep_Dive.md) | Column Order 與 Byte Alignment 全鏈路效能、Bit 位運算標籤系統、Linux Page Fault 與 huge_pages / NUMA |
-| **鎖（Lock）** | [`lock/PostgreSQL_Lock_Complete.md`](lock/PostgreSQL_Lock_Complete.md) | 隱式鎖、Lock Wait 追蹤、秒殺 Advisory Lock、高並發更新、Lock Flooding、max_locks_per_transaction、OLTP advisory lock、無間隙 ID 生成 |
-| **索引（Index）** | 已合併至上層目錄 | 掃描類型全解析（Seq/Index/Bitmap/Parallel/Index-Only）、Bitmap Heap Scan 詳解、BRIN/Bloom/GIN/GiST/SP-GiST/RUM 模糊查詢、GIN+LIMIT 優化、Leaf Page & Covering Index |
-| **其他進階** | [`others/PostgreSQL_Others_Deep_Dive.md`](others/PostgreSQL_Others_Deep_Dive.md) | PG 17 開發規範、Trigger Audit（DML+DDL）、JOIN 冗餘 Early DISTINCT、pgcrypto 加密、千億級 pg_trgm Regex、12306 搶票架構設計 |
+| **資料型別** | [`datatype/PostgreSQL_Datatype.md`](datatype/PostgreSQL_Datatype.md) | Float vs Numeric 效能對比（360x）、SIMD 向量化、`AT TIME ZONE` 語法解析與型別轉換陷阱 |
+| **JSON/JSONB** | [`json/PostgreSQL_JSON.md`](json/PostgreSQL_JSON.md) | JSONB Value Types、Type I/O 機制、陣列提取與 GIN Index、JSONPath / SQL/JSON / json_table（PG 12→17） |
+| **全文檢索** | [`fulltext/PostgreSQL_Fulltext.md`](fulltext/PostgreSQL_Fulltext.md) | zhparser 中文分詞、Whole-Row FTS（Generated Column）、record_out + SCWS 逗號問題與解法 |
+| **擴充功能** | [`extensions/PostgreSQL_Extensions.md`](extensions/PostgreSQL_Extensions.md) | IMPORT FOREIGN SCHEMA 跨庫連線、pg_pathman 高效分區（Custom Scan API）、pg_shard 分散式分片（Citus 前身） |
+| **Vacuum / Bloat** | [`vacuum/PostgreSQL_Vacuum.md`](vacuum/PostgreSQL_Vacuum.md) | Bloat 8 大成因與測試驗證、預防措施、VACUUM FULL vs pg_repack vs pg_squeeze 三方案對比 |
+| **系統底層** | [`system/PostgreSQL_System.md`](system/PostgreSQL_System.md) | Column Order 與 Byte Alignment 全鏈路效能、Bit 位運算標籤系統、Linux Page Fault 與 huge_pages / NUMA |
+| **鎖（Lock）** | [`lock/PostgreSQL_Lock.md`](lock/PostgreSQL_Lock.md) | 隱式鎖、Lock Wait 追蹤、秒殺 Advisory Lock、高並發更新、Lock Flooding、max_locks_per_transaction、OLTP advisory lock、無間隙 ID 生成 |
+| **其他進階** | [`others/PostgreSQL_Others.md`](others/PostgreSQL_Others.md) | PG 17 開發規範、Trigger Audit（DML+DDL）、JOIN 冗餘 Early DISTINCT、pgcrypto 加密、千億級 pg_trgm Regex、12306 搶票架構設計 |
+| **查詢深度解析** | [`PostgreSQL_Query.md`](PostgreSQL_Query.md) | 查詢生命週期、CBO 與 pg_hint_plan、GROUP BY 策略、IN/ANY/VALUES、分頁與計數、Recursive CTE 優化、死循環防禦 |
+| **監控與追溯** | [`PostgreSQL_Monitoring.md`](PostgreSQL_Monitoring.md) | 慢查詢追溯體系、`pg_stat_activity` / `auto_explain` / `pg_stat_io`、`track_commit_timestamp` |
+| **索引全解析** | [`PostgreSQL_Index.md`](PostgreSQL_Index.md) | 掃描類型全解析（Seq/Index/Bitmap/Parallel/Index-Only）、Bitmap Heap Scan 詳解、BRIN/Bloom/GIN/GiST/SP-GiST/RUM、Covering Index |
+| **分頁查詢** | [`PostgreSQL_分頁查詢.md`](PostgreSQL_分頁查詢.md) | OFFSET 效能退化、CURSOR 方案、Keyset Pagination、分頁優化策略 |
 
 ---
 
@@ -60,7 +62,7 @@
 - **六、12306 搶票架構**：varbit 座位區段銷售狀態、Array+GIN 車次查詢、SKIP LOCKED 避免 Lock 衝突、pgrouting 路徑規劃、10 大法寶
 
 ### 鎖（lock）
-- **PostgreSQL_Lock_Complete.md**：隱式鎖請求、Lock Wait 追蹤（`log_lock_waits` / `pg_stat_activity` / `LOCK_DEBUG`）、Advisory Lock 秒殺（231K TPS）、高並發全表更新（18x 加速）、Lock Flooding、`max_locks_per_transaction` 配置、OLTP advisory lock、無間隙 ID 生成
+- **PostgreSQL_Lock.md**：隱式鎖請求、Lock Wait 追蹤（`log_lock_waits` / `pg_stat_activity` / `LOCK_DEBUG`）、Advisory Lock 秒殺（231K TPS）、高並發全表更新（18x 加速）、Lock Flooding、`max_locks_per_transaction` 配置、OLTP advisory lock、無間隙 ID 生成
 
 ---
 
@@ -68,15 +70,15 @@
 
 ### 內容來源
 
-筆記原始內容主要來自 [digoal (德哥) 的 PostgreSQL blog](https://github.com/digoal/blog)，經結構化整理、去除重複、補充 PG 9~18 版本演進資訊與 Senior Developer 實戰見解。
+部分內容參考自 [digoal (德哥) 的 PostgreSQL blog](https://github.com/digoal/blog)，經大幅改寫、去除重複、補充 PG 9~18 版本演進資訊、Mermaid 圖視覺化與新手導向說明。
 
 ### 使用方式
 
-- 每份 `*_Deep_Dive.md` 為該主題的完整學習手冊，由淺到深排列
+- 每份 md 為該主題的完整學習手冊，由淺到深排列
 - `images/` 目錄存放相關圖片
 - 專業名詞使用英文（TID、Recheck Cond、OldestXmin 等）
 - 版本標注：`> 更新於 2026-05-17，補充 PG X~X 新增能力`
 
 ### License
 
-原始內容版權歸 [digoal](https://github.com/digoal) 所有。整理、補充部分以 MIT License 釋出。
+MIT License
