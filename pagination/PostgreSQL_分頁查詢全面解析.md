@@ -40,6 +40,15 @@ END;
 $$ LANGUAGE plpgsql STRICT VOLATILE;
 ```
 
+> **`f()` 是什麼？** 它是一個佔位函數（placeholder），每次被呼叫就印出 `NOTICE: called`。作用只有一個：**數出函數被執行了幾次**——如果 query 返回 2 行但 f() 被呼叫了 5 次，代表有 3 次是多餘的計算。
+>
+> 在真實專案中，`f()` 可以替換成任何昂貴的 SELECT list 計算：
+>
+> | 佔位函數 | 真實世界對應 | 每一次呼叫的代價 |
+> |----------|-------------|----------------|
+> | `f()` 無參數 | `generate_uuid()`、`random()`、`clock_timestamp()` | 產生新隨機值 |
+> | `f(col)` 有參數 | `calculate_tax(price)`、`geocode(address)`、`hash_password(ssn)` | 每行 CPU 計算 / 外部 API 呼叫 |
+
 ```sql
 SELECT f(), * FROM (VALUES (1), (2), (3), (4), (5), (6)) t(id) OFFSET 3 LIMIT 2;
 -- NOTICE:  called
@@ -230,7 +239,68 @@ flowchart LR
     style a2 fill:#99ff99
 ```
 
-> 在實際應用中，如果 function 接受的是 table column 值（如 `f(col)`），而非 `f()` 無參數，則此解法無效——因為內層必須投影該 column 才能傳給外層。這種情況下應考慮：
+#### d. `f(col)` 的隔離法到底有沒有效？
+
+先澄清一個容易誤解的地方：**如果 `f(col)` 只出現在 SELECT list 中，子查詢隔離法其實是有效的**。
+
+```sql
+-- ✅ 隔離生效：內層 OFFSET 過濾後只剩 2 行，f(id) 只執行 2 次
+SELECT f(id), * FROM (
+    SELECT id FROM tbl OFFSET 3 LIMIT 2  -- 內層過濾
+) sub;
+```
+
+傳遞 column 值本身幾乎零成本——`id` 就是一個整數，從內層帶到外層不耗什麼資源。
+
+**那原文說「無效」是指什麼場景？** 以下三種情況逐一說明：
+
+**Case A：`f(col)` 只在 SELECT list → 隔離法有效**
+
+```mermaid
+flowchart LR
+    step1["內層子查詢<br/>SELECT id FROM tbl<br/>OFFSET 3 LIMIT 2"] -->|"過濾後<br/>只剩2行"| step2["2行的id值<br/>id=4, id=5"]
+    step2 --> step3["外層查詢<br/>SELECT f(id), *<br/>f(id)只執行2次"]
+    style step1 fill:#ccffcc
+    style step2 fill:#ccffcc
+    style step3 fill:#ccffcc,stroke:#009900
+```
+
+內層 OFFSET/LIMIT 先把行數從 6 減到 2，column 值（id=4, id=5）傳遞零成本。外層 `f(id)` 只跑 2 次。✅
+
+**Case B：`f(col)` 在 WHERE 中 → 無法隔離**
+
+```mermaid
+flowchart LR
+    step1b["全表掃描<br/>1000萬行"] --> step2b["每行執行 f(status)<br/>判斷是否 = 'active'"]
+    step2b -->|"❌ 不匹配<br/>999萬行"| wasted["丟棄"]
+    step2b -->|"✅ 匹配<br/>1萬行"| step3b["OFFSET 100<br/>LIMIT 10"]
+    step3b --> result["返回10行"]
+    style step2b fill:#ffcccc
+    style wasted fill:#ff9999,stroke:#cc0000
+```
+
+`f(status)` 決定了哪些行是 "active"——它必須在過濾階段執行，否則不知道該留誰、該丟誰。**無法搬到外層。**
+
+**Case C：PG 把子查詢「扁平化」→ 隔離白做**
+
+```mermaid
+flowchart LR
+    subgraph written["你寫的"]
+        w1["SELECT f(id) FROM<br/>(SELECT id FROM tbl<br/> OFFSET 3 LIMIT 2) sub"]
+    end
+    subgraph optimizer["Optimizer 拉平後"]
+        o1["SELECT f(id) FROM tbl<br/>OFFSET 3 LIMIT 2"]
+    end
+    written -->|"⚠️ 拉平"| optimizer
+    style written fill:#ccffcc
+    style optimizer fill:#ffcccc,stroke:#cc0000
+```
+
+PG 的 optimizer 有時會把簡單子查詢「拉平」（subquery flattening），內外層合併成一句，隔離當場白做。有 `OFFSET/LIMIT` 的子查詢通常不會被拉平，但在涉及 JOIN、UNION 等複雜查詢時不保證。
+
+> **一句話總結**：隔離法對 SELECT-list 的 `f(col)` 有效（Case A），真正無解的是 `f(col)` 在 WHERE/JOIN 中（Case B）。
+
+> 替代方案（當隔離法無效或 f(col) 在 WHERE 中時）：
 > 1. 改用 WHERE-based pagination（keyset / cursor）完全避免 OFFSET
 > 2. 若 function 邏輯可用 CASE 改寫為 IMMUTABLE expression，讓 optimizer 處理
 > 3. 若 function 為 STABLE 且結果可緩存，考慮 subquery 中先 `DISTINCT` 去重 column 值再 JOIN 回來，減少呼叫次數
@@ -253,37 +323,73 @@ flowchart LR
 OFFSET 不是「跳過 N 行後再開始讀取」，而是**前面的 N 行仍然需要被完整掃描、過濾、丟棄**。當數據分佈存在斷層時，性能會出現劇烈的「質變」——OFFSET 加 1 可能導致掃描量跳升數萬倍。
 
 ```mermaid
-%%{init: {'theme': 'base'}}%%
-flowchart LR
-    subgraph dense["前100行：密集匹配（✅ = info=test）"]
-        direction LR
-        d1["1✅"] --- d2["2✅"] --- d3["3✅"] --- dots1["..."] --- d100["100✅"]
-    end
-    
-    subgraph gap["斷層區：100~20萬行（❌ = info≠test）"]
-        direction LR
-        g1["101❌"] --- g2["..."] --- gm["~199,900行❌"]
+flowchart TB
+    subgraph sql["SQL 語意解析：SELECT * FROM tbl WHERE info='test' ORDER BY id OFFSET 100 LIMIT 10"]
+        direction TB
+        s1["WHERE info='test' → 只看匹配行（info=test）"]
+        s2["ORDER BY id → 按 id 從小排到大"]
+        s3["OFFSET 100 → 跳過前 100 個匹配行"]
+        s4["LIMIT 10 → 取接下來的 10 個匹配行"]
+        s1 --> s2 --> s3 --> s4
     end
 
-    subgraph sparse["恢復區：20萬行後（✅ = info=test）"]
+    subgraph data["實際數據分佈"]
         direction LR
-        s1["200,000✅"] --- s2["200,001✅"] --- dots2["..."] --- s300k["300,000✅"]
+        batch1["第1批匹配行<br/>id 1~100<br/>（100行）"] 
+        gap["斷層<br/>id 101~199,999<br/>全不匹配<br/>（~20萬行）"]
+        batch2["第2批匹配行<br/>id 200,000+<br/>（10萬行）"]
+        batch1 --> gap --> batch2
     end
 
-    dense --> gap --> sparse
+    sql --> data
 
-    subgraph query_phases["不同OFFSET的掃描成本"]
+    subgraph execution["PG 的執行過程"]
+        direction TB
+        e1["1. 從 id=1 開始掃<br/>id 1~100 全部匹配"]
+        e1 --> e2["2. OFFSET 100 把這100行跳過<br/>但 PG 還欠 LIMIT 的 10 行"]
+        e2 --> e3["3. 繼續從 id=101 往後掃<br/>但 id 101~199,999 全不匹配 ❌<br/>每一行都要檢查 → 約20萬行白掃"]
+        e3 --> e4["4. 終於掃到 id=200,000<br/>又匹配了 ✅ → 湊滿10行返回"]
+    end
+
+    data --> execution
+
+    style gap fill:#ffcccc
+    style e3 fill:#ffcccc
+    style batch1 fill:#ccffcc
+    style batch2 fill:#ccffcc
+    style e4 fill:#ccffcc
+```
+
+OFFSET + LIMIT 的陷阱在於：**OFFSET 跳過的是「匹配行」，不是「表中的行」**。如果匹配行是分兩批散落在表中、中間隔著一個巨大的不匹配區，那 PG 從第 1 批匹配行結束到第 2 批開始之間的每一行都必須逐行檢查——即使全部不匹配。
+
+下面用後續實驗的真實數據來量化這個效應（詳見 §2.II 模擬實驗）：
+
+```mermaid
+flowchart TB
+    subgraph data["實驗數據分佈（1000萬行表）"]
+        direction TB
+        dense["第1批匹配<br/>━━━━━━━━<br/>id 1~999<br/>全部 ✅ info=test<br/>（999行）"]
+        gap["斷層區<br/>━━━━━━━━<br/>id 1000~4,999,999<br/>全部 ❌ info≠test<br/>（~500萬行全是廢行）"]
+        sparse["第2批匹配<br/>━━━━━━━━<br/>id 5,000,000~5,000,100<br/>再次 ✅ info=test<br/>（101行）"]
+        dense --> gap --> sparse
+    end
+
+    data --> query_phases
+
+    subgraph query_phases["不同 OFFSET 的掃描成本"]
         direction TB
         p1["OFFSET 10 LIMIT 10<br/>只掃描前20行<br/>⏱ 0.39ms"]
-        p2["OFFSET 100 LIMIT 10<br/>掃描前110行（仍在密集區）<br/>⏱ 仍快"]
-        p3["OFFSET 1000 LIMIT 10<br/>跨越斷層：掃描~20萬行❌<br/>⏱ 952ms (2440x放大!)"]
+        p2["OFFSET 100 LIMIT 10<br/>掃描前110行（仍在第1批）<br/>⏱ 仍然很快"]
+        p3["OFFSET 1000 LIMIT 10<br/>跨越斷層！<br/>必須掃過 ~500萬行不匹配的<br/>才能找到第2批匹配行<br/>⏱ 952ms (2440x!)"]
+        p1 --> p2 --> p3
     end
 
     style dense fill:#ccffcc
     style gap fill:#ffcccc
     style sparse fill:#ccffcc
-    style p3 fill:#ff9999,stroke:#cc0000
     style p1 fill:#ccffcc
+    style p2 fill:#ffffcc
+    style p3 fill:#ff9999,stroke:#cc0000
 ```
 
 > **上圖說明**：一個 30 萬行的表中，只有綠色行滿足查詢條件。前 100 行密集匹配，但 100～20 萬之間全是紅色不匹配行（斷層），之後才再次出現匹配行。OFFSET 值一旦跨越斷層，查詢成本會劇烈跳升。
@@ -291,7 +397,7 @@ flowchart LR
 如上圖：一個 node 有 30 萬 row，前 100 row 滿足條件，100 到 20 萬 row 都不滿足，之後才再次出現滿足條件的 row。
 
 - `OFFSET 10 LIMIT 10`：掃描前 20 row → 極快
-- `OFFSET 100 LIMIT 10`：必須掃描 100 到 20 萬之間的 **199,900 row 全部不滿足的 row**，才能找到下一個滿足條件的結果
+- `OFFSET 100 LIMIT 10`：OFFSET 先跳過前 100 行（全匹配），但接下來從第 101 行到第 199,999 行**全部不匹配**，必須掃過這約 20 萬行才能找到下一批匹配結果
 
 OFFSET + LIMIT 的成本取決於 **條件匹配的第一條滿足 row 之前的總 row 數**，而非 OFFSET 的數值本身。這就是「質變」的來源。
 
@@ -305,6 +411,38 @@ OFFSET + LIMIT 的成本取決於 **條件匹配的第一條滿足 row 之前的
 > 兩個問題會疊加：一個查詢中既有 OFFSET 又有 `f()` → 前置 tuple 全都執行 `f()` 再掃描再丟棄。
 
 ### II. 模擬實驗：1000 萬行表中的三個階段
+
+> **關鍵前提：這張表只有 `id` 上有索引（PK），`info` 沒有索引。** 這是 SQL 新手最常搞混的地方——**邏輯執行順序 ≠ 物理執行方式**。
+>
+> 你用 SQL 的邏輯去想：
+> ```
+> WHERE info='test' → 1100 行 → ORDER BY id → OFFSET 1000 → LIMIT 10000 → 100 行
+> ```
+> 這樣想確實最多只碰 1100 行。但 PostgreSQL 的 planner 會根據**可用的索引**選擇實際執行路徑：這張表只有 `id` 上的 PK 索引，沒有 `info` 索引。planner 無法直接跳到匹配行——只能在兩種「都要碰大量 row」的路徑中挑一個代價較小的：
+
+```mermaid
+flowchart LR
+    subgraph path1["路徑一：Index Scan on id"]
+        direction TB
+        i1["沿 id 索引從 1 順序掃描"]
+        i2["每行回表檢查 info='test'？"]
+        i3["id 1~999 ✅→ id 1000+ ❌→ 一路掃<br/>直到湊滿 OFFSET+LIMIT 或到表尾"]
+        i1 --> i2 --> i3
+    end
+
+    subgraph path2["路徑二：Seq Scan + Sort"]
+        direction TB
+        s1["全表掃描 1000 萬行"]
+        s2["過濾出 info='test' 的 1100 行"]
+        s3["排序後再 OFFSET/LIMIT"]
+        s1 --> s2 --> s3
+    end
+
+    style path1 fill:#ffe0e0,stroke:#cc0000
+    style path2 fill:#ffffcc
+```
+
+> Planner 根據 OFFSET 值估算兩條路徑的成本，挑更便宜的。OFFSET 小時 Index Scan 遠快（只掃幾十行），OFFSET 大到一定程度 Seq Scan 反而更划算，但**兩條路都避不開大量 row**——因為沒有 `info` 索引，PG 不知道匹配行在哪。
 
 #### a. 建立測試表
 
@@ -339,6 +477,21 @@ SELECT * FROM tbl WHERE info = 'test' ORDER BY id OFFSET 100 LIMIT 10;
 ```
 
 OFFSET 100 只跳過了前面緊湊分佈的匹配 row，Index Scan 總共只處理了 110 row。
+
+> **Phase 1 的實際執行順序**：planner 選了 Index Scan on `id`，沿 `id` 索引從 1 開始順序掃描，先走 order by，再根據每一行的結果做 where filter，每掃一行就回表檢查 `WHERE info='test'`：
+>
+> ```
+> id=1   → info='test' ✅ → OFFSET 100，跳過  (第1個匹配)
+> id=2   → info='test' ✅ → OFFSET 100，跳過  (第2個匹配)
+> ...
+> id=100 → info='test' ✅ → OFFSET 100，跳過  (第100個匹配)
+> id=101 → info='test' ✅ → LIMIT 10，返回    (第1筆結果)
+> id=102 → info='test' ✅ → LIMIT 10，返回    (第2筆結果)
+> ...
+> id=110 → info='test' ✅ → LIMIT 10，返回    (第10筆結果，湊滿)
+> ```
+>
+> 因為匹配行密集在前 1000 行內，Index Scan 掃到 id=110 就湊滿 OFFSET+LIMIT 了，`Rows Removed by Filter = 0`，沒有任何白掃。
 
 #### c. Phase 2：OFFSET 1000 LIMIT 100（跨越斷層，性能崩潰）
 
@@ -460,6 +613,8 @@ WHERE create_time >= '2014-02-08' AND create_time < '2014-02-11'
   AND y > 0
 ORDER BY create_time LIMIT 1 OFFSET 10;
 -- 幾十秒
+
+-- 結果：id=xxx, create_time='2014-02-08 18:38:35.79', ...（第11個匹配行）
 ```
 
 兩個 SQL 的 execution plan 幾乎一樣（都用 `create_time` index scan + Filter），但後者的 Filter 淘汰率極高。
@@ -473,52 +628,32 @@ WHERE create_time <= '2014-02-08 18:38:35.79'
 -- count: 1,448,081
 ```
 
+> **為什麼 COUNT 條件跟原查詢不一樣？**
+>
+> 原查詢的 WHERE 是 `2014-02-08` 到 `2014-02-11`（業務需要的 3 天視窗）。但 COUNT 是一把「量尺」——用來量測 PG 為了找出結果掃了多少行。實際操作步驟：
+>
+> 1. 先跑 `OFFSET 10 LIMIT 1`：
+>    ```sql
+>    SELECT * FROM tbl
+>    WHERE create_time >= '2014-02-08' AND create_time < '2014-02-11'
+>      AND x = 3 AND id != '11622' AND id != '13042' AND y > 0
+>    ORDER BY create_time LIMIT 1 OFFSET 10;
+>    -- 結果：id=xxx, create_time='2014-02-08 18:38:35.79', ...（第11個匹配行）
+>    ```
+>
+> 2. 拿到結果的 `create_time = '2014-02-08 18:38:35.79'` 後，用 COUNT 量：從時間範圍起點（`2014-02-08` 即 `2014-02-08 00:00:00`）到這個 create_time 之間，總共有多少行？
+>    ```sql
+>    SELECT COUNT(*) FROM tbl
+>    WHERE create_time >= '2014-02-08'             -- 即 00:00:00
+>      AND create_time <= '2014-02-08 18:38:35.79'; -- 第11個匹配行的時間
+>    -- count: 1,448,081
+>    ```
+>
+> 3. 答案是 **144 萬行**——PG 沿 `create_time` 索引，從 `2014-02-08 00:00:00` 一路掃到 `18:38:35.79`，總共掃過 144 萬行，才湊出 11 個匹配行
+
 僅僅 OFFSET 10，就需要掃描約 **144 萬 row**，其中絕大多數都被 Filter 丟棄。這就是「質變」的具體數字。
 
 > 根本矛盾：**WHERE 條件中的 `id !=` 和 `x = 3` 等 Filter 無法被 `create_time` 索引加速**，Index Scan 只能在 `create_time` 維度快速定位，但 Filter 淘汰率高 → OFFSET 越大，需要掃描的 row 越多。這是所有 SQL 資料庫的共同問題，不是 PostgreSQL 特有。`OFFSET N` 的複雜度是 O(N) 而非 O(1)。
-
-### IV. Index Scan 中的 Filter 成本：Rows Removed by Filter
-
-當 Index Scan 中包含非 index column 的 Filter 條件時，每個 index entry 指向的 heap row 都要被回表檢查：
-
-```
-Index Scan using idx on tbl
-   Index Cond: (create_time >= '...' AND create_time < '...')
-   Filter: (id != '123' AND id != '321' AND y > 0 AND x = 3)
-   Rows Removed by Filter: 1440000   ← 這裡就是質變的量化指標
-```
-
-| 指標 | 說明 |
-|------|------|
-| `Index Cond` | 真正用來縮小 index scan range 的條件（走 index B-tree 結構） |
-| `Filter` | index scan 後逐 row 檢查的附加條件（不做 index 定位，只是 heap tuple 回表後的 CPU 過濾） |
-| `Rows Removed by Filter` | 被 Filter 篩掉的 row 數 = 白掃的量 |
-
-```mermaid
-flowchart TB
-    query["WHERE create_time >= '2014-02-08'<br/>AND id != '123' AND x = 3<br/>ORDER BY create_time OFFSET 10 LIMIT 1"]
-    
-    query --> idx{"Idx Scan on create_time<br/>──────<br/><b>Index Cond:</b> create_time範圍<br/>（透過B-tree快速定位）"}
-    
-    idx --> heap["回表讀取 heap tuple"]
-    
-    heap --> filter{"Filter 檢查<br/>──────<br/>id != '123' AND x = 3 AND y > 0<br/>（每行都要CPU逐一檢查!）"}
-    
-    filter -->|"❌ 不通過"| removed["Rows Removed by Filter<br/>──────<br/>掃了144萬行都是不匹配的<br/>全部白白丟棄!"]
-    
-    filter -->|"✅ 通過"| result["返回給client<br/>──────<br/>僅1行<br/>⏱ 花了幾十秒"]
-
-    style removed fill:#ffcccc
-    style filter fill:#ffffcc
-    style result fill:#ccffcc
-    style idx fill:#cce5ff
-```
-
-> **優化方向**：
-> 1. **讓 Filter 條件變成 Index Cond**：把 `x` 或 `y` 加入 composite index。但代價是 index 變大、寫入變慢。
-> 2. **Partial Index**：如果 `x = 3` 是少數情況，可以 `CREATE INDEX ... WHERE x = 3` 讓 index 只包含這些 row。
-> 3. **Covering Index（INCLUDE）**：讓回表變 Index Only Scan，省掉 heap page read。
-> 4. **`pg_stat_statements` 監控**：query 中的 `shared_blks_hit + shared_blks_read` 過大但 `rows` 很小 → 幾乎肯定是 OFFSET 掃描放大。
 
 ---
 
@@ -537,7 +672,9 @@ WHERE create_time >= '2014-02-08' AND create_time < '2014-02-11'
   AND x = 3 AND id != '123' AND id != '321' AND y > 0
 ORDER BY create_time, pk
 LIMIT 10;
-
+-- ⚠️ 前提：create_time 上有索引（承接 §2.III Production 案例中
+--    的 create_time index scan）
+--
 -- 得到最後一條的 create_time = '2014-02-08 10:30:00', pk = 5678
 
 -- 第 2 頁（代替 OFFSET 10）
@@ -549,7 +686,9 @@ ORDER BY create_time, pk
 LIMIT 10;
 ```
 
-**核心思想**：把「跳過前 N 條」轉化為 `WHERE create_time > last_fetched_time`，讓 Index Scan 直接 seek 到上次結束的位置。這是業界稱為 **Keyset Pagination** 或 **Cursor-based Pagination** 的標準做法（如 GraphQL Relay 的 `after`/`before` cursor）。
+**核心思想**：把「跳過前 N 條」轉化為 `WHERE (create_time, pk) > (last_time, last_pk)`，讓 Index Scan 直接 seek 到上次結束的位置。這是業界稱為 **Keyset Pagination** 或 **Cursor-based Pagination** 的標準做法（如 GraphQL Relay 的 `after`/`before` cursor）。
+
+**但這一切的前提是 `create_time` 上有索引。** 沒有索引的話 `WHERE (create_time, pk) > (...)` 跟 OFFSET 一樣要走全表掃描——Keyset 方案只有在索引能直接 seek 到目標位置時才有效。理想情況下有 `(create_time, pk)` 的複合索引，兩欄一併命中，連 tie-breaker 都不用單獨處理。
 
 ```mermaid
 flowchart TB
@@ -614,6 +753,106 @@ ORDER BY order_col, pk_col;
 ```
 
 **Web/API 層的實作**：API response 中回傳 `next_cursor`（base64 encoded last sort keys），client 下次請求帶 `?cursor=xxx`。這在 GraphQL Relay spec、Twitter API、Stripe API 中都是標準 pagination 模式。
+
+`next_cursor` **不是 SQL 的回傳欄位**——它是應用層從查詢結果的最後一行中取出排序鍵值、編碼後產生的。以下用前面的例子走一遍完整流程：
+
+**第 1 次請求：首頁（client → server）**
+
+```
+GET /api/orders?page_size=10
+```
+
+沒有 cursor，表示從頭開始。Server 執行：
+
+```sql
+SELECT * FROM tbl
+WHERE create_time >= '2014-02-08' AND create_time < '2014-02-11'
+  AND x = 3 AND id != '123' AND id != '321' AND y > 0
+ORDER BY create_time, pk
+LIMIT 10;
+```
+
+Server 拿到 10 筆結果，**記下最後一行的排序鍵值**：
+
+```
+最後一行：create_time = '2014-02-08 10:30:00', pk = 5678
+```
+
+Server 將這兩個值拼成字串 `"2014-02-08 10:30:00|5678"`，做 base64 編碼：
+
+```
+next_cursor = base64("2014-02-08 10:30:00|5678")
+            = "MjAxNC0wMi0wOCAxMDozMDowMHw1Njc4"
+```
+
+Server 回傳：
+
+```json
+{
+  "data": [ /* 10 筆訂單 */ ],
+  "next_cursor": "MjAxNC0wMi0wOCAxMDozMDowMHw1Njc4"
+}
+```
+
+**第 2 次請求：下一頁（client → server）**
+
+```
+GET /api/orders?page_size=10&cursor=MjAxNC0wMi0wOCAxMDozMDowMHw1Njc4
+```
+
+Server 將 `cursor` 做 base64 解碼 → `"2014-02-08 10:30:00|5678"` → 拆出 `create_time` 和 `pk` 值，代入 SQL：
+
+```sql
+SELECT * FROM tbl
+WHERE create_time >= '2014-02-08' AND create_time < '2014-02-11'
+  AND x = 3 AND id != '123' AND id != '321' AND y > 0
+  AND (create_time, pk) > ('2014-02-08 10:30:00', 5678)  -- ← 從 cursor 解出
+ORDER BY create_time, pk
+LIMIT 10;
+```
+
+SQL 本身不需要知道 `cursor` 這個概念——cursor 只是應用層把排序鍵值包裝起來、方便在 HTTP 無狀態請求之間傳遞的手段。**真正在 SQL 中起作用的是 `(create_time, pk) > (...)`，而括號裡的值正是從上一頁最後一行的排序鍵中取出的。**
+
+**那上一頁怎麼做？** Server 在回傳每一頁時，同時提供兩個 cursor：
+
+```json
+{
+  "data": [ /* id=112~121 的訂單 */ ],
+  "first": { "create_time": "2014-02-08 10:30:01", "pk": 1357 },
+  "last":  { "create_time": "2014-02-08 10:30:05", "pk": 9012 },
+  "next_cursor": "base64(last 的排序鍵)",   // → 給「下一頁」用
+  "prev_cursor": "base64(first 的排序鍵)"   // → 給「上一頁」用
+}
+```
+
+當 client 點「上一頁」時，帶的是 `prev_cursor`。Server 解碼後拿到**當前頁第一行的排序鍵**，用 `<` 反向查：
+
+```sql
+-- 上一頁：從當前頁第一行之前往回取 10 筆
+SELECT * FROM (
+  SELECT * FROM tbl
+  WHERE create_time >= '2014-02-08' AND create_time < '2014-02-11'
+    AND x = 3 AND id != '123' AND id != '321' AND y > 0
+    AND (create_time, pk) < ('2014-02-08 10:30:01', 1357)  -- ← 當前頁第一行
+  ORDER BY create_time DESC, pk DESC   -- 反向排序，取「之前的10筆」
+  LIMIT 10
+) sub
+ORDER BY create_time, pk;   -- 再轉回正序輸出
+```
+
+關鍵技巧：
+
+```
+(create_time, pk) < (first_time, first_pk)  →  取「比第一行更早」的資料
+ORDER BY create_time DESC, pk DESC           →  反向排（離第一行最近的排最前）
+LIMIT 10                                     →  取最接近的 10 筆
+外層 ORDER BY create_time, pk                →  轉回正序，給前端自然的順序
+```
+
+| 方向 | 用哪個 cursor | SQL 條件 | 排序 |
+|------|:---:|------|------|
+| 下一頁 | `next_cursor`（最後一行） | `> (last_time, last_pk)` | `ORDER BY ... ASC` |
+| 上一頁 | `prev_cursor`（第一行） | `< (first_time, first_pk)` | 子查詢 DESC → 外層 ASC |
 
 **Keyset 的先天限制與應對**：
 
