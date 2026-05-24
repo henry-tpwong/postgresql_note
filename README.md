@@ -1,114 +1,66 @@
 # PostgreSQL 深度學習筆記
 
-> 整理自 [digoal (德哥) blog](https://github.com/digoal/blog)，輔以 PG 9~18 版本演進更新與 senior developer 實戰見解。
+> 整理自 [digoal (德哥) blog](https://github.com/digoal/blog)，輔以 PG 9~18 版本演進更新與 Senior Developer 實戰見解。
+> 每份 `*_Deep_Dive.md` 由多篇原始筆記合併而成，依由淺到深排列，含標題層級（`# 一、` → `## 1.` → `### I.`）與 Mermaid 圖輔助說明。
 
 ---
 
-## 目錄 
+## 目錄
 
-### Index 索引
+| 章節 | 檔案 | 主題 |
+|------|------|------|
+| **資料型別** | [`datatype/PostgreSQL_Datatype_Deep_Dive.md`](datatype/PostgreSQL_Datatype_Deep_Dive.md) | Float vs Numeric 效能對比（360x）、SIMD 向量化、`AT TIME ZONE` 語法解析與型別轉換陷阱 |
+| **JSON/JSONB** | [`json/PostgreSQL_JSON_Deep_Dive.md`](json/PostgreSQL_JSON_Deep_Dive.md) | JSONB Value Types、Type I/O 機制、陣列提取與 GIN Index、JSONPath / SQL/JSON / json_table（PG 12→17） |
+| **全文檢索** | [`fulltext/PostgreSQL_Fulltext_Deep_Dive.md`](fulltext/PostgreSQL_Fulltext_Deep_Dive.md) | zhparser 中文分詞、Whole-Row FTS（Generated Column）、record_out + SCWS 逗號問題與解法 |
+| **擴充功能** | [`extensions/PostgreSQL_Extensions_Deep_Dive.md`](extensions/PostgreSQL_Extensions_Deep_Dive.md) | IMPORT FOREIGN SCHEMA 跨庫連線、pg_pathman 高效分區（Custom Scan API）、pg_shard 分散式分片（Citus 前身） |
+| **Vacuum / Bloat** | [`vacuum/PostgreSQL_Vacuum_Deep_Dive.md`](vacuum/PostgreSQL_Vacuum_Deep_Dive.md) | Bloat 8 大成因與測試驗證、預防措施、VACUUM FULL vs pg_repack vs pg_squeeze 三方案對比 |
+| **監控與追溯** | 已合併至上述章節 | 慢查詢追溯體系、`track_commit_timestamp` 用途與效能影響 |
+| **系統底層** | [`system/PostgreSQL_System_Deep_Dive.md`](system/PostgreSQL_System_Deep_Dive.md) | Column Order 與 Byte Alignment 全鏈路效能、Bit 位運算標籤系統、Linux Page Fault 與 huge_pages / NUMA |
+| **鎖（Lock）** | [`lock/PostgreSQL_Lock_Complete.md`](lock/PostgreSQL_Lock_Complete.md) | 隱式鎖、Lock Wait 追蹤、秒殺 Advisory Lock、高並發更新、Lock Flooding、max_locks_per_transaction、OLTP advisory lock、無間隙 ID 生成 |
+| **索引（Index）** | 已合併至上層目錄 | 掃描類型全解析（Seq/Index/Bitmap/Parallel/Index-Only）、Bitmap Heap Scan 詳解、BRIN/Bloom/GIN/GiST/SP-GiST/RUM 模糊查詢、GIN+LIMIT 優化、Leaf Page & Covering Index |
+| **其他進階** | [`others/PostgreSQL_Others_Deep_Dive.md`](others/PostgreSQL_Others_Deep_Dive.md) | PG 17 開發規範、Trigger Audit（DML+DDL）、JOIN 冗餘 Early DISTINCT、pgcrypto 加密、千億級 pg_trgm Regex、12306 搶票架構設計 |
 
-| 筆記 | 主題 |
-|------|------|
-| [PostgreSQL_Index_Full.md](index/PostgreSQL_Index_Full.md) | **完整索引學習筆記**：掃描類型全解析 → Bitmap Heap Scan → EXPLAIN 分析 → BRIN → Bloom → GIN/GiST/SP-GiST/RUM 模糊查詢 → GIN+LIMIT 優化 → RUM 全文檢索 → Leaf Page & Covering Index → 索引選擇速查表 |
+---
 
-### 查詢效能優化
+## 各章節快速導覽
 
-| 筆記 | 主題 |
-|------|------|
-| [PostgreSQL_IN_vs_ANY_vs_VALUES.md](query/PostgreSQL_IN_vs_ANY_vs_VALUES.md) | IN / =ANY(ARRAY) / =ANY(VALUES) / JOIN VALUES 效能對決（Datadog 100x case） |
-| [PostgreSQL_GroupAgg_vs_HashAgg.md](query/PostgreSQL_GroupAgg_vs_HashAgg.md) | GROUP BY Sort vs Hash 的 cost model 與選擇邏輯 |
-| [PostgreSQL_count_estimate_keyset.md](query/PostgreSQL_count_estimate_keyset.md) | COUNT 估算與 Keyset Pagination |
-| [PostgreSQL_Group_TopN_Recursive.md](query/PostgreSQL_Group_TopN_Recursive.md) | Group TopN 與遞迴查詢優化 |
-| [PostgreSQL_Recursive_Optimization.md](query/PostgreSQL_Recursive_Optimization.md) | Recursive CTE 效能優化 |
-| [PostgreSQL_Recursive_Cycle.md](query/PostgreSQL_Recursive_Cycle.md) | Recursive CTE CYCLE 檢測 |
-| [PostgreSQL_pg_hint_plan.md](query/PostgreSQL_pg_hint_plan.md) | pg_hint_plan 強制執行計劃 |
-| [PostgreSQL_Query_Lifecycle.md](query/PostgreSQL_Query_Lifecycle.md) | 查詢生命週期（parser → planner → executor） |
+### 資料型別（datatype）
+- **一、Float vs Numeric**：Benchmark（四則/開根號/Pi 計算）、硬體加速 vs 軟體模擬的根本差異、SIMD 向量化優勢、選型建議、版本演進
+- **二、AT TIME ZONE**：EXTRACT epoch 的時區陷阱、`gram.y` 語法規則、`timestamptz_part()` vs `timestamp_part()` 的 overload 選擇、三種 Case 逐步分解
 
-### Vacuum / Bloat / 空間回收
+### JSON/JSONB（json）
+- **一、Value Types 與構造方法**：Scalar Types（大小寫敏感）、jsonb 內部無 Type 概念、Type I/O Function 機制、`format() + jsonb_in()` 構造法、BYTEA Escape 限制、`json_lex()` Tokenizer 完整邏輯
+- **二、陣列提取與查詢**：`->` / `->>` 操作符、`json_array_elements` + ARRAY 構造器、`@>` / `&&` 陣列操作、GIN on Expression、JSONPath（PG 12+）、SQL/JSON 標準函數（PG 15+）、`json_table`（PG 17+）
 
-| 筆記 | 主題 |
-|------|------|
-| [PostgreSQL_Vacuum_Bloat.md](vacuum/PostgreSQL_Vacuum_Bloat.md) | Vacuum 原理、8 大 bloat 成因、預防措施、`OldestXmin` 機制 |
-| [PostgreSQL_Table_Bloat_Repack_Squeeze.md](vacuum/PostgreSQL_Table_Bloat_Repack_Squeeze.md) | 表膨脹檢測與 pg_repack / pg_squeeze 回收 |
+### 全文檢索（fulltext）
+- **一、zhparser 中文全文檢索**：SCWS 分詞引擎、Token Type Mapping（實詞 vs 虛詞）、分詞效果測試、完整部署流程、效能調校（GIN/GiST/RUM 選擇）
+- **二、Whole-Row FTS（PG 17 視角）**：Generated Column + GIN 現代方案、Legacy IMMUTABLE 繞過法、`t::text` 格式限制、加權檢索、中文分詞 Extension 選擇
+- **三、record_out + SCWS 逗號問題**：`record_out` 序列化格式、SCWS 將逗號解析為 auxiliary token 導致截斷、`replace(, → ' ')` 解法、分詞效能基準（4.44 萬字/s）
 
-### Lock / 並發
+### 擴充功能（extensions）
+- **一、IMPORT FOREIGN SCHEMA**：`LIMIT TO` / `EXCEPT` 過濾、View/Materialized View/Foreign Table 一併導入、串聯 FDW 注意事項、限制與適用範圍
+- **二、pg_pathman**：Custom Scan API + HOOK 實作、`RuntimeAppend` runtime partition pruning、Range/Hash 分區 API、Split/Merge/Append/Prepend、非阻塞式資料遷移、Insert 4.1x 加速
+- **三、pg_shard（Citus 前身）**：Hash Sharding、Metadata 三表（partition/shard/shard_placement）、Replica 與故障修復、`master_copy_shard_placement` full-copy 策略、限制清單
 
-| 筆記 | 主題 |
-|------|------|
-| [PostgreSQL_Implicit_Lock.md](lock/PostgreSQL_Implicit_Lock.md) | 隱式鎖請求：`pg_get_indexdef` 等函數的隱性 table lock 陷阱與 lock queue pileup |
-| [PostgreSQL_Lock_Wait_Trace.md](lock/PostgreSQL_Lock_Wait_Trace.md) | Lock wait 追蹤三法：`log_lock_waits` / `pg_stat_activity` / `LOCK_DEBUG` |
-| [PostgreSQL_Flash_Sale_Advisory_Lock.md](lock/PostgreSQL_Flash_Sale_Advisory_Lock.md) | 秒殺場景：Advisory Lock vs FOR UPDATE NOWAIT vs SKIP LOCKED（231K TPS） |
-| [PostgreSQL_High_Concurrency_Update.md](lock/PostgreSQL_High_Concurrency_Update.md) | 高並發全表更新：Advisory Lock / SKIP LOCKED / 分區方案（18x 加速） |
-| [PostgreSQL_Lock_Flooding.md](lock/PostgreSQL_Lock_Flooding.md) | Lock flooding 現象與 `max_locks_per_transaction` |
-| [PostgreSQL_max_locks_per_transaction.md](lock/PostgreSQL_max_locks_per_transaction.md) | `max_locks_per_transaction` 配置指南 |
-| [PostgreSQL_OLTP_advisory_lock.md](lock/PostgreSQL_OLTP_advisory_lock.md) | OLTP 高並發 advisory lock 場景 |
-| [PostgreSQL_advisory_lock_gapfree_id.md](lock/PostgreSQL_advisory_lock_gapfree_id.md) | Advisory lock + 無間隙 ID 生成 |
+### Vacuum / Bloat（vacuum）
+- **一、Vacuum 原理與防止 Bloat**：8 大 Bloat 成因（Long Transaction 為核心）、6 組測試驗證（XID/游標/長查詢/隔離級別/批量更新/naptime）、10 項預防措施、`OldestXmin` 原始碼分析
+- **二、收縮膨脹表**：VACUUM FULL vs pg_repack vs pg_squeeze 三方案對比（鎖定時長/Delta 捕捉/效能影響/成熟度）、現代最佳實踐、`REINDEX CONCURRENTLY`（PG 12+）
 
-### JSON / JSONB
+### 系統底層（system）
+- **一、Column Order & Byte Alignment**：ADD COLUMN 永遠在末尾、Simple View 虛擬重排、Byte Alignment 對 Row Size 的影響（padding 可佔 41%）、全鏈路效能鏈式反應
+- **二、Bit 位運算標籤系統**：5000 萬用戶/200 標籤實測、`bitand()` 無法用 Index 的瓶頸、替代方案（intarray + RD-Tree、roaringbitmap）、生產環境建議
+- **三、Linux Page Fault**：MMU 與虛擬記憶體、Major/Minor/Invalid 三種 Page Fault、大 shared_buffers 啟動低潮案例（minor fault 風暴）、huge_pages / pg_prewarm / NUMA 現代化解方
 
-| 筆記 | 主題 |
-|------|------|
-| [PostgreSQL_JSON_Array_Extract.md](json/PostgreSQL_JSON_Array_Extract.md) | JSON array→SQL array 轉換、GIN 索引、JSONPath / SQL/JSON 標準（到 PG 17 `json_table`） |
-| [PostgreSQL_JSONB_Construct.md](json/PostgreSQL_JSONB_Construct.md) | JSONB 建構與效能 |
+### 其他進階（others）
+- **一、PG 17 開發規範**：命名/設計/Query/管理/穩定性五大類 50+ 條規則，標記 4 條已過時規則
+- **二、Trigger Audit**：DML 審計（hstore + Row Trigger 記錄欄位級變更）+ DDL 審計（Event Trigger + hstore）
+- **三、JOIN 冗餘膨脹 Early DISTINCT**：笛卡爾乘積膨脹的根因、每層 JOIN 後立即去重的解法、重現實驗與 CTE 簡化寫法
+- **四、pgcrypto 加密**：密碼儲存（crypt+gen_salt）、PGP 對稱/公鑰加密、三種方案選擇矩陣
+- **五、千億級 Regex 模糊查詢**：1,008 億行 pg_trgm + GIN 效能實測、Trigram 原理、四種查詢模式（Prefix/Suffix/中間/Regex）、pg_bigm 替代方案
+- **六、12306 搶票架構**：varbit 座位區段銷售狀態、Array+GIN 車次查詢、SKIP LOCKED 避免 Lock 衝突、pgrouting 路徑規劃、10 大法寶
 
-### 全文檢索 (FTS)
-
-| 筆記 | 主題 |
-|------|------|
-| [PostgreSQL_Chinese_FTS_zhparser.md](fulltext/PostgreSQL_Chinese_FTS_zhparser.md) | 中文全文檢索：zhparser + SCWS 安裝、token type mapping、雲端相容矩陣 |
-| [PostgreSQL_FTS_whole_row.md](fulltext/PostgreSQL_FTS_whole_row.md) | 整行 FTS 索引 |
-| [PostgreSQL_Whole_Row_FTS.md](fulltext/PostgreSQL_Whole_Row_FTS.md) | 整行全文檢索方案 |
-
-### 系統底層
-
-| 筆記 | 主題 |
-|------|------|
-| [PostgreSQL_Page_Fault.md](system/PostgreSQL_Page_Fault.md) | Linux page fault 對 PG 性能影響、huge_pages / THP / NUMA / `pg_prewarm` |
-| [PostgreSQL_bit_ops_perf.md](system/PostgreSQL_bit_ops_perf.md) | Bit 操作效能對比 |
-| [PostgreSQL_Column_Order_Alignment.md](system/PostgreSQL_Column_Order_Alignment.md) | Column order 與記憶體對齊對 tuple 大小的影響 |
-
-### 監控 / 排查
-
-| 筆記 | 主題 |
-|------|------|
-| [PostgreSQL_Slow_Query_Trace.md](monitoring/PostgreSQL_Slow_Query_Trace.md) | 慢查詢追溯體系：`pg_stat_activity` / `auto_explain` / `pg_stat_io` / wait_event |
-| [PostgreSQL_slow_query_tracing.md](monitoring/PostgreSQL_slow_query_tracing.md) | 慢查詢追蹤方法 |
-| [PostgreSQL_track_commit_timestamp.md](monitoring/PostgreSQL_track_commit_timestamp.md) | `track_commit_timestamp` 功能與應用 |
-
-### 分頁 / OFFSET
-
-| 筆記 | 主題 |
-|------|------|
-| [PostgreSQL_OFFSET.md](pagination/PostgreSQL_OFFSET.md) | OFFSET 原理：跳過 row 仍被計算、`VOLATILE` function 陷阱 |
-| [PostgreSQL_OFFSET_Gap.md](pagination/PostgreSQL_OFFSET_Gap.md) | OFFSET 造成的查詢缺口問題 |
-| [PostgreSQL_分頁優化.md](pagination/PostgreSQL_分頁優化.md) | 分頁效能優化 |
-
-### 資料型別 / Function
-
-| 筆記 | 主題 |
-|------|------|
-| [PostgreSQL_Float_vs_Numeric.md](datatype/PostgreSQL_Float_vs_Numeric.md) | Float vs Numeric 性能對比（360x sqrt 差距）、SIMD 向量化 |
-| [PostgreSQL_AT_TIME_ZONE.md](datatype/PostgreSQL_AT_TIME_ZONE.md) | `AT TIME ZONE` 行為詳解 |
-
-### Partition / Extension / FDW
-
-| 筆記 | 主題 |
-|------|------|
-| [PostgreSQL_pg_pathman.md](extensions/PostgreSQL_pg_pathman.md) | pg_pathman 分區管理 extension |
-| [PostgreSQL_pg_shard.md](extensions/PostgreSQL_pg_shard.md) | pg_shard 分散式方案 |
-| [PostgreSQL_FDW_ImportForeignSchema.md](extensions/PostgreSQL_FDW_ImportForeignSchema.md) | `IMPORT FOREIGN SCHEMA` 用法 |
-
-### 其他
-
-| 筆記 | 主題 |
-|------|------|
-| [PostgreSQL_12306_Ticket_System.md](others/PostgreSQL_12306_Ticket_System.md) | 12306 訂票系統設計思路 |
-| [PostgreSQL_JOIN_Redundancy.md](others/PostgreSQL_JOIN_Redundancy.md) | JOIN 冗餘分析 |
-| [PostgreSQL_pgcrypto.md](others/PostgreSQL_pgcrypto.md) | pgcrypto 加密 extension |
-| [PostgreSQL_Trigger_Audit.md](others/PostgreSQL_Trigger_Audit.md) | Trigger 審計 |
-| [PostgreSQL_pg_trgm_Regex_100Billion.md](others/PostgreSQL_pg_trgm_Regex_100Billion.md) | pg_trgm 正則 100 億級別案例 |
-| [PostgreSQL_Dev_Standards.md](others/PostgreSQL_Dev_Standards.md) | PG 17 開發規範：命名、索引、SQL 編寫、schema 設計（標記過時規則） |
+### 鎖（lock）
+- **PostgreSQL_Lock_Complete.md**：隱式鎖請求、Lock Wait 追蹤（`log_lock_waits` / `pg_stat_activity` / `LOCK_DEBUG`）、Advisory Lock 秒殺（231K TPS）、高並發全表更新（18x 加速）、Lock Flooding、`max_locks_per_transaction` 配置、OLTP advisory lock、無間隙 ID 生成
 
 ---
 
@@ -116,15 +68,14 @@
 
 ### 內容來源
 
-筆記原始內容主要來自 [digoal (德哥) 的 PostgreSQL blog](https://github.com/digoal/blog)，經結構化整理、去除重複、補充 PG 9~18 版本演進資訊與 senior developer 實戰見解。
-
+筆記原始內容主要來自 [digoal (德哥) 的 PostgreSQL blog](https://github.com/digoal/blog)，經結構化整理、去除重複、補充 PG 9~18 版本演進資訊與 Senior Developer 實戰見解。
 
 ### 使用方式
 
-- 每篇 `.md` 獨立成章，可直接閱讀
+- 每份 `*_Deep_Dive.md` 為該主題的完整學習手冊，由淺到深排列
 - `images/` 目錄存放相關圖片
 - 專業名詞使用英文（TID、Recheck Cond、OldestXmin 等）
-- 版本標注：`> 更新於 2026-05-17，補充 PG 14~18 新增能力`
+- 版本標注：`> 更新於 2026-05-17，補充 PG X~X 新增能力`
 
 ### License
 
