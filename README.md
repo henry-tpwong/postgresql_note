@@ -20,7 +20,7 @@
 | **查詢深度解析** | [`PostgreSQL_Query.md`](PostgreSQL_Query.md) | 查詢生命週期、CBO 與 pg_hint_plan、GROUP BY 策略、IN/ANY/VALUES、分頁與計數、Recursive CTE 優化、死循環防禦 |
 | **監控與追溯** | [`PostgreSQL_Monitoring.md`](PostgreSQL_Monitoring.md) | 慢查詢追溯體系、`pg_stat_activity` / `auto_explain` / `pg_stat_io`、`track_commit_timestamp` |
 | **索引全解析** | [`PostgreSQL_Index.md`](PostgreSQL_Index.md) | 掃描類型全解析（Seq/Index/Bitmap/Parallel/Index-Only）、Bitmap Heap Scan 詳解、BRIN/Bloom/GIN/GiST/SP-GiST/RUM、Covering Index |
-| **分頁查詢** | [`PostgreSQL_分頁查詢.md`](PostgreSQL_分頁查詢.md) | OFFSET 效能退化、CURSOR 方案、Keyset Pagination、分頁優化策略 |
+| **分頁查詢** | [`PostgreSQL_pagination.md`](PostgreSQL_pagination.md) | OFFSET 效能退化、CURSOR 方案、Keyset Pagination、分頁優化策略 |
 
 ---
 
@@ -53,6 +53,10 @@
 - **二、Bit 位運算標籤系統**：5000 萬用戶/200 標籤實測、`bitand()` 無法用 Index 的瓶頸、替代方案（intarray + RD-Tree、roaringbitmap）、生產環境建議
 - **三、Linux Page Fault**：MMU 與虛擬記憶體、Major/Minor/Invalid 三種 Page Fault、大 shared_buffers 啟動低潮案例（minor fault 風暴）、huge_pages / pg_prewarm / NUMA 現代化解方
 
+### 鎖（lock）
+- **一、Lock 機制全景**：8 級 Lock Mode 衝突矩陣、Lock Queue 排隊機制（pending lock 可堵死後續請求）、Object-Level Lock 在 Transaction 結束才釋放、idle in transaction 偵測與預防
+- **二、Advisory Lock 應用場景**：秒殺（231K TPS）、高並發全表更新（18x 加速）、OLTP 排隊控制、無間隙 ID 生成與 Lock Flooding 防禦、`max_locks_per_transaction` 配置
+
 ### 其他進階（others）
 - **一、PG 17 開發規範**：命名/設計/Query/管理/穩定性五大類 50+ 條規則，標記 4 條已過時規則
 - **二、Trigger Audit**：DML 審計（hstore + Row Trigger 記錄欄位級變更）+ DDL 審計（Event Trigger + hstore）
@@ -61,8 +65,30 @@
 - **五、千億級 Regex 模糊查詢**：1,008 億行 pg_trgm + GIN 效能實測、Trigram 原理、四種查詢模式（Prefix/Suffix/中間/Regex）、pg_bigm 替代方案
 - **六、12306 搶票架構**：varbit 座位區段銷售狀態、Array+GIN 車次查詢、SKIP LOCKED 避免 Lock 衝突、pgrouting 路徑規劃、10 大法寶
 
-### 鎖（lock）
-- **PostgreSQL_Lock.md**：隱式鎖請求、Lock Wait 追蹤（`log_lock_waits` / `pg_stat_activity` / `LOCK_DEBUG`）、Advisory Lock 秒殺（231K TPS）、高並發全表更新（18x 加速）、Lock Flooding、`max_locks_per_transaction` 配置、OLTP advisory lock、無間隙 ID 生成
+### 查詢深度解析（Query）
+- **一、查詢生命週期**：Client Request → Parser → Analyzer → Planner → Executor 六階段逐層拆解、Process-per-Connection 架構設計、三層 Tree 轉換（Parse/Plan/Executor）
+- **二、CBO 與 pg_hint_plan**：Cost-Based Optimizer 盲區分析、何時需要 Hint 介入、pg_hint_plan 使用方法與注意事項
+- **三、GROUP BY 策略**：Sort (GroupAgg) vs Hash (HashAgg) 兩種實作路徑、Planner 選擇邏輯與調校
+- **四、IN / =ANY / VALUES 效能對決**：四種等效寫法的底層差異、JOIN VALUES 展開陷阱
+- **五、分頁與計數優化**：count(*) 替代策略、OFFSET 退化分析、Keyset 位點
+- **六、Recursive CTE 優化**：Index Skip Scan 模擬、Top-N Per Group（44x 加速）
+- **七、Recursive CTE 死循環防禦**：CYCLE 語法（PG 14+）、Production 防禦體系
+
+### 監控與追溯（Monitoring）
+- **一、慢查詢追溯體系**：pg_stat_activity 即時監測 → OS/DB 層級數據採集 → auto_explain / log_lock_waits 自動記錄 → 交叉分析還原案發經過
+- **二、track_commit_timestamp**：SLRU 儲存結構、logical replication / snapshot too old / CDC 應用場景、效能影響與 Production 取捨
+
+### 索引全解析（Index）
+- **一、六種掃描類型全解析**：Seq Scan / Index Scan / Bitmap Heap Scan / Index-Only Scan / Parallel Scan / TID Scan 的 Planner 選擇邏輯與成本模型
+- **二、Index 核心機制**：B-Tree / Hash 內部結構、Covering Index（INCLUDE）、Partial Index、Expression Index
+- **三、BRIN Index**：Block Range Index 原理、適用場景（時序/ append-only）、與 B-Tree 的效能對比
+- **四、Bloom Index**：單一索引支撐任意 Column 組合查詢、簽名長度調校
+- **五～七、模糊查詢索引全景**：GIN / GiST / SP-GiST / RUM 四種索引的內部機制、全文檢索排序、GIN+LIMIT 慢的原因與 RUM 解法
+
+### 分頁查詢（Pagination）
+- **一、OFFSET 基本原理**：OFFSET 不是「跳過」而是「計算後丟棄」、VOLATILE function 的放大效應、SQL 邏輯執行順序
+- **二、OFFSET 的質變**：數據斷層引發掃描量跳升、Rows Removed by Filter 暴增、Production 真實案例
+- **三、分頁優化方案**：Keyset Pagination / CURSOR / ismax 標記列四種方案對比與選擇指南
 
 ---
 
