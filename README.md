@@ -12,7 +12,7 @@
 | **資料型別** | [`datatype/PostgreSQL_Datatype.md`](datatype/PostgreSQL_Datatype.md) | Float vs Numeric 效能對比（360x）、SIMD 向量化、`AT TIME ZONE` 語法解析與型別轉換陷阱 |
 | **JSON/JSONB** | [`json/PostgreSQL_JSON.md`](json/PostgreSQL_JSON.md) | JSONB Value Types、Type I/O 機制、陣列提取與 GIN Index、JSONPath / SQL/JSON / json_table（PG 12→17） |
 | **全文檢索** | [`fulltext/PostgreSQL_Fulltext.md`](fulltext/PostgreSQL_Fulltext.md) | zhparser 中文分詞、Whole-Row FTS（Generated Column）、record_out + SCWS 逗號問題與解法 |
-| **擴充功能** | [`extensions/PostgreSQL_Extensions.md`](extensions/PostgreSQL_Extensions.md) | IMPORT FOREIGN SCHEMA 跨庫連線、pg_pathman 高效分區（Custom Scan API）、pg_shard 分散式分片（Citus 前身） |
+| **擴充功能** | [`extensions/PostgreSQL_Extensions.md`](extensions/PostgreSQL_Extensions.md) | 十大 Extension 全解析：FDW 跨庫連線、pg_partman 自動分區、Citus 12 分散式、PgBouncer 連接池、pg_stat_statements 查詢統計、auto_explain 計畫記錄、pg_repack 在線重組、pg_cron 定時任務、pg_stat_kcache IO 統計、hypopg 假設索引 |
 | **Vacuum / Bloat** | [`vacuum/PostgreSQL_Vacuum.md`](vacuum/PostgreSQL_Vacuum.md) | Bloat 8 大成因與測試驗證、預防措施、VACUUM FULL vs pg_repack vs pg_squeeze 三方案對比 |
 | **系統底層** | [`system/PostgreSQL_System.md`](system/PostgreSQL_System.md) | Column Order 與 Byte Alignment 全鏈路效能、Bit 位運算標籤系統、Linux Page Fault 與 huge_pages / NUMA |
 | **鎖（Lock）** | [`lock/PostgreSQL_Lock.md`](lock/PostgreSQL_Lock.md) | 隱式鎖、Lock Wait 追蹤、秒殺 Advisory Lock、高並發更新、Lock Flooding、max_locks_per_transaction、OLTP advisory lock、無間隙 ID 生成 |
@@ -40,9 +40,16 @@
 - **三、record_out + SCWS 逗號問題**：`record_out` 序列化格式、SCWS 將逗號解析為 auxiliary token 導致截斷、`replace(, → ' ')` 解法、分詞效能基準（4.44 萬字/s）
 
 ### 擴充功能（extensions）
-- **一、IMPORT FOREIGN SCHEMA**：`LIMIT TO` / `EXCEPT` 過濾、View/Materialized View/Foreign Table 一併導入、串聯 FDW 注意事項、限制與適用範圍
-- **二、pg_pathman**：Custom Scan API + HOOK 實作、`RuntimeAppend` runtime partition pruning、Range/Hash 分區 API、Split/Merge/Append/Prepend、非阻塞式資料遷移、Insert 4.1x 加速
-- **三、pg_shard（Citus 前身）**：Hash Sharding、Metadata 三表（partition/shard/shard_placement）、Replica 與故障修復、`master_copy_shard_placement` full-copy 策略、限制清單
+- **一、IMPORT FOREIGN SCHEMA**：`LIMIT TO` / `EXCEPT` 過濾、View/Materialized View/Foreign Table 一併導入、PG 14-17 演進（postgres_fdw 2.0、async_append、MERGE pushdown、parallel_foreign_scan）
+- **二、pg_partman**：PG 10-17 原生分區演進、自動分區創建/清理、Retention Policy、Background Worker 驅動的 partition lifecycle、按天/月/年分區管理
+- **三、Citus 12**：分散式 SQL 引擎、Hash/Range Sharding、Co-Located Join、Schema-Based Sharding、非阻塞 Rebalancing、Query from Any Node
+- **四、PgBouncer**：Transaction vs Session vs Statement Pooling、生產級 HAProxy 拓撲、PgBouncer 1.22+ prepared statement 追蹤
+- **五、pg_stat_statements**：查詢歸一化原理、queryid 計算、Top-N 慢查詢/JIT/WAL 分析、PG 16 新增 JIT 計數器
+- **六、auto_explain**：自動記錄執行計劃、log_analyze/log_buffers/log_triggers/log_nested_statements、生產調校策略
+- **七、pg_repack**：四階段在線重組原理、vs VACUUM FULL / pg_squeeze 對比、配合 pg_cron 定時執行
+- **八、pg_cron**：PG 內建排程、定時 VACUUM / 分區維護 / 物化視圖刷新、與 pg_partman 協同
+- **九、pg_stat_kcache**：getrusage() 實體 IO 統計、CPU 耗時分析、寫入放大檢測、與 pg_stat_statements 聯表診斷
+- **十、hypopg**：假設索引 zero-cost 試錯、分區表索引測試、結合 pg_stat_statements Top-N 慢查詢最佳實踐
 
 ### Vacuum / Bloat（vacuum）
 - **一、Vacuum 原理與防止 Bloat**：8 大 Bloat 成因（Long Transaction 為核心）、6 組測試驗證（XID/游標/長查詢/隔離級別/批量更新/naptime）、10 項預防措施、`OldestXmin` 原始碼分析
