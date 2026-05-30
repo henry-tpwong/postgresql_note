@@ -1,11 +1,12 @@
 # PostgreSQL 資料型別深度探討
 
-本文由淺入深，依序探討兩個 PostgreSQL 資料型別相關主題：
+本文由淺入深，依序探討三個 PostgreSQL 資料型別相關主題：
 
 1. **第一章「Float vs Numeric 性能對比」**：從實戰角度出發，比較兩種數值型別的效能差異、底層原因與選型建議。適合快速了解何時該用哪種型別。
 2. **第二章「AT TIME ZONE 語法解析」**：深入 parser 內部（gram.y）、型別系統與函數 overload 選擇邏輯，用一個違反直覺的案例逐步拆解 `EXTRACT epoch` 在不同時區下的行為。適合想理解 PostgreSQL 型別系統底層運作的讀者。
+3. **第三章「timestamptz vs timestamp — .NET 8 Dapper / EF Core 實戰」**：從 Npgsql 6.0 的 breaking change 出發，解釋 `DateTimeKind` 錯誤的底層原理、Dapper 與 EF Core 的具體寫法、以及正確的型別選擇策略。適合 .NET 開發者在實際專案中避坑。
 
-建議依序閱讀：先建立對數值型別的實戰認識，再進入時間型別的 parser 層級分析。
+建議依序閱讀：先建立對數值型別的實戰認識，再進入時間型別的 parser 層級分析，最後落腳到應用層的 .NET 實踐。
 
 ---
 
@@ -33,22 +34,178 @@ CREATE TABLE tf (c1 FLOAT, c2 FLOAT);
 INSERT INTO tf VALUES (1.1111, 1.1111);
 ```
 
-### 為什麼要 `SET STORAGE PLAIN`？
+### 為什麼要 `SET STORAGE PLAIN`？—— 深入 TOAST 機制
 
-PostgreSQL 有一個名為 TOAST 的機制：當一個欄位的值太大時（通常是超過約 2KB），PG 會自動將它壓縮或移到獨立的存儲區域。這對日常使用是好事，但在 benchmark 時會引入額外的壓縮/解壓縮開銷，干擾效能測量。
+> **新手提示**：這段會從最基礎的 PostgreSQL 存儲原理講起。如果你對名詞不熟沒關係，把它想像成「書本的頁面」和「太長的段落要移到附錄」就很好理解了。
 
-- `STORAGE PLAIN`：告訴 PG「不要對這個欄位做任何 TOAST 處理」，確保我們測量的是純粹的數值運算速度，而不是存儲機制的速度。
-- 注意 FLOAT 本身是固定 8 bytes，永遠不會觸發 TOAST，所以不需要這一步。
+#### 第一步：PostgreSQL 的 "頁面" (Page) 概念
+
+PostgreSQL 把資料存在硬碟上時，是以一個固定大小的 **頁面（Page）** 為單位來讀寫的。每個頁面預設 **8KB**（8192 bytes），不可改變。
+
+```
+硬碟上的資料檔:
+┌────────────┬────────────┬────────────┬────────────┐
+│  Page 0    │  Page 1    │  Page 2    │  Page 3    │  ...
+│  8 KB      │  8 KB      │  8 KB      │  8 KB      │
+│  ┌──────┐  │  ┌──────┐  │  ┌──────┐  │  ┌──────┐  │
+│  │Row 1 │  │  │Row 3 │  │  │Row 5 │  │  │Row 7 │  │
+│  │Row 2 │  │  │Row 4 │  │  │Row 6 │  │  │ ...  │  │
+│  └──────┘  │  └──────┘  │  └──────┘  │  └──────┘  │
+└────────────┴────────────┴────────────┴────────────┘
+```
+
+一條資料列（Row）的總大小受這 8KB 限制——**一條 row 不能跨越多個 page**。這就是 PG 的基本規則。
+
+#### 第二步：問題——當欄位太大，塞不進一個 Page？
+
+考慮這張表：
+
+```sql
+CREATE TABLE blog_post (
+    id      INT,
+    title   TEXT,
+    content TEXT    -- 這篇文章可能有 100KB！
+);
+```
+
+100KB 的文章內容 `content`，遠超過一個 page 的 8KB 限制。如果 PG 硬要把整條 row 塞進去，它做不到。那怎麼辦？
+
+答案就是 **TOAST**。
+
+```mermaid
+flowchart TD
+    P[一個 Page = 8 KB] --> ROW["一條 Row<br/>id + title + content"]
+    ROW --> Q{"整條 Row 塞得進<br/>一個 Page 嗎？"}
+    Q -->|"塞得進<br/>(總大小 ≤ 8KB)"| OK["正常儲存<br/>所有欄位在同一 Page 內"]
+    Q -->|"塞不進<br/>(content 太大)"| TOAST["觸發 TOAST 機制<br/>把大欄位移到別處"]
+```
+
+#### 第三步：TOAST 是什麼？
+
+**TOAST** = **T**he **O**versized-**A**ttribute **S**torage **T**echnique（超大衣櫃儲存技術，中文有人戲稱「烤吐司」）。
+
+TOAST 的核心思想：**把太大的欄位值從主表中「切出來」，放到另一張獨立的附属表中儲存，主表中只留一個指標指向它。**
+
+```
+┌─────────── 主表 (blog_post) ───────────┐
+│ id │ title        │ content           │
+├────┼──────────────┼───────────────────┤
+│ 1  │ "Hello"      │ ➜ TOAST pointer   │  ← 主表只存一個指標
+│ 2  │ "TOAST 詳解" │ ➜ TOAST pointer   │
+└────┴──────────────┴───────────────────┘
+                      │
+                      ▼
+┌──── TOAST 附属表 (pg_toast_xxxxx) ────┐
+│ chunk_id │ chunk_seq │ chunk_data     │
+├──────────┼───────────┼────────────────┤
+│ 1001     │ 0         │ "PostgreSQL... │  ← 真實資料切成多個
+│ 1001     │ 1         │ "是一種強大..." │    2KB 的小塊存放
+│ 1001     │ 2         │ "...的資料庫"  │
+│ 1002     │ 0         │ "TOAST 的作用" │
+│ 1002     │ 1         │ "是解決超大..." │
+└──────────┴───────────┴────────────────┘
+```
+
+```mermaid
+sequenceDiagram
+    participant User as 用戶查詢
+    participant PG as PostgreSQL
+    participant Main as 主表 Page
+    participant Toast as TOAST 附属表
+
+    User->>PG: SELECT * FROM blog_post WHERE id = 1
+    PG->>Main: 讀取主表 Row
+    Main-->>PG: id=1, title="Hello", content=TOAST指標
+    PG->>Toast: 根據 TOAST 指標讀取真實資料
+    Toast-->>PG: chunk 0, chunk 1, chunk 2...
+    PG->>PG: 把 chunks 組合成完整 content
+    PG-->>User: 返回完整結果
+```
+
+> **關鍵效能影響**：TOAST 指標指向的值存在另一個物理位置。因此每次要讀取這個欄位時，PG 需要「**額外的硬碟 I/O**」去 TOAST 附属表中把資料找回來。這就好比你讀一本書，大部分內容在正文裡，但某一段被移到附錄——你必須翻到附錄才能讀到它。對於 benchmark 而言，這些額外的 I/O 會**汙染效能數據**，讓你看不清數值運算本身的真實速度。
+
+#### 第四步：四種 Storage 策略
+
+PostgreSQL 為每個欄位提供四種 TOAST 策略，你可以用 `ALTER COLUMN ... SET STORAGE` 來選擇：
+
+| 策略 | 行為 | 觸發條件 | 適合場景 |
+|------|------|---------|---------|
+| `PLAIN` | **禁止 TOAST**。不壓縮、不移到外部。 | 永不觸發。值太大就報錯（row too big）。 | Benchmark、已知很小的欄位 |
+| `EXTENDED` | **先壓縮，還太大就移到外部** | 值 > 2KB 時嘗試壓縮，壓縮後仍 > 2KB 則 TOAST | **PG 的預設策略**，適合 TEXT / BYTEA |
+| `EXTERNAL` | **不壓縮，直接移到外部** | 值 > 2KB 時直接 TOAST，不嘗試壓縮 | 已壓縮的資料（如 JPEG），壓了也白壓 |
+| `MAIN` | **先壓縮，壓完盡量留在主表** | 值 > 2KB 時先壓縮，除非壓縮後仍然塞不進 page 才 TOAST | 需要頻繁讀取的大欄位 |
+
+```mermaid
+flowchart TD
+    S["一個欄位的值"] --> QSZ{"值有多大？"}
+
+    QSZ -->|"≤ 2KB"| NORMAL["所有策略都一樣<br/>直接存在主表中<br/>不觸發 TOAST"]
+
+    QSZ -->|"> 2KB"| STGY{"當前 STORAGE<br/>策略是？"}
+
+    STGY -->|PLAIN| PERR["❌ 報錯<br/>row too big"]
+    STGY -->|EXTERNAL| EXT["直接移到 TOAST 表<br/>不壓縮"]
+    STGY -->|EXTENDED| EXD["先嘗試壓縮"]
+    STGY -->|MAIN| MAI["先嘗試壓縮"]
+
+    EXD --> EXD2{"壓縮後仍 > 2KB？"}
+    EXD2 -->|是| TOAST1["移到 TOAST 表"]
+    EXD2 -->|否| STAY1["留在主表中"]
+
+    MAI --> MAI2{"壓縮後<br/>Row 總大小<br/>仍塞不進 Page？"}
+    MAI2 -->|是| TOAST2["移到 TOAST 表"]
+    MAI2 -->|否| STAY2["留在主表中"]
+
+    style PERR fill:#ff6b6b,color:#fff
+    style STAY1 fill:#4ecdc4,color:#fff
+    style STAY2 fill:#4ecdc4,color:#fff
+```
+
+#### 第五步：回到「為什麼 Benchmark 要 SET STORAGE PLAIN」
+
+```sql
+-- 原始 Benchmark 設定：
+CREATE TABLE tt (c1 NUMERIC, c2 NUMERIC);
+ALTER TABLE tt ALTER COLUMN c1 SET STORAGE PLAIN;
+ALTER TABLE tt ALTER COLUMN c2 SET STORAGE PLAIN;
+```
+
+- **NUMERIC 預設的 storage 策略是 `MAIN`** —— PG 可能會壓縮、甚至 TOAST 化大數值。
+- `NUMERIC(1000, 500)` 這類高精度數字的內部 digit 陣列可以很長（超過 2KB），此時 PG **會觸發 TOAST**，讀寫時產生額外的附屬表 I/O。
+- Benchmark 中雖然用的是 `NUMERIC(1.1111)`（只有 4 位小數，內部結構很小，根本不會觸發 TOAST），但 `SET STORAGE PLAIN` 是一個**防禦性措施**——確保即使未來測試大數值，也不會被 TOAST 開銷汙染結果。
+- `FLOAT` 永遠是固定 8 bytes，絕對不可能超過 2KB，因此不需要這一步。
 
 ```mermaid
 flowchart LR
-    A[建立測試表] --> B{欄位型別?}
-    B -->|NUMERIC| C[SET STORAGE PLAIN]
-    B -->|FLOAT| D[無需設定<br/>固定8 bytes]
-    C --> E[INSERT 相同測試資料]
-    D --> E
-    E --> F[開始 Benchmark]
+    subgraph WITH_PLAIN["SET STORAGE PLAIN (NUMERIC)"]
+        W1["資料讀寫請求"] --> W2["直接存取主表中的<br/>NUMERIC struct"]
+        W2 --> W3["純數值運算效能<br/>✅ 無 TOAST 干擾"]
+    end
+
+    subgraph WITHOUT_PLAIN["預設 MAIN (NUMERIC)"]
+        O1["資料讀寫請求"] --> O2{"數值大小？"}
+        O2 -->|小數值| O3["直接存取<br/>與 PLAIN 相同"]
+        O2 -->|大數值| O4["壓縮 / TOAST<br/>額外 I/O"]
+        O4 --> O5["數值運算 + TOAST 開銷<br/>❌ 效能數據被汙染"]
+    end
+
+    subgraph FLOAT_CASE["FLOAT (無需設定)"]
+        F1["固定 8 bytes"] --> F2["永遠不觸發 TOAST"]
+    end
+
+    style W3 fill:#4ecdc4,color:#fff
+    style O5 fill:#ff6b6b,color:#fff
 ```
+
+#### 一句話總結
+
+| 概念 | 比喻 |
+|------|------|
+| **Page** | 一本書的每一頁，固定大小 8KB |
+| **TOAST** | 文章太長寫不下，把冗餘段落移到書末「附錄」 |
+| **TOAST 指標** | 正文中留一句「詳見附錄第 X 頁」 |
+| **STORAGE PLAIN** | 「不准移到附錄，寫不下就報錯」——測效能時用它排除附錄翻頁的干擾 |
+| **STORAGE EXTENDED（預設）** | 「寫不下先縮小字體（壓縮），再不行就移到附錄」——這是 PG 對 TEXT 欄位的預設策略 |
 
 ---
 
@@ -723,3 +880,432 @@ flowchart LR
 ```
 
 > [PG 版本註] 原文基於 PG 9.x（2015）。核心行為（`AT TIME ZONE` 的型別轉換、`date_part` 的 overload 選擇邏輯）在最新版本（PG 17+）完全一致，未變更。唯一變化：PG 12+ 新增 `date_trunc` 的 timezone 參數支援（`date_trunc('day', timestamptz, 'Asia/Shanghai')`），但與 `EXTRACT` / `AT TIME ZONE` 無直接關聯。
+
+---
+
+# 三、timestamptz vs timestamp — .NET 8 Dapper / EF Core 實戰
+
+> **初學者先知道**：在第二章我們看到了 PG 內部 `timestamptz` 和 `timestamp` 的區別——一個有時區語意（存 UTC，顯示時依 session tz 轉換），一個沒有（我寫什麼就存什麼）。到了 .NET 應用層，問題變成：**當你的 C# 程式透過 Npgsql 把資料寫入 PG 時，Npgsql 如何對應這兩種型別？** Npgsql 6.0（配合 .NET 6 發布）做了一個關鍵的 breaking change，導致很多既有程式碼開始拋出 `DateTimeKind` 錯誤。本章從底層映射原理到 Dapper / EF Core 寫法，完整拆解。
+
+---
+
+## 1. 問題背景：Npgsql 6.0 的 Breaking Change
+
+### 先理解 .NET 的 DateTime.Kind
+
+.NET 的 `DateTime` 有一個 `Kind` 屬性（枚舉），它告訴你這個日期時間值**帶有什麼樣的時區含義**：
+
+| DateTimeKind | 意義 | 範例 |
+|-------------|------|------|
+| `Unspecified` | 只是一個日期時間值，不附帶任何時區資訊 | `2025-01-01 12:00:00`（不知道是哪個時區的 12:00） |
+| `Utc` | 明確表示這個值是 UTC 時間 | `2025-01-01 04:00:00 UTC` |
+| `Local` | 明確表示這個值是執行中電腦的本地時區時間 | `2025-01-01 12:00:00 +08`（在台灣的機器上） |
+
+```mermaid
+flowchart LR
+    subgraph KIND["DateTime.Kind 三種模式"]
+        U["Unspecified<br/>『我不知道時區』"]
+        L["Local<br/>『這是本地時間』"]
+        Z["Utc<br/>『這是 UTC 時間』"]
+    end
+```
+
+> **核心矛盾**：PG 的 `timestamp` 是「無時區語意」的型別，而 .NET 的 `DateTime` 卻可能攜帶 `Kind=Utc` 或 `Kind=Local` 的時區資訊。如果 Npgsql 允許你把一個明確標記為 UTC 的 DateTime 寫入無時區的 `timestamp` 欄位，**時區資訊就被悄悄丟棄了**——這就是 bug 的根源。
+
+### Npgsql 5.x 的行為（寬容模式）
+
+| PG 型別 | 寫入規則 | 讀出規則 |
+|---------|---------|---------|
+| `timestamp` | 接受任何 Kind，原樣寫入 | 返回 `Kind=Unspecified` |
+| `timestamptz` | 接受任何 Kind，寫入前先轉 UTC | 返回 `Kind=Local`（根據執行機器時區） |
+
+舊行為的問題：
+1. **寫入 `timestamp` 時資訊丟失**：`DateTime(2025-01-01 12:00, Kind=Utc)` 寫入 `timestamp` 欄位後，讀出來變成 `Kind=Unspecified`，12:00 是哪個時區的？不知道了。
+2. **讀出 `timestamptz` 時依賴機器時區**：在台灣（UTC+8）的機器上讀出來的 `Kind=Local` 是台灣時間，但部署到 AWS us-east-1（UTC-5）就完全不一樣。容器化環境中這更容易出錯。
+
+### Npgsql 6.0+ 的行為（嚴格模式，預設）
+
+| PG 型別 | 寫入規則 | 讀出規則 |
+|---------|---------|---------|
+| `timestamp` | **只接受** `Kind=Unspecified`，其他 throw | 返回 `Kind=Unspecified` |
+| `timestamptz` | 接受任意 Kind（Utc 直接存，Local 轉 Utc 後存，Unspecified 視為 Utc） | 返回 `Kind=Utc` |
+
+這就是你看到的錯誤：
+
+```
+System.InvalidCastException:
+  Cannot write DateTime with Kind=Local to PostgreSQL type 'timestamp without time zone'
+  Cannot write DateTime with Kind=Utc to PostgreSQL type 'timestamp without time zone'
+```
+
+```mermaid
+flowchart TD
+    subgraph V5["Npgsql 5.x (寬容)"]
+        V5A["DateTime.Kind=Local → timestamp"] --> V5B["❌ 時區資訊被默默丟棄<br/>讀出變成 Unspecified"]
+        V5C["timestamptz → DateTime.Kind=Local"] --> V5D["❌ 讀出時區取決於部署機器<br/>容器環境容易錯"]
+    end
+
+    subgraph V6["Npgsql 6.0+ (嚴格)"]
+        V6A["DateTime.Kind=Local/Utc → timestamp"] --> V6B["✅ 直接 throw，強迫開發者面對問題"]
+        V6C["timestamptz → DateTime.Kind=Utc"] --> V6D["✅ 始終返回 UTC，不依賴環境"]
+    end
+
+    style V5B fill:#ff6b6b,color:#fff
+    style V5D fill:#ff6b6b,color:#fff
+    style V6B fill:#4ecdc4,color:#fff
+    style V6D fill:#4ecdc4,color:#fff
+```
+
+> **設計哲學一句話**：Npgsql 6.0 的態度是——「我不允許你犯糊塗。如果你要寫 `timestamp`，你必須明確表示你的 DateTime 沒有時區資訊（Kind=Unspecified）。如果你有時區資訊，就應該寫入 `timestamptz`。」
+
+---
+
+## 2. 底層原理：Npgsql 型別映射機制
+
+### 為什麼 Npgsql 要這樣設計？
+
+在 Npgsql 內部，每當讀寫一個 PG 欄位時，都會調用對應的 **TypeHandler**。`timestamp` 和 `timestamptz` 各有自己的 handler：
+
+```mermaid
+flowchart TD
+    SQL["SQL: SELECT created_at FROM orders"] --> READER["NpgsqlDataReader"]
+    READER --> PG_TYPE{"PG 欄位型別?"}
+
+    PG_TYPE -->|"timestamp<br/>(無時區)"| TH1["TimestampHandler<br/>直接讀取 8 bytes<br/>構造 DateTime, Kind=Unspecified"]
+    PG_TYPE -->|"timestamptz<br/>(有時區)"| TH2["TimestampTzHandler<br/>讀取 UTC 值<br/>構造 DateTime, Kind=Utc"]
+
+    TH1 --> APP1["C# 拿到 DateTime<br/>Kind=Unspecified"]
+    TH2 --> APP2["C# 拿到 DateTime<br/>Kind=Utc"]
+```
+
+寫入時的檢查邏輯（簡化版）：
+
+```
+寫入路徑 (timestamp 欄位):
+  NpgsqlParameter.Value = DateTime
+  
+  → TimestampHandler.ValidateAndGetLength():
+      if (DateTime.Kind != Unspecified)
+          throw InvalidCastException("Cannot write DateTime with Kind=...")
+      // 通過檢查後才進行寫入
+  
+寫入路徑 (timestamptz 欄位):
+  NpgsqlParameter.Value = DateTime
+  
+  → TimestampTzHandler.ValidateAndGetLength():
+      if (DateTime.Kind == Local)
+          value = value.ToUniversalTime()  // Local → UTC
+      else if (Kind == Unspecified)
+          value = DateTime.SpecifyKind(value, Utc)  // Unspecified → 視為 UTC
+      // 寫入轉換後的 UTC 值
+```
+
+> **為什麼 `timestamptz` 對 Kind 比較寬容？** 因為 `timestamptz` 的語意是「這是一個物理瞬間」，無論你給的是哪個時區的時間，只要你能告訴 Npgsql 這是什麼時區（透過 Kind 屬性），它就能正確轉成 UTC 儲存。而 `timestamp` 沒有這個轉換能力——它只是一個牆上時鐘值，因此 Npgsql 強制要求你給出 `Unspecified` 以避免歧義。
+
+---
+
+## 3. Dapper 實戰
+
+Dapper 底層走原生 ADO.NET (`NpgsqlDataReader` + reflection 映射)，行為完全由 Npgsql 的 TypeHandler 決定，**Dapper 不做任何額外的型別轉換**。
+
+### 讀取：timestamp 與 timestamptz
+
+```csharp
+using var conn = new NpgsqlConnection(connectionString);
+
+// === 讀取 timestamp (without time zone) ===
+public class Order
+{
+    // 從 DB 讀出時 Kind = Unspecified
+    public DateTime CreatedAt { get; set; }
+}
+
+var orders = await conn.QueryAsync<Order>(
+    "SELECT created_at FROM orders LIMIT 1"
+);
+Console.WriteLine(orders.First().CreatedAt.Kind); // Unspecified
+
+
+// === 讀取 timestamptz ===
+public class Event
+{
+    // 從 DB 讀出時 Kind = Utc (Npgsql 6.0+ 預設)
+    public DateTime OccurredAt { get; set; }
+}
+
+var events = await conn.QueryAsync<Event>(
+    "SELECT occurred_at FROM events LIMIT 1"
+);
+Console.WriteLine(events.First().OccurredAt.Kind); // Utc
+```
+
+### 寫入：正確寫法與錯誤示範
+
+```csharp
+// ✅ OK: 寫入 timestamp — 必須用 Kind=Unspecified
+await conn.ExecuteAsync(
+    "INSERT INTO orders (created_at) VALUES (@CreatedAt)",
+    new { CreatedAt = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Unspecified) }
+);
+
+// ✅ OK: 寫入 timestamp — 另一種等價寫法 (DateTime 預設 Kind=Unspecified)
+await conn.ExecuteAsync(
+    "INSERT INTO orders (created_at) VALUES (@CreatedAt)",
+    new { CreatedAt = new DateTime(2025, 1, 1, 12, 0, 0) }
+);
+
+
+// ❌ THROWS: DateTime.Now 的 Kind=Local
+await conn.ExecuteAsync(
+    "INSERT INTO orders (created_at) VALUES (@CreatedAt)",
+    new { CreatedAt = DateTime.Now }  // Kind=Local → InvalidCastException
+);
+
+// ❌ THROWS: DateTime.UtcNow 的 Kind=Utc
+await conn.ExecuteAsync(
+    "INSERT INTO orders (created_at) VALUES (@CreatedAt)",
+    new { CreatedAt = DateTime.UtcNow }  // Kind=Utc → InvalidCastException
+);
+
+
+// ✅ OK: 寫入 timestamptz — UtcNow 直接存
+await conn.ExecuteAsync(
+    "INSERT INTO events (occurred_at) VALUES (@OccurredAt)",
+    new { OccurredAt = DateTime.UtcNow }
+);
+
+// ✅ OK: 寫入 timestamptz — Now (Local) → Npgsql 自動轉 UTC
+await conn.ExecuteAsync(
+    "INSERT INTO events (occurred_at) VALUES (@OccurredAt)",
+    new { OccurredAt = DateTime.Now }
+);
+```
+
+### Dapper 的 DateTimeOffset 寫法（推薦對應 timestamptz）
+
+```csharp
+// ✅ 最佳實踐: timestamptz 用 DateTimeOffset，完全消除歧義
+public class EventWithOffset
+{
+    public DateTimeOffset OccurredAt { get; set; }
+}
+
+await conn.ExecuteAsync(
+    "INSERT INTO events (occurred_at) VALUES (@OccurredAt)",
+    new { OccurredAt = DateTimeOffset.UtcNow }
+);
+
+var events = await conn.QueryAsync<EventWithOffset>(
+    "SELECT occurred_at FROM events"
+);
+// OccurredAt 自帶 offset，零歧義
+```
+
+---
+
+## 4. EF Core 實戰
+
+EF Core 透過 `Npgsql.EntityFrameworkCore.PostgreSQL` provider 運作。provider 在 6.0+ 同樣跟隨 Npgsql 的嚴格模式。
+
+### 預設映射關係
+
+EF Core 在生成 Migration 時，會根據 C# 型別選擇 PG 欄位型別：
+
+| C# 型別 | 預設 PG 對應 | 行為 |
+|---------|-------------|------|
+| `DateTime` | `timestamp with time zone` | EF Core 預設走 timestamptz |
+| `DateTimeOffset` | `timestamp with time zone` | 完全映射 |
+| `DateOnly` (.NET 6+) | `date` | 只存日期 |
+| `TimeOnly` (.NET 6+) | `time without time zone` | 只存時間 |
+
+> **注意**：EF Core 預設把 `DateTime` 映射為 `timestamptz`，而不是 `timestamp`。如果你需要 `timestamp without time zone`，必須在 `OnModelCreating` 中明確指定（見下方）。
+
+### 模型定義與 Migration
+
+```csharp
+public class AppDbContext : DbContext
+{
+    public DbSet<Order> Orders { get; set; }
+    public DbSet<EventLog> EventLogs { get; set; }
+
+    protected override void OnConfiguring(DbContextOptionsBuilder options)
+        => options.UseNpgsql("Host=localhost;Database=mydb");
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        // 明確指定 order 的 created_at 為 timestamp without time zone
+        builder.Entity<Order>()
+            .Property(o => o.CreatedAt)
+            .HasColumnType("timestamp without time zone");
+
+        // event_log 的 occurred_at 保持預設 (timestamptz)
+        // 不需要特別指定
+    }
+}
+
+public class Order
+{
+    public int Id { get; set; }
+    public DateTime CreatedAt { get; set; }  // → PG: timestamp without time zone
+}
+
+public class EventLog
+{
+    public int Id { get; set; }
+    public DateTime OccurredAt { get; set; }  // → PG: timestamp with time zone (預設)
+}
+```
+
+### 寫入操作——正確與錯誤示範
+
+```csharp
+var db = new AppDbContext();
+
+// ❌ THROWS: CreatedAt 對應 PG timestamp, 但 DateTime.Now 的 Kind=Local
+var order1 = new Order { CreatedAt = DateTime.Now };
+db.Orders.Add(order1);
+await db.SaveChangesAsync();  // Npgsql 6.0+: InvalidCastException
+
+
+// ✅ OK: 使用 Kind=Unspecified 寫入 timestamp
+var order2 = new Order
+{
+    CreatedAt = DateTime.SpecifyKind(DateTime.Now, DateTimeKind.Unspecified)
+};
+db.Orders.Add(order2);
+await db.SaveChangesAsync();
+
+
+// ✅ OK: EventLog 對應 timestamptz, 接受任意 Kind
+var log = new EventLog { OccurredAt = DateTime.UtcNow };
+db.EventLogs.Add(log);
+await db.SaveChangesAsync();
+```
+
+### 三種處理 EF Core timestamp 的實用模式
+
+**模式一：手動 SpecifyKind**
+
+```csharp
+// 每次寫入前手動轉換
+order.CreatedAt = DateTime.SpecifyKind(DateTime.Now, DateTimeKind.Unspecified);
+```
+
+**模式二：ValueConverter（推薦，一勞永逸）**
+
+```csharp
+protected override void OnModelCreating(ModelBuilder builder)
+{
+    builder.Entity<Order>()
+        .Property(o => o.CreatedAt)
+        .HasColumnType("timestamp without time zone")
+        .HasConversion(
+            v => DateTime.SpecifyKind(v, DateTimeKind.Unspecified),  // 寫入 DB 前
+            v => DateTime.SpecifyKind(v, DateTimeKind.Unspecified)   // 從 DB 讀出後
+        );
+}
+
+// 之後程式碼中可以直接用 DateTime.Now，ValueConverter 會自動處理:
+var order = new Order { CreatedAt = DateTime.Now };
+db.Orders.Add(order);
+await db.SaveChangesAsync();  // ✅ OK
+```
+
+**模式三：改用 DateTimeOffset 對應 timestamptz（最推薦）**
+
+```csharp
+public class EventLog
+{
+    public int Id { get; set; }
+    public DateTimeOffset OccurredAt { get; set; }  // 零歧義
+}
+
+// 寫入時:
+db.EventLogs.Add(new EventLog { OccurredAt = DateTimeOffset.UtcNow });
+```
+
+---
+
+## 5. 型別選擇決策
+
+```mermaid
+flowchart TD
+    S["我需要存一個時間值"] --> Q1{"這個時間值<br/>有時區語意嗎？"}
+    Q1 -->|"有（同一個物理瞬間<br/>在不同時區看到不同牆上時間）"| TZ["選 timestamptz"]
+    Q1 -->|"沒有（就是一個牆上時間<br/>如: 每天9:00開門）"| NTZ["選 timestamp"]
+
+    TZ --> Q2{"C# 用什麼型別？"}
+    Q2 -->|"DateTimeOffset<br/>(推薦)"| TZ1["✅ 零歧義<br/>Npgsql 原生支援"]
+    Q2 -->|"DateTime<br/>(Kind=Utc)"| TZ2["✅ 可行<br/>寫入/讀出保持 Utc"]
+
+    NTZ --> Q3{"C# 用什麼型別？"}
+    Q3 -->|"DateTime<br/>(Kind=Unspecified)"| NTZ1["✅ 必須是 Unspecified<br/>或用 ValueConverter"]
+```
+
+| 場景 | PG 型別 | C# 型別 | 典型範例 |
+|------|--------|---------|---------|
+| 訂單建立時間（全球用戶） | `timestamptz` | `DateTimeOffset` | `2025-01-01T12:00:00+08:00` |
+| 每日開店時間（固定） | `timestamp` | `DateTime (Unspecified)` | 每天 `09:00:00` |
+| 活動開始時間（跨時區） | `timestamptz` | `DateTime (Utc)` | 全球同步直播 |
+| 班表時間（本地含義） | `timestamp` | `DateTime (Unspecified)` | 台北門市 10:00 上班 |
+
+---
+
+## 6. 過渡方案：EnableLegacyTimestampBehavior
+
+如果專案中已有大量既有程式碼無法一次性修改，Npgsql 提供了回到舊行為的開關。**這只是過渡手段，不建議長期使用。**
+
+```csharp
+// 方式 1: NpgsqlDataSourceBuilder (Npgsql 7.0+)
+var dataSourceBuilder = new NpgsqlDataSourceBuilder(connectionString);
+dataSourceBuilder.EnableLegacyTimestampBehavior = true;
+var dataSource = dataSourceBuilder.Build();
+
+// 方式 2: Connection String 參數
+// "Host=localhost;Database=mydb;EnableLegacyTimestampBehavior=true"
+
+// 方式 3: AppContext switch（全域）
+AppContext.SetSwitch("Npgsql.EnableLegacyTimestampBehavior", true);
+```
+
+> **啟用後的還原行為**：`timestamptz` 讀出變回 `Kind=Local`（依賴機器時區）、寫入 `timestamp` 不再檢查 Kind。但注意：Npgsql 團隊已表示未來版本可能完全移除這個開關。
+
+---
+
+## 7. 總結對照表
+
+| 維度 | `timestamp` (without tz) | `timestamptz` (with tz) |
+|------|--------------------------|-------------------------|
+| **PG 內部儲存** | 牆上時鐘值，原樣儲存 | 內部一律存 UTC |
+| **輸入轉換** | 無轉換 | session tz → UTC |
+| **輸出轉換** | 無轉換 | UTC → session tz |
+| **Npgsql 寫入規則** | 只接受 `Kind=Unspecified` | 接受任意 Kind，轉 UTC 後儲存 |
+| **Npgsql 讀出規則** | 返回 `Kind=Unspecified` | 返回 `Kind=Utc` |
+| **推薦 C# 型別** | `DateTime` (Kind=Unspecified) | `DateTimeOffset` 或 `DateTime` (Kind=Utc) |
+| **EF Core 預設映射** | 需手動 `.HasColumnType("timestamp without time zone")` | `DateTime` 預設就對應 timestamptz |
+| **典型用途** | 固定時程（開店/關店/班表） | 有跨時區需求的時間點（訂單/事件/log） |
+
+```mermaid
+flowchart LR
+    subgraph PG["PostgreSQL"]
+        TS["timestamp<br/>(無時區)"]
+        TSTZ["timestamptz<br/>(有時區)"]
+    end
+
+    subgraph NPGSQL["Npgsql 6.0+ TypeHandler"]
+        TH_TS["TimestampHandler<br/>只接受 Unspecified"]
+        TH_TSTZ["TimestampTzHandler<br/>接受任意 Kind → 轉 UTC"]
+    end
+
+    subgraph DOTNET[".NET 應用層"]
+        DT_U["DateTime<br/>Kind=Unspecified"]
+        DTO["DateTimeOffset<br/>(推薦)"]
+        DT_UTC["DateTime<br/>Kind=Utc"]
+    end
+
+    TS --> TH_TS --> DT_U
+    TSTZ --> TH_TSTZ --> DTO
+    TSTZ --> TH_TSTZ --> DT_UTC
+```
+
+> **心法一句話**：Npgsql 6.0 的 breaking change 不是在找你麻煩，而是強迫你在「無時區語意」和「有時區語意」之間做一個清醒的選擇。跟第二章的 `AT TIME ZONE` 一樣，本質上都是 PG 型別系統的精確行為在應用層的體現——型別決定了行為。

@@ -16,26 +16,39 @@
 
 ---
 
-## 0. 新手先備知識：MVCC、死元組（Dead Tuple）與 VACUUM 是什麼？
+## 0. 核心概念速覽：從生產場景理解 MVCC、Dead Tuple 與 VACUUM
 
-在深入探討 Bloat 之前，我們必須先理解 PostgreSQL 最核心的設計：**多版本並行控制（MVCC, Multi-Version Concurrency Control）**。
+> 本章以 Developer 在生產環境中會遇到的**真實場景**為起點，反向推導核心原理。先知道「生產上會看到什麼訊號」，再學「為什麼會這樣」，最後補上「如何快速診斷」。
 
-### 什麼是 MVCC？
+### 場景一：表變大、資料沒增加 —— 什麼是 Bloat？
+
+你在 Grafana / Datadog 的磁盤監控看到某張表的磁盤用量在過去數小時內從 500 MB 暴增到 2 GB，但 `SELECT count(*)` 的回傳值完全沒變。同時 APP 端開始回報查詢變慢。
+
+這就是 PostgreSQL 最常見的生產問題之一：**Bloat（表膨脹）**。
+
+**Bloat = 磁盤空間被 dead tuple 佔據而未回收，導致表／索引的實際大小遠大於所需大小。** 就像垃圾桶一直沒人倒，垃圾不斷累積，查詢時需要掃描更多 page，I/O 增加。
+
+要理解 Bloat 為什麼發生，必須先理解 PostgreSQL 最核心的設計：**MVCC（多版本並行控制）**。
+
+### MVCC 是什麼？為什麼 Bloat 是它的代價？
 
 大多數關聯式資料庫在處理「同時讀取與寫入同一筆資料」時，有兩種策略：
-- **悲觀鎖（Pessimistic Locking）**：讀取時加鎖，寫入時等待。讀者阻塞寫者，寫者阻塞讀者。
-- **樂觀鎖 / MVCC（Optimistic / Multi-Version）**：每次更新不直接覆蓋舊資料，而是**建立一個新版本**。讀者永遠讀取「自己交易開始時已提交的版本」——讀者永遠不阻塞寫者，寫者永遠不阻塞讀者。
 
-PostgreSQL 採用 MVCC。這意味著同一行資料在資料庫中可能同時存在**多個版本（tuple / row version）**。
+- **悲觀鎖（Pessimistic Locking）**：讀取時加鎖，寫入時等待。讀者阻塞寫者，寫者阻塞讀者。
+- **MVCC（Multi-Version Concurrency Control）**：每次更新不直接覆蓋舊資料，而是**建立一個新版本**。讀者永遠讀取「自己交易開始時已提交的版本」——**讀者永不阻塞寫者，寫者永不阻塞讀者**。
+
+PostgreSQL 採用 MVCC。同一行資料在資料庫中可能同時存在多個版本（tuple / row version）。
+
+> **MVCC 的代價**：舊版本不會自動消失，必須靠 VACUUM 清理。清理不夠快或不夠及時 → 舊版本堆積 → Bloat。
 
 ### Tuple 的生命週期：xmin 與 xmax
 
-PostgreSQL 中的每一行資料（稱為 **tuple** 或 **row version**）在內部都攜帶兩個隱藏的系統欄位：
+PostgreSQL 中的每一行資料（tuple / row version）內部攜帶兩個隱藏系統欄位：
 
 | 欄位 | 含義 |
 |------|------|
-| `xmin` | 建立這個 tuple 版本的交易 ID（Transaction ID）。「我由哪個交易建立」 |
-| `xmax` | 刪除這個 tuple 版本的交易 ID。0 表示「尚未被刪除」。「我由哪個交易標記為過時」 |
+| `xmin` | 建立這個版本的交易 ID。「我由哪個交易建立」 |
+| `xmax` | 刪除/淘汰這個版本的交易 ID。0 表示尚為最新版。「我由哪個交易標記為過時」 |
 
 ```mermaid
 flowchart LR
@@ -55,27 +68,40 @@ flowchart LR
 ```
 
 **關鍵理解**：
-- **INSERT**：很簡單，建立一個新 tuple，xmin = 當前交易 ID，xmax = 0。
-- **UPDATE**：PostgreSQL 的 UPDATE 不是直接修改原 tuple。而是兩步：(1) 將舊 tuple 的 xmax 設為當前交易 ID（標記為「這個版本到此為止」），(2) 建立一個全新的 tuple，xmin = 當前交易 ID。所以 UPDATE 實際上等於 **DELETE + INSERT**。
-- **DELETE**：將 tuple 的 xmax 設為當前交易 ID（標記為「已刪除」），不立即從磁盤移除。
+- **INSERT**：建立新 tuple，xmin = 當前交易 ID，xmax = 0。
+- **UPDATE** = **DELETE + INSERT**：(1) 舊 tuple 的 xmax 設為當前交易 ID，(2) 建立全新 tuple（xmin = 當前交易 ID）。
+- **DELETE**：將 tuple 的 xmax 設為當前交易 ID，**不立即從磁盤移除**。
 
-### 什麼是死元組（Dead Tuple）？
+### 什麼是 Dead Tuple？
 
-當一個 tuple 的 xmax 不為 0，且**沒有任何活躍交易還需要看到這個版本**時，這個 tuple 就稱為 **Dead Tuple（死元組）**。
+當一個 tuple 的 `xmax` 不為 0，且**所有需要看到這個舊版本的交易都已結束**，就是 Dead Tuple。Dead tuple 仍佔據磁盤空間——只是被「標記過時」，實體資料還在硬碟上。
 
-Dead tuple 仍然佔用磁盤空間——它們只是被「標記為過時」，但實體資料還在硬碟上。
+### 場景二：autovacuum log 一直顯示「dead but not yet removable」
 
-### 什麼是 OldestXmin？為什麼它這麼重要？
+你巡 PostgreSQL log 發現 autovacuum 輸出：
 
-PostgreSQL 需要一個方法來判斷「某個 tuple 是否還有任何交易可能需要它」。這個方法就是 **OldestXmin**——系統中**所有活躍交易中，最老的那個 snapshot 水位**。
+```
+tuples: 0 removed, 500001 remain, 500001 are dead but not yet removable
+tuples: 0 removed, 760235 remain, 760235 are dead but not yet removable
+```
 
-想像一個場景：
-1. 交易 A（XID=100）在中午 12:00 開始，執行 `SELECT * FROM users`，它需要看到 12:00 之前已提交的所有資料。
-2. 交易 B（XID=105）在 12:05 更新了 `users` 表，產生了 dead tuple（xmax=105）。
-3. 此時 OldestXmin = 100（因為交易 A 還在執行，它「看到的世界」停留在 XID=100）。
-4. VACUUM 檢查 dead tuple（xmax=105）：105 >= OldestXmin(100) → **不能回收！** 因為交易 A（snapshot=100）可能還需要看到這個被更新的舊版本。
+`removed = 0` 表示 VACUUM 在跑，但一個 dead tuple 都沒清掉。為什麼？
 
-這就是**長交易阻塞 VACUUM 的根源**——只要有一個老交易不結束，所有比它新的 dead tuple 都無法被回收。
+### OldestXmin — 決定 Dead Tuple 能不能回收的關鍵水位
+
+PostgreSQL 計算 **OldestXmin**（系統中所有活躍交易中，最老的那個 snapshot），然後：
+
+- **xmax < OldestXmin** → 所有交易都不再需要這個舊版本 → **可回收**
+- **xmax >= OldestXmin** → 還有交易可能看得到 → **不可回收**
+
+**生產場景模擬**：
+
+1. 中午 12:00，開發者打開 pgAdmin，執行 `BEGIN; SELECT * FROM users;` 後去吃午飯（XID=100）。
+2. 中午 12:05，排程任務開始大量 `UPDATE users`，產生大量 dead tuple（xmax=105）。
+3. 此時 OldestXmin = 100（開發者 pgAdmin 的 snapshot 還卡在 XID=100）。
+4. autovacuum 檢查 dead tuple：`xmax=105 >= OldestXmin(100)` → **全部不能回收**。
+
+結果：這些 dead tuple 會持續佔據空間，直到那位開發者 COMMIT 或被 timeout kill 掉。
 
 ```mermaid
 sequenceDiagram
@@ -94,138 +120,278 @@ sequenceDiagram
     Note over VAC: log: "recovered N dead tuples"
 ```
 
-### VACUUM 做什麼？
+**生產快速排查**：誰在阻塞 VACUUM？
 
-VACUUM 是 PostgreSQL 內建的垃圾回收機制。它有三個核心任務：
+```sql
+-- 找出持有最舊 snapshot 的 session（這就是阻塞 VACUUM 的兇手）
+SELECT pid, usename, application_name,
+       state, now() - xact_start AS xact_age,
+       backend_xid, backend_xmin,
+       left(query, 80) AS query
+FROM pg_stat_activity
+WHERE backend_xmin IS NOT NULL
+ORDER BY backend_xmin
+LIMIT 5;
+```
 
-1. **回收 Dead Tuple 空間**：掃描資料頁（page），找出所有已確認不再被任何交易需要的 dead tuple，將其空間標記為「可重用」（寫入 Free Space Map, FSM）。
-2. **凍結舊交易 ID（Freeze）**：防止交易 ID 迴繞（XID Wraparound）。交易 ID 是 32-bit 整數，有限制，需要定期將老舊的 xmin 標記為「凍結」，表示這個 tuple 在所有交易看來都是可見的。
-3. **更新統計資訊**：更新 Visibility Map（VM，可見性對應圖），幫助後續的 VACUUM 和 Index-Only Scan 更有效率。
+### 場景三：查詢變慢，EXPLAIN 的 Buffer 暴增
 
-**重要區分**：
-- **VACUUM（一般）**：只標記空間可重用，不歸還磁盤空間給作業系統。適合日常維護。
-- **VACUUM FULL**：完全重寫整張表，歸還所有空間。但全程鎖表，對線上系統不可用。
+業務團隊投訴「同樣的 SELECT 比以前慢 5 倍」。EXPLAIN 分析發現 Buffer 讀取量暴增——不是資料變多了，是 dead tuple 把 page 塞滿了，同樣的查詢需要掃描更多 page。
 
-### 什麼是 Bloat（膨脹）？
+**快速量化 Bloat 嚴重程度**：
 
-**Bloat = 磁盤空間被 dead tuple 佔據而未回收，導致表／索引的實際大小遠大於所需大小。**
+```sql
+-- 診斷各表的 dead tuple 佔比
+SELECT schemaname, relname,
+       n_live_tup,
+       n_dead_tup,
+       CASE WHEN n_live_tup > 0
+            THEN round(100.0 * n_dead_tup / (n_live_tup + n_dead_tup), 1)
+            ELSE 0
+       END AS dead_ratio_pct,
+       pg_size_pretty(pg_total_relation_size(relid)) AS total_size
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 0
+ORDER BY n_dead_tup DESC
+LIMIT 20;
+```
 
-就像一個垃圾桶一直沒人倒——垃圾（dead tuple）不斷累積，可用空間越來越少，查詢時需要掃描更多 page，I/O 增加，效能下降。
+`dead_ratio_pct > 20%` → 建議安排 vacuum / repack。`> 50%` → 緊急。
 
-理解了這些基礎概念後，我們來看 Bloat 的具體成因。
+```sql
+-- 精確版：用 pgstattuple 取得詳細 dead tuple 資訊
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+SELECT * FROM pgstattuple('your_table_name');
+```
+
+### VACUUM 做了什麼？
+
+VACUUM 是 PostgreSQL 內建的垃圾回收機制，三個核心任務：
+
+1. **回收 Dead Tuple 空間**：掃描資料頁（page），找出已確認不再被任何交易需要的 dead tuple，將其空間標記為「可重用」（寫入 Free Space Map, FSM）。
+2. **凍結舊交易 ID（Freeze）**：防止交易 ID 迴繞（XID Wraparound）。交易 ID 是 32-bit 整數，必須定期將老舊的 xmin 標記為「凍結」。
+3. **更新 Visibility Map（VM）**：幫助後續 VACUUM 和 Index-Only Scan 跳過不需要檢查的 page。
+
+**重要區分 —— 生產上最常被問的問題**：
+
+| | VACUUM（一般/autovacuum） | VACUUM FULL |
+|---|---|---|
+| **行為** | 只標記空間可重用，**不歸還磁盤空間給 OS** | 重建整張表，歸還所有空間給 OS |
+| **鎖** | 不阻塞讀寫 | 全程 AccessExclusiveLock（阻塞所有操作） |
+| **用途** | 日常維護 | 緊急收縮 / 維護窗口 |
+
+### 總結：從生產訊號到根因的 Mapping
+
+| 你在生產環境看到 | 對應的核心概念 | 下一步行動 |
+|---|---|---|
+| 表磁盤暴增但 row count 沒變 | Bloat（Dead Tuple 堆積） | 查 `n_dead_tup`，確認 autovacuum 是否在跑 |
+| Log 顯示「dead but not yet removable」| OldestXmin 被壓住 | 查 `backend_xmin` 找出長交易，kill 或等它結束 |
+| 查詢掃描 page 數暴增、變慢 | Page density 下降（dead tuple 塞滿 page） | `pgstattuple` 精確診斷，安排 vacuum / repack |
+| autovacuum 從不觸發 | 觸發閾值太高 / Worker 不足 | 檢查 `scale_factor`、`naptime`、worker 數量 |
+
+理解了這些基礎概念後，我們來看 Bloat 在生產環境中的具體成因和對策。
 
 ---
 
-## 1. Bloat 成因總覽
+## 1. Bloat 成因：生產環境診斷指南
 
-PostgreSQL MVCC 機制下，UPDATE / DELETE 產生 dead tuple，須由 VACUUM 回收空間。回收不及時即產生 bloat。
+> 以下按**生產環境遇到頻率從高到低**排列。每個成因附帶「生產訊號 + 快速診斷」，讓你在 on-call 時能快速定位。
 
-### I. 未開啟 autovacuum
+### 1.1 Long Transaction／未關閉游標／隔離級別（生產中最高頻的根因）
 
-無 autovacuum 且無自訂 VACUUM 排程 → 必然膨脹。
+**生產訊號**：autovacuum log 持續輸出 `0 removed, N are dead but not yet removable`，`removed` 完全為 0，但 dead tuple 不斷增長。
 
-### II. autovacuum 開啟但回收不及時
-
-#### a. IO 差
-
-大表執行 whole-table vacuum（prevent XID wraparound 或 table age > `vacuum_freeze_table_age` 時觸發全表掃描）產生大量 IO，拖慢回收速度。
-
-#### b. autovacuum 觸發閾值太晚
-
-觸發公式（PG 原始碼）：
-
-```
-threshold = vac_base_thresh + vac_scale_factor * reltuples
-```
-
-白話解釋：dead tuple 數量需要達到「基礎閾值 + 總行數 × 比例」才會觸發 autovacuum。
-
-預設值：`autovacuum_vac_thresh = 50`，`autovacuum_vac_scale = 0.2`。
-→ dead tuple 達 table 的 ~20% 才觸發，回收完表已膨脹超過 20%。
-
-> 補充（Senior Dev）：PG 13+ 針對 INSERT-only 表新增了獨立閾值：
-
-```
-insert_threshold = autovacuum_vac_insert_thresh
-                  + autovacuum_vac_insert_scale_factor * reltuples
-```
-
-預設 `autovacuum_vac_insert_thresh = 1000`，`autovacuum_vac_insert_scale_factor = 0.2`，解決了過去 INSERT 多但 UPDATE/DELETE 少導致從不觸發 autovacuum 的問題——此類表雖無 dead tuple，但仍需 vacuum 來標記 frozen tuples 防止 XID wraparound。
-
-#### c. Worker 全忙
-
-`autovacuum_max_workers` 決定最大 concurrent worker 數。當待 vacuum 的表超過 worker 數，部分表需等待空閒 worker。早前版本一個 database 同一時間只跑一個 worker，現已無此限制（同一 database 可多 worker 並行 vacuum）。
-
-程式碼說明（`src/backend/postmaster/autovacuum.c`）：同一資料庫內可有多個 worker 同時執行。Worker 會將正在 vacuum 的表記錄在共享記憶體（shared memory）中，避免其他 worker 因等待同一張表的 vacuum lock 而阻塞。
-
-每個 worker 記憶體消耗由 `autovacuum_work_mem`（預設 -1 = 沿用 `maintenance_work_mem`）控制，worker 越多記憶體需求越大。
-
-> 補充（Senior Dev）：PG 16+ 新增 `vacuum_buffer_usage_limit`（預設 256 KB），限制每個 VACUUM/ANALYZE 可使用的 shared buffer 量，避免單一 vacuum 操作擠出 hot data。PG 18 進一步將此提升為 VACUUM 命令的 `BUFFER_USAGE_LIMIT` 選項。
-
-#### d. Long Transaction / Long SQL（最核心原因）
-
-`backend_xid` 表示已申請 transaction ID 的事務（增刪改 DDL）。從申請 XID 開始持續到事務結束。白話：這個交易「做了寫入操作」，拿到了一個編號。
-
-`backend_xmin` 表示 SQL 執行時的 snapshot 水位（可見的最大已提交 XID）。從 SQL 開始持續到 SQL 結束／游標關閉。白話：這個交易／查詢「看到的世界」停留在某個時間點。
-
-**關鍵機制**：VACUUM 只能回收 XID < OldestXmin 的事務產生的 dead tuple。只要存在任何持有 `backend_xid` 或 `backend_xmin` 且 XID < 新 dead tuple 的 session，這些 dead tuple 就無法被回收。
-
-簡單說就是：**只要有人還在用望遠鏡看過去（舊 snapshot），過去的「垃圾」就得留著，不能清掉。**
-
-原始碼（`src/backend/utils/time/tqual.c`）中，當 VACUUM 執行時，PostgreSQL 內部會呼叫一個判斷函數來決定每個 tuple 的回收狀態。這個函數以 OldestXmin 作為截止點（cutoff）：所有 xmax < OldestXmin 的 dead tuple 可以安全回收；xmax >= OldestXmin 的 dead tuple 視為「最近死亡」（recently dead），可能仍有活躍交易需要看到舊版本，因此不能移除。這個判斷邏輯是整個 VACUUM 回收機制的核心。
-
-以下四種場景都會導致 `backend_xid` / `backend_xmin` 持續佔用：
-
-| 場景 | 持續到何時 |
-|------|-----------|
-| 持有 XID 的長事務（增刪改 DDL） | 事務 COMMIT / ROLLBACK |
-| 未關閉的游標（DECLARE CURSOR 後未 CLOSE） | 游標 CLOSE 或事務結束 |
-| 長時間執行的查詢（`SELECT pg_sleep(1000)`） | SQL 執行結束 |
-| REPEATABLE READ / SERIALIZABLE 隔離級別事務 | 事務 COMMIT / ROLLBACK |
-
-監控 SQL：
+**快速確認**：
 
 ```sql
-SELECT datname, usename, query,
-       xact_start, now() - xact_start AS xact_duration,
-       state, backend_xid, backend_xmin
+-- 找出誰的 snapshot 在阻塞 VACUUM（按最舊排序）
+SELECT pid, usename, application_name,
+       state, now() - xact_start AS xact_age,
+       backend_xid, backend_xmin,
+       left(query, 80) AS query
 FROM pg_stat_activity
 WHERE state <> 'idle'
   AND (backend_xid IS NOT NULL OR backend_xmin IS NOT NULL)
-ORDER BY 4;
+ORDER BY xact_start;
 ```
 
-> 補充（Senior Dev）：PG 9.6 引入 `old_snapshot_threshold` 解決此問題（原文開頭提到的 "snapshot too old"），允許設定 snapshot 的生命週期上限，超過後會報錯 `snapshot too old` 而非無限阻塞 vacuum。但此參數有其 trade-off：可能導致 long-running query 被 kill，且不適用於 standby。PG 14+ 引入 `vacuum_failsafe_age`（預設 1.6 billion XID），作為 safety net：當 table age 逼近 wraparound 時，VACUUM 會跳過 index cleanup 等操作，優先完成 vacuum 以防止 shutdown，即使有 long transaction。
+**根因**：VACUUM 只能回收 xmax < OldestXmin 的 dead tuple。`OldestXmin` = 所有活躍交易中最老的那個 snapshot。只要有人卡住一個舊 snapshot，所有比他新的 dead tuple 都不能回收。
 
-#### e. autovacuum_vacuum_cost_delay 啟用
+- `backend_xid`：已申請交易 ID（做了寫入操作），從申請持續到 COMMIT。
+- `backend_xmin`：查詢的 snapshot 水位（看到的世界停在某個時間點），從 SQL 開始持續到 SQL 結束或游標關閉。
 
-基於成本的垃圾回收，當達到 `autovacuum_vacuum_cost_limit` 後 sleep `autovacuum_vacuum_cost_delay` 再繼續。對 IO 充裕的系統反而拖慢回收。
+以下四種場景都會導致 `backend_xid` / `backend_xmin` 長期佔用：
 
-成本計算由三個參數決定：
+| 生產場景 | 實際例子 | 持續到何時 |
+|------|----------|-----------|
+| 持有 XID 的長事務 | 開發者在 pgAdmin 開一個 `BEGIN; INSERT...;` 後掛著 | 事務 COMMIT / ROLLBACK |
+| 未關閉游標 | ORM 或應用忘記 `CLOSE CURSOR` | 游標 CLOSE 或事務結束 |
+| 長時間查詢 | `pg_dump` 全庫備份期間（隱式 REPEATABLE READ）、報表查詢 `SELECT * FROM huge_table` 跑很久 | SQL 執行結束 |
+| REPEATABLE READ / SERIALIZABLE | Java Spring `@Transactional(isolation=REPEATABLE_READ)` | 事務 COMMIT / ROLLBACK |
 
-| 參數 | 值 | 含義 |
-|------|-----|------|
-| `vacuum_cost_page_hit` | 1 | 從 shared buffer 中找到 page 的成本 |
-| `vacuum_cost_page_miss` | 10 | 從磁盤讀取 page 的成本 |
-| `vacuum_cost_page_dirty` | 20 | 將 clean page 標記為 dirty 的額外成本 |
+> **生產陷阱**：
+> - `pg_dump` 使用 REPEATABLE READ，備份一張 500GB 的表可能要數小時 → 期間所有 dead tuple 無法回收。
+> - Standby 開啟 `hot_standby_feedback = on` + 有 long query → standby 回報的 OldestXmin 會阻止 primary 的 VACUUM。
+> - ORM（Hibernate/Entity Framework）有時會隱式開啟游標卻忘記關閉。
 
-cost limit 在 active worker 之間按比例分配。
+> **PG 版本防禦**：
+> - PG 9.6+：`old_snapshot_threshold` 設定 snapshot 生命週期上限，超時報錯 `snapshot too old`（trade-off：可能 kill long query，不適用於 standby）。
+> - PG 14+：`vacuum_failsafe_age`（預設 1.6B XID）— 當 table age 逼近 wraparound，VACUUM 會跳過 index cleanup 優先完成 vacuum 以防 shutdown。
+> - PG 9.6+：`idle_in_transaction_session_timeout` 自動 kill 掛著不 commit 的 session。
 
-> 補充（Senior Dev）：PG 13+ 支援 per-table 的 `autovacuum_vacuum_cost_delay` 和 `autovacuum_vacuum_cost_limit` storage parameter，可對不同優先級的表設定不同 cost 策略。PG 14+ 新增 `maintenance_io_concurrency` 參數，控制 VACUUM 和 ANALYZE 的 prefetch 並發數。
+### 1.2 批量 DELETE／UPDATE 在單一交易中（開發者常見錯誤）
 
-#### f. autovacuum launcher naptime 太長
+**生產訊號**：執行完一個 database migration script 或 batch job 後，該表的磁盤用量瞬間變成 2-5 倍。
 
-Launcher process 的喚醒間隔由 `autovacuum_naptime` 決定。程式碼硬限制底限為 100 毫秒。
+**快速確認**：
+```sql
+-- 找出 dead tuple 佔比最高的表
+SELECT schemaname, relname,
+       n_dead_tup, n_live_tup,
+       round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+       pg_size_pretty(pg_total_relation_size(relid)) AS size
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 10000
+ORDER BY n_dead_tup DESC
+LIMIT 10;
+```
 
-若設太大，launcher 睡過頭 → 有垃圾也沒人通知 fork worker。
+**根因**：`DELETE FROM big_table WHERE created_at < '2024-01-01'` 在一個交易中刪除 1 億行 → 1 億行 dead tuple 必須等該交易 COMMIT 後 VACUUM 才能回收。COMMIT 前這些空間無法被釋放也無法被 reuse → 表在交易期間持續膨脹。
 
-#### g. 批量刪除／更新
+**解法**：拆分成小事務，例如每次刪 1000 行 + COMMIT：
+```sql
+DO $$
+DECLARE
+  deleted_rows INT;
+BEGIN
+  LOOP
+    DELETE FROM big_table WHERE ctid IN (
+      SELECT ctid FROM big_table WHERE created_at < '2024-01-01' LIMIT 1000
+    );
+    GET DIAGNOSTICS deleted_rows = ROW_COUNT;
+    COMMIT;
+    EXIT WHEN deleted_rows = 0;
+  END LOOP;
+END $$;
+```
 
-例如 10GB 表一次 DELETE 9GB → 9GB dead tuple 必須等事務結束後才能回收，期間持續膨脹。
+> 更推薦：使用分割表（Partition），用 `DROP PARTITION` 秒殺，完全不需要 DELETE。
 
-#### h. 非 HOT 更新導致 Index Bloat
+### 1.3 autovacuum 觸發閾值太高（配置問題，最容易修）
 
-非 HOT 更新產生新的 index entry，舊 index entry 需等到整個 index page 無任何引用才能回收。BTREE index 尤其容易膨脹。
+**生產訊號**：表明明有大量 dead tuple，但 autovacuum 很久才觸發一次，觸發時表已嚴重膨脹。
+
+**根因**：autovacuum 觸發公式：
+
+```
+threshold = autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor × reltuples
+```
+
+**預設值在生產的實際影響**：
+
+| 表大小 | 預設觸發門檻 (`thresh=50, scale=0.2`) | 表膨脹程度 |
+|--------|--------------------------------------|-----------|
+| 1 萬行 | dead tuple ≥ 2050 | ~20% |
+| 100 萬行 | dead tuple ≥ 200,050 | ~20% |
+| 1 億行 | dead tuple ≥ 20,000,050 | ~20% |
+| 10 億行 | dead tuple ≥ 200,000,050 | **~20%，200M dead tuple，膨脹極嚴重** |
+
+**快速診斷是否因閾值卡住**：
+```sql
+-- 看哪些表 dead tuple 已很多但還沒觸發
+SELECT schemaname, relname,
+       n_dead_tup,
+       n_live_tup,
+       round(n_dead_tup - (
+         current_setting('autovacuum_vacuum_threshold')::int
+         + current_setting('autovacuum_vacuum_scale_factor')::float * n_live_tup
+       )) AS gap_to_threshold,
+       last_autovacuum
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 1000
+ORDER BY n_dead_tup DESC;
+```
+
+> PG 12+：`autovacuum_vacuum_insert_threshold` / `insert_scale_factor` 獨立控制 INSERT-only 表的 vacuum 觸發。預設 `thresh=1000, scale=0.2`。INSERT-only 表雖無 dead tuple，仍需 vacuum 來推進 freeze horizon。
+>
+> PG 13+：所有 autovacuum 參數支援 **per-table** 設定，可對超大表單獨調低閾值。
+
+### 1.4 Worker 全忙 / Naptime 太長
+
+**生產訊號**：多張表同時有 dead tuple，但只有少數正在被 VACUUM，且 `pg_stat_progress_vacuum` 顯示排隊的表數量遠大於正在跑的。
+
+**快速確認**：
+```sql
+-- 查看當前有哪些 VACUUM 在跑
+SELECT pid, datname, relid::regclass AS table_name,
+       phase, heap_blks_total, heap_blks_scanned
+FROM pg_stat_progress_vacuum;
+
+-- 確認 worker 數量與負載
+SELECT count(*) AS active_vacuum_workers
+FROM pg_stat_activity
+WHERE query LIKE 'autovacuum:%';
+```
+
+**根因**：
+- `autovacuum_max_workers`（預設 3）不足。現代環境中 DB instance 內常有數十上百張表，3 個 worker 根本不夠。
+- `autovacuum_naptime`（預設 60s）太長。Launcher 每 60 秒才檢查一次，有垃圾也無法及時通知。
+- 每個 worker 記憶體消耗 = `autovacuum_work_mem`（預設 -1 = `maintenance_work_mem`）。worker 越多，記憶體需求越大。
+
+> PG 16+：`vacuum_buffer_usage_limit`（預設 256KB）限制單個 vacuum 的 shared buffer 佔用，防止擠出 hot data。PG 18 提升為 `BUFFER_USAGE_LIMIT` 選項。
+
+### 1.5 IO 瓶頸 / Cost Delay（IO 充裕環境的反效果）
+
+**生產訊號**：VACUUM 在跑，但速度極慢，`pg_stat_progress_vacuum.heap_blks_scanned` 增長極緩。
+
+**快速確認**：
+```sql
+-- 檢查 cost delay 設定
+SHOW autovacuum_vacuum_cost_delay;
+SHOW autovacuum_vacuum_cost_limit;
+```
+
+**根因**：autovacuum 的 cost-based throttling 原意是保護慢 IO 系統，但對現代 NVMe SSD / SAN 反而拖慢回收。每次達到 `cost_limit` 就 sleep `cost_delay` 毫秒。
+
+| 參數 | 預設 | 影響 |
+|------|------|------|
+| `vacuum_cost_page_hit` | 1 | shared buffer hit 成本 |
+| `vacuum_cost_page_miss` | 10 | 磁盤讀取 page 成本 |
+| `vacuum_cost_page_dirty` | 20 | dirty page 額外成本 |
+| `autovacuum_vacuum_cost_limit` | 200（累計） | 達到後 sleep `cost_delay` |
+| `autovacuum_vacuum_cost_delay` | 2ms（預設 PG 12 前） | 每次到達 limit 的 sleep 時長 |
+
+**現代硬體建議**：
+- NVMe SSD 環境 → `cost_delay = 0`（不做 throttling）
+- 混合環境 → PG 13+ 支援 **per-table** 的 `autovacuum_vacuum_cost_delay` / `cost_limit`，對高優先級表設更寬鬆的策略
+- PG 14+：`maintenance_io_concurrency` 控制 VACUUM/ANALYZE 的 prefetch 並發數
+
+### 1.6 非 HOT 更新 → Index Bloat
+
+**生產訊號**：表本身尚可，但索引特別大，且 `pg_stat_user_indexes.idx_scan` 不低但 `idx_tup_fetch` 很高。
+
+**快速確認**：
+```sql
+-- 索引大小 vs 表大小對比
+SELECT indexrelname, 
+       pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+       idx_scan, idx_tup_read, idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE idx_tup_read > 0
+ORDER BY pg_relation_size(indexrelid) DESC
+LIMIT 10;
+```
+
+**根因**：如果 UPDATE 的欄位包含任一索引欄位，PostgreSQL 無法使用 HOT（Heap-Only Tuple）優化，必須在每個索引都插入新的 index entry → 舊 index entry 變成 dead → 索引也膨脹。
+
+**開發者守則**：
+- 頻繁更新的熱表，索引只建在真正用於 WHERE/JOIN 的欄位上
+- 避免對頻繁更新的欄位建索引（如 `updated_at`）
+- 考慮用 partial index 或 expression index 減少 entries
+
+### 1.7 autovacuum 未開啟（少見但致命）
+
+**生產訊號**：`SHOW autovacuum;` 回傳 `off` → 立即修復。沒有 autovacuum 的 PG instance 最終會因為 XID wraparound 而 shutdown。
 
 ```mermaid
 flowchart TD
@@ -244,22 +410,24 @@ flowchart TD
         J["IO 太慢 / cost_delay 太長"] --> B
         K["長交易未提交"] --> D
         L["未關閉游標"] --> D
-        M["REPEATABLE READ"] --> D
+        M["REPEATABLE READ / Serializable"] --> D
         N["批量 DELETE/UPDATE"] --> B
     end
 ```
 
 ---
 
-## 2. 測試驗證
+## 2. 測試驗證 + 生產對照
 
-以下用實際測試驗證上述每種 Bloat 根因。測試環境參數刻意設為極敏感（非常低的觸發閾值、關閉 cost delay），目的是隔離變因，讓每個根因的效果清晰可見。
+以下測試刻意將參數設為極敏感（低觸發閾值、關閉 cost delay），目的是**隔離變因**，讓每個根因的效果清晰可見。測試雖然在 lab 環境進行，但每項結論都能直接對應到生產場景。
 
-**新手理解關鍵**：每個測試會觀察兩個數值：
+**閱讀方式**：每個測試後面的「👉 生產對照」會幫你將 lab 結果對應到生產環境中看到的現象。
+
+**關鍵觀察指標**：
 - `removed`：VACUUM 成功回收了多少 dead tuple
-- `dead but not yet removable`：dead tuple 存在但因長交易等原因「暫時不能回收」
+- `dead but not yet removable`：dead tuple 存在但因外部因素「暫時不能回收」
 
-當 `dead but not yet removable` 不斷增長而 `removed = 0`，就表示有東西卡住了 VACUUM。
+當 `dead but not yet removable` 不斷增長而 `removed = 0`，就表示有東西卡住了 VACUUM。在生產環境中對應的就是「表變大但查不到原因」的情況。
 
 測試環境參數：
 
@@ -365,6 +533,8 @@ tuples: 13629196 removed, 2515757 remain, 500001 are dead but not yet removable
 tuples: 7183691 removed, 11252550 remain, 0 are dead but not yet removable
 ```
 
+> 👉 **生產對照**：長交易結束後 VACUUM 的回收速度是爆發式的（大量 dead tuple 積壓一次清）。在生產中如果看到某時段突然大量回收，通常表示之前卡住的長交易結束了。這種情況下磁盤用量會先暴增再回落——對應到監控告警：先收到「磁盤用量過高」，幾分鐘後自動恢復。排查時關鍵是找出「誰卡住了」。
+
 ### II. Test 2：未關閉的游標阻塞 Vacuum
 
 `backend_xmin` 在游標關閉前持續有效。游標本身不持有 XID，但只要游標存在，它所屬的 snapshot 就一直有效。
@@ -408,6 +578,8 @@ VACUUM VERBOSE t;
 -- INFO:  "t": found 1 removable, 0 nonremovable row versions
 ```
 
+> 👉 **生產對照**：游標問題在生產中特別隱蔽——ORM（Hibernate、Entity Framework、Django ORM）可能隱式建立 server-side cursor（如 `cursor.execute()` 後不關），開發者完全不會意識到。辨識方法：`pg_stat_activity` 中 `backend_xmin` 不為 NULL 但 `backend_xid` 為 NULL 的 session，通常是游標未關。
+
 ### III. Test 3：長時間查詢阻塞 Vacuum
 
 `backend_xmin` 持續到 SQL 執行結束。一個長時間執行的 SELECT（即使不做任何修改）足以阻塞 VACUUM。
@@ -430,6 +602,8 @@ SELECT 1;
 COMMIT;
 -- backend_xmin 釋放
 ```
+
+> 👉 **生產對照**：Test 3（長時間查詢）和 Test 4（隔離級別）在生產中常組合出現：(1) 報表系統用 REPEATABLE READ 跑長查詢 → snapshot 卡住數分鐘；(2) `pg_dump` 隱式使用 REPEATABLE READ → 備份期間 VACUUM 無法回收。解決方案：報表系統用 READ COMMITTED + 必要時 `pg_dump -j` 並行備份加快速度；PG 9.6+ 設定 `idle_in_transaction_session_timeout` 和 `old_snapshot_threshold`。
 
 ### V. Test 5：持續並發批量更新導致 Bloat
 
@@ -470,6 +644,8 @@ pgbench -M prepared -n -r -f ./test.sql -c 20 -j 10 -T 500000
 -- tbl_pkey: 21 MB（起始 21 MB，未膨脹）
 ```
 
+> 👉 **生產對照**：這個測試最接近實際生產場景——電商網站的庫存更新、社交平台的按讚數更新都是這種持續並發小更新的模式。關鍵教訓：(1) 將事務粒度控制到單行而非批量；(2) 使用 `fillfactor` 為熱表預留空間（如設為 80），讓 HOT UPDATE 有更多機會在同 page 完成；(3) 監控 `n_dead_tup` 的增長速率，而非只看絕對值。
+
 ### VI. Test 6：autovacuum_naptime 過長
 
 將 `autovacuum_naptime = 1000` 秒後壓測：
@@ -482,9 +658,13 @@ SELECT * FROM pg_stat_all_tables WHERE relname = 'tbl';
 
 表膨脹：73 MB → 393 MB，index 21 MB → 115 MB。
 
+> 👉 **生產對照**：naptime 預設 60s 在多數場景下足夠，但在高寫入吞吐的系統（如每秒 10k+ UPDATE）中，60 秒內可以產生數十萬 dead tuple。建議生產環境將 naptime 調為 1-10s。代價是 launcher 更頻繁掃描 `pg_stat_user_tables`，CPU overhead 極小。注意：若已有 long transaction 導致垃圾無法回收，過短的 naptime 會讓 worker 反覆無效掃描，反而浪費 IO。
+
 ---
 
-## 3. 預防與優化措施
+## 3. 預防與優化：生產環境配置 Checklist
+
+> 以下按「生產上線前必做 → 建議 → 監控」的優先級排列。每個項目附帶具體配置值和適用場景。
 
 ```mermaid
 flowchart TD
@@ -510,125 +690,166 @@ flowchart TD
     E --> E3["使用 pgstattuple 診斷"]
 ```
 
-### I. 務必開啟 autovacuum
+### 第 1 步：基礎配置（任何生產環境必做）
 
-```
-autovacuum = on
-```
+```ini
+# postgresql.conf — 生產環境最低配置
+autovacuum = on                                # 必須開啟（預設 on，但務必確認）
 
-### II. 提高系統 IO
+# 觸發閾值：不要等 dead tuple 達到 20% 才回收
+autovacuum_vacuum_scale_factor = 0.01          # 大表建議 0.01~0.05（預設 0.2）
+autovacuum_analyze_scale_factor = 0.005        # 預設 0.1
+autovacuum_vacuum_threshold = 50               # 基礎閾值保持預設
+autovacuum_naptime = 10s                       # 預設 60s，建議降至 1~10s
 
-IO 越好，回收越快。
-
-### III. 調低觸發閾值
-
-讓 dead tuple 少量時就觸發，而非等到 20%。對 1000 萬 row 的表希望 1 萬 dead tuple 就觸發：
-
-```
-autovacuum_vacuum_scale_factor = 0.001      # 預設 0.2
-autovacuum_analyze_scale_factor = 0.0005    # 預設 0.1
+# PG 12+：INSERT-only 表也要 VACUUM（推進 freeze horizon）
+autovacuum_vacuum_insert_scale_factor = 0.1    # 預設 0.2
+autovacuum_vacuum_insert_threshold = 500       # 預設 1000
 ```
 
-白話解釋：將「需等待 dead tuple 佔比」從 20% 降低到 0.1%。以前 1000 萬行的表要累積 200 萬 dead tuple 才觸發 VACUUM，現在 1 萬行就觸發。
+> PG 13+：所有 autovacuum 參數支援 **per-table** 設定。對超大表（> 10GB），建議：
+> ```sql
+> ALTER TABLE huge_table SET (
+>   autovacuum_vacuum_scale_factor = 0.005,
+>   autovacuum_vacuum_threshold = 1000
+> );
+> ```
 
-> 補充（Senior Dev）：PG 12+ 新增 `autovacuum_vacuum_insert_threshold` 和 `autovacuum_vacuum_insert_scale_factor`，確保 INSERT-only 表（無 dead tuple）也會被 vacuum 來推進 freeze horizon。PG 13+ 所有 autovacuum 參數支援 per-table storage parameter。
+### 第 2 步：資源配置（依據硬體調整）
 
-### IV. 增加 Worker 數量與記憶體
+```ini
+# Worker 與記憶體
+autovacuum_max_workers = 5                     # 預設 3，建議 = CPU 核數 × 0.3 ~ 0.5
+autovacuum_work_mem = 1GB                      # 預設 -1（沿用 maintenance_work_mem 64MB）
 
-```
-autovacuum_max_workers = <CPU 核數>       # default 3
-autovacuum_work_mem = 2GB                  # default -1 = maintenance_work_mem
-```
-
-確保系統剩餘記憶體 > `autovacuum_max_workers × autovacuum_work_mem`。
-
-### V. 應用層避免以下場景
-
-| 避免 | 原因 |
-|------|------|
-| Long SQL（查增刪改 DDL 全部） | `backend_xmin` 長期佔用 |
-| 打開游標不關閉 | `backend_xmin` 持續到游標關閉 |
-| 非必要的 REPEATABLE READ / SERIALIZABLE | `backend_xmin` 持續到事務結束 |
-| 大表 pg_dump（隱式 repeatable read） | 全庫備份期間的 snapshot 阻止 vacuum |
-| 長時間不關閉的持有 XID 事務 | `backend_xid` 阻止 vacuum |
-| 大批量 DELETE / UPDATE 在單一事務 | 大量 dead tuple 等事務結束才能回收 |
-
-> 注意事項：standby 開啟 `hot_standby_feedback = on` 且有 long query 時，同樣會阻止 primary 的 vacuum。因為 standby 會回報自己的 OldestXmin 給 primary（透過 hot standby feedback），告訴 primary「我這邊還有人在看這個 snapshot，不要回收」。參考：[PostgreSQL物理"备库"的哪些操作或配置，可能影响"主库"的性能、垃圾回收、IO波动](https://github.com/digoal/blog/blob/master/201704/20170410_03.md)
-
-### VI. IO 好的系統關閉 cost delay
-
-```
-autovacuum_vacuum_cost_delay = 0
+# IO 速度控制
+autovacuum_vacuum_cost_delay = 0               # NVMe SSD 環境設 0（不做 throttling）
+autovacuum_vacuum_cost_limit = 2000            # HDD 環境調高 limit 再設 delay=2ms
 ```
 
-### VII. 調低 autovacuum_naptime
+**資源計算**：`autovacuum_max_workers × autovacuum_work_mem` 不得超過系統可用記憶體的 20%。
 
+> PG 14+：`maintenance_io_concurrency = 10` 控制 VACUUM/ANALYZE 的 prefetch 並發（SSD 環境建議 10~50）。
+>
+> PG 16+：`vacuum_buffer_usage_limit = '2MB'` 限制單個 vacuum 的 shared buffer 佔用，防止擠出 hot data。
+
+### 第 3 步：防禦性參數（防止長交易永久阻塞）
+
+```ini
+# PG 9.6+：自動 kill 掛著不 COMMIT 的 session
+idle_in_transaction_session_timeout = 10min    # 超過 10 分鐘的 idle-in-transaction 自動斷開
+
+# PG 9.6+：snapshot 生命週期上限（有取捨，慎用）  
+# old_snapshot_threshold = 1h                  # 超時的 snapshot 回報 "snapshot too old" error
 ```
-autovacuum_naptime = 1s
+
+**Caution**：
+- `idle_in_transaction_session_timeout` 會 kill connection → 需確保應用有 retry 機制。
+- `old_snapshot_threshold` 會導致 long-running query 報錯 → 不適用報表系統，且 standby 不支援。
+- 備庫 `hot_standby_feedback = on` 會將 standby 的 OldestXmin 回報給 primary，阻止 primary VACUUM。如有讀寫分離架構，需額外關注 standby 上的 long query。
+
+### 第 4 步：應用層守則（開發者 Checklist）
+
+| # | 守則 | 為什麼 | 工具/做法 |
+|---|------|--------|----------|
+| 1 | 事務越短越好 | `backend_xmin` 佔用越短 → VACUUM 回收越快 | 避免在 transaction 內做 HTTP call、file IO |
+| 2 | 批量操作拆分小事務 | 單一事務產生大量 dead tuple → 膨脹 | 每次 DELETE/UPDATE 1k~10k 行就 COMMIT |
+| 3 | 預設用 READ COMMITTED | RR / Serializable 的 snapshot 卡到 COMMIT | `@Transactional(isolation=READ_COMMITTED)` |
+| 4 | 用 Partition 取代 DELETE | `DROP PARTITION` 瞬間釋放空間 | `PARTITION BY RANGE (created_at)` |
+| 5 | ORM 游標用完即關 | 未關閉的 server-side cursor 會卡 `backend_xmin` | 檢查 `@QueryHint(cursor=true)` 或 `scrollableCursor` |
+| 6 | 大表備份用 parallel | `pg_dump` 隱式 RR，單線程慢 → snapshot 卡更久 | `pg_dump -j 4` |
+| 7 | UPDATE 只動非索引欄（HOT） | HOT UPDATE 不產生 index entry → 索引不膨脹 | 避免對高頻更新欄位建 index |
+| 8 | `fillfactor` 給熱表留空間 | 讓 HOT UPDATE 在同 page 完成 → 減少 index bloat | 熱表設 `fillfactor = 80` |
+
+> **生產陷阱**：`hot_standby_feedback = on` + standby 上有 long query → standby 的 OldestXmin 回報給 primary → **primary 的 VACUUM 被 standby 阻塞**。常見於讀寫分離架構（primary write + standby read）。排查：檢查 standby 上的 `pg_stat_activity`。
+
+### 第 5 步：監控設置（必須 Alert 的指標）
+
+```sql
+-- 1. Dead Tuple Ratio：定時跑、設定 Alert
+SELECT relname,
+       round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS dead_pct
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 1000
+ORDER BY dead_pct DESC;
+-- Alert: dead_pct > 30% → Warning, > 50% → Critical
+
+-- 2. 長交易監控（找出阻塞 VACUUM 的 session）
+SELECT pid, usename,
+       now() - xact_start AS xact_age,
+       state, left(query, 100) AS query
+FROM pg_stat_activity
+WHERE (backend_xid IS NOT NULL OR backend_xmin IS NOT NULL)
+  AND state <> 'idle'
+ORDER BY xact_start;
+-- Alert: xact_age > 5min → Warning
+
+-- 3. Table Age (防止 XID Wraparound)
+SELECT relname, age(relfrozenxid) AS table_age
+FROM pg_class
+WHERE relkind = 'r'
+ORDER BY age(relfrozenxid) DESC
+LIMIT 10;
+-- Alert: age > 200M → Warning, > 1B → Critical
+
+-- 4. 精確診斷（懷疑某表有問題時）
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+SELECT * FROM pgstattuple('suspect_table');
+-- dead_tuple_percent > 20% → 安排 vacuum/repack
 ```
 
-若仍太長可在編譯 PG 原始碼時將 autovacuum launcher 的最短睡眠時間底限改為 1ms。
+### 第 6 步：已膨脹的緊急處置
 
-但需注意：若有 long transaction 導致垃圾無法回收，過短的 naptime 會讓 worker 不斷喚醒掃描→無法回收→再喚醒，浪費 IO/CPU。
-
-### VIII. 拆分批處理為小事務
-
-將大範圍 UPDATE / DELETE 拆分為多個小事務，減少單次事務對 FSM 空間的壓力與鎖持有時間。
-
-### IX. 使用較大 Block Size
-
-現代硬體建議 32KB。`fillfactor` 不需調低（預設 100），因為表總有垃圾，每個 block 被更新後都不可能是滿的。
-
-### X. 已膨脹的回收方案
-
-| 方案 | 排他鎖 | 說明 |
-|------|--------|------|
-| `VACUUM FULL` / `CLUSTER` | 需要 AccessExclusiveLock | table rewrite，全程鎖表 |
-| `pg_repack` / `pg_reorg` | 僅最終 swap filenode 時短暫鎖 | 推薦，鎖定時間最短 |
+| 方案 | 鎖定 | 適用場景 |
+|------|------|---------|
+| `VACUUM FULL` / `CLUSTER` | AccessExclusiveLock（全程鎖表） | 維護窗口可用、內建無需裝 extension |
+| `pg_repack` | 僅 FILENODE 切換時毫秒級鎖 | **生產首選**，線上不中斷服務 |
+| `REINDEX CONCURRENTLY` | 不需鎖表 | 僅 index bloat，表本身正常時用（PG 12+） |
+| DROP PARTITION | 短暫 AccessExclusiveLock | 分區表直接刪除不需要的分區 |
 
 ---
 
-## 4. 原始碼參考
+## 4. 原始碼參考（生產 Debug 用）
 
-以下列出與 VACUUM 相關的核心原始碼檔案及其功能說明（以白話描述取代原始程式碼）：
+> 以下原始碼檔案在**生產排查時極少需要直接看**，但當 `pg_stat_activity` 和系統表查不到你要的資訊時，原始碼是你理解 PostgreSQL 內部行為的最終參考。
 
-1. **`src/backend/postmaster/autovacuum.c`** — autovacuum 守護進程（daemon）的排程邏輯。負責定期喚醒、檢查哪些表需要 vacuum、分派任務給可用的 worker。包含 free worker list 的管理。
-
-2. **`src/backend/utils/time/tqual.c`** — 包含 VACUUM 用到的核心判斷邏輯。這個函數以 OldestXmin 為基準：若某 tuple 的 xmax < OldestXmin，則可安全回收；若 xmax >= OldestXmin，則標記為「可能仍有交易需要此版本」，暫時無法回收。這就是為什麼長交易會阻塞 VACUUM 的根本原因——OldestXmin 被長交易壓住不動。
-
-3. **`src/backend/storage/ipc/sinvaladt.c`** — 提供從共享記憶體（shared memory）中查詢某個 backend process 的當前交易 ID（`backend_xid`）和 snapshot XID（`backend_xmin`）的功能。監控查詢（`pg_stat_activity`）就是透過這個機制取得 `backend_xid` 和 `backend_xmin`，用來排查是哪個 session 阻塞了 VACUUM。
+| 檔案 | 做什麼 | 生產場景 |
+|------|--------|---------|
+| `src/backend/postmaster/autovacuum.c` | autovacuum daemon 排程：定期喚醒 → 檢查哪些表需要 vacuum → 分派 worker | 想知道為什麼某張表一直沒被 vacuum？Launcher 的檢查邏輯在這裡 |
+| `src/backend/utils/time/tqual.c` | VACUUM 核心回收判斷：`xmax < OldestXmin` → 可回收；`xmax >= OldestXmin` → 不可回收 | 理解「為什麼 dead but not yet removable」的演算法依據 |
+| `src/backend/storage/ipc/sinvaladt.c` | 從 shared memory 查詢 backend 的 `backend_xid` 和 `backend_xmin` | `pg_stat_activity` 的 `backend_xmin` 欄位資料來源。想理解 snapshot 機制如何跨 process 傳遞就看這裡 |
 
 ---
 
 ## 5. 版本變遷速查
 
+> 以下梳理各 PG 版本中 VACUUM 相關的重大變更。**升級考量**欄幫助你評估從舊版升級時需要改什麼配置、關注什麼風險。
+
 ```mermaid
 timeline
     title PostgreSQL VACUUM 功能演進
-    PG 9.6 : old_snapshot_threshold<br/>(snapshot 生命週期上限)
+    PG 9.6 : old_snapshot_threshold<br/>idle_in_transaction_session_timeout
     PG 12 : INSERT-only 表 vacuum 閾值<br/>REINDEX CONCURRENTLY
     PG 13 : Per-table cost delay<br/>Per-table autovacuum 參數
-    PG 14 : vacuum_failsafe_age<br/>maintenance_io_concurrency<br/>Per-table log_autovacuum
+    PG 14 : vacuum_failsafe_age<br/>maintenance_io_concurrency
     PG 15 : max_workers 上限提升
     PG 16 : vacuum_buffer_usage_limit
     PG 18 : VACUUM PARALLEL<br/>VACUUM SKIP_LOCKED
 ```
 
-| 功能 | 引入版本 | 說明 |
-|------|---------|------|
-| `old_snapshot_threshold` | PG 9.6 | snapshot too old，限制 snapshot 生命週期上限 |
-| `autovacuum_vacuum_insert_threshold` | PG 12 | INSERT-only 表 vacuum 觸發閾值 |
-| `autovacuum_vacuum_insert_scale_factor` | PG 12 | INSERT-only 表 vacuum 觸發比例 |
-| `REINDEX CONCURRENTLY` | PG 12 | 線上重建索引，不需鎖表 |
-| Per-table `autovacuum_vacuum_cost_delay` | PG 13 | 不同表可設定不同 cost 策略 |
-| Per-table autovacuum 參數 | PG 13 | 所有 autovacuum 參數可依表獨立設定 |
-| `vacuum_failsafe_age` | PG 14 | 防止 XID wraparound 的 safety net |
-| `maintenance_io_concurrency` | PG 14 | VACUUM / ANALYZE 的 prefetch 並發數 |
-| `log_autovacuum_min_duration` 支援 per-table | PG 14 | 更精細的 log 控制 |
-| `autovacuum_max_workers` 上限提升 | PG 15 | 支援更多 concurrent vacuum worker |
-| `vacuum_buffer_usage_limit` | PG 16 | 限制單個 vacuum 的 shared buffer 用量 |
-| `VACUUM PARALLEL` | PG 18 | 並行 vacuum 加速索引 cleanup |
-| `VACUUM SKIP_LOCKED` | PG 18 | 跳過無法鎖定的 relation |
+| 功能 | 版本 | 說明 | 升級考量 |
+|------|------|------|---------|
+| `idle_in_transaction_session_timeout` | 9.6 | 自動 kill 掛著不 COMMIT 的 session | 從 < 9.6 升級後建議立即設定為 `10min`。可能導致舊 APP 連線中斷 — 需確認應用有 retry 機制 |
+| `old_snapshot_threshold` | 9.6 | snapshot 生命週期上限，超時報錯 | 慎用：會 kill long query。對報表系統、資料遷移腳本不適用 |
+| `autovacuum_vacuum_insert_threshold` / `insert_scale_factor` | 12 | INSERT-only 表獨立真空閾值 | 升級到 12+ 後 INSERT-heavy workload 的 freeze 更主動，WAL 量微幅增加 |
+| `REINDEX CONCURRENTLY` | 12 | 不鎖表重建索引 | 升級後 index bloat 處置更簡單，不需 rebuild 整張表 |
+| Per-table `autovacuum` 參數 | 13 | 每張表可獨立設定 vacuum 策略 | 升級後建議對超大表單獨調低 `vacuum_scale_factor` |
+| `vacuum_failsafe_age` | 14 | 防止 XID wraparound shutdown 的最後防線 | 升級到 14+ 後 wraparound risk 大幅降低，即使長交易存在 |
+| `maintenance_io_concurrency` | 14 | VACUUM/ANALYZE 的 prefetch 並發 | SSD 環境建議設 10~50，HDD 保持預設 |
+| `autovacuum_max_workers` 上限提升 | 15 | 支援更多 concurrent worker | 升級後可增加 worker 數，但需確保記憶體（worker × work_mem）充足 |
+| `vacuum_buffer_usage_limit` | 16 | 限制單個 vacuum 的 shared buffer 佔用 | 防止 vacuum 擠出 hot data。預設 256KB，生產可調高至 `2MB` |
+| `VACUUM PARALLEL` | 18 | 索引 cleanup 並行處理 | 大幅加速大表的 index vacuum。升級後 `max_parallel_maintenance_workers` 控制並發度 |
+| `VACUUM SKIP_LOCKED` | 18 | 跳過無法鎖定的 relation | 避免因單表被鎖導致整個 vacuum job 卡住 |
 
 ## 參考
 
@@ -648,28 +869,37 @@ timeline
 
 ## 1. 表膨脹（Bloat）的成因與後果
 
-### Bloat 是怎麼發生的？（新手複習）
+### 回顧：Bloat 的本質
 
-回顧第一章的 MVCC 機制：PostgreSQL 的 UPDATE 和 DELETE 不直接覆蓋或刪除舊資料，而是產生 dead tuple，由 VACUUM 負責回收。
+PostgreSQL 的 UPDATE / DELETE 產生 dead tuple，由 VACUUM 回收。**Bloat = dead tuple 堆積未被回收** 導致表空間遠大於實際資料所需。
 
-Bloat 的根本原因不是 VACUUM 不存在，而是 **dead tuple 的產生速度超過了 VACUUM 的回收速度**，或是 **VACUUM 被阻塞無法回收**。
+### 生產決策：何時該「重建」而非等待 VACUUM？
 
-### 為什麼 VACUUM 回收不了？
+一般 VACUUM 只標記空間可重用、不歸還磁盤給 OS。當以下任一情況出現，應該考慮重建而非等待：
 
-- **長時間未提交的交易**：持有舊 snapshot（`backend_xmin`）→ OldestXmin 被壓住 → 所有比此 snapshot 新的 dead tuple 無法回收
-- **閒置的 replication slot**：邏輯複製或物理複製的 slot 如果沒有被消費，WAL 會堆積，同時 VACUUM 也無法推進，因為 slot 需要保留舊版本的 WAL 變更供 standby 或 logical subscriber 使用
-- **autovacuum 未及時觸發**：觸發閾值 `autovacuum_vacuum_scale_factor` 預設 20%（0.2）。一張 1 億行的表需要 2000 萬 dead tuple 才觸發 VACUUM。到那時表已經嚴重膨脹，回收也需要很久。超大表上尤其嚴重。
-- **HOT update 無法生效**：如果更新的欄位包含索引欄位（indexed column），PostgreSQL 無法使用 HOT（Heap-Only Tuple）優化，必須在每個索引中都插入新的 index entry → 舊 index entry 變成 dead → 索引也膨脹
+| 指標 | 臨界值 | 工具 |
+|------|--------|------|
+| `dead_tuple_percent`（pgstattuple） | > 30% | `SELECT * FROM pgstattuple('table');` |
+| `n_dead_tup` 持續增長但 `last_autovacuum` 正常 | dead ratio > 20% | `pg_stat_user_tables` |
+| 查詢延遲明顯高於 baseline | latency ↑ 3x+ | APM / `auto_explain` |
+| Disk 用量 > 預期 × 3 且 `n_live_tup` 沒變 | — | `pg_total_relation_size()` |
 
-### Bloat 的後果：不只是浪費空間
+```sql
+-- 一鍵評估：哪些表該重建了
+SELECT relname,
+       n_live_tup,
+       n_dead_tup,
+       round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+       pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+       last_autovacuum,
+       CASE WHEN n_dead_tup * 1.0 / NULLIF(n_live_tup, 0) > 0.3 
+            THEN '⚠️ 建議 rebuild' ELSE 'OK' END AS action
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 1000
+ORDER BY n_dead_tup DESC;
+```
 
-| 後果 | 說明 |
-|------|------|
-| 磁盤空間浪費 | 表佔用空間比實際資料大數倍 |
-| 查詢變慢 | Page density（資料密度）下降，相同的 SELECT 需要讀取更多 page → I/O 增加 |
-| Cache 效率降低 | 有用的 live tuple 被沒用的 dead tuple 擠出 shared buffer → cache hit ratio 下降 |
-| 備份/還原變慢 | pg_dump 和 PITR 需要處理更多 page |
-| Index-Only Scan 失效 | Visibility Map 更新不及時，引擎必須額外檢查 heap page |
+### Bloat 對生產的實際影響
 
 ```mermaid
 flowchart LR
@@ -682,11 +912,25 @@ flowchart LR
     A --> B
 ```
 
+| 後果 | 生產表現 |
+|------|---------|
+| 查詢變慢 | 相同 SQL 延遲從 50ms → 250ms。由 I/O 增加而非資料增加造成，容易被誤判為「資料量成長」 |
+| Cache 效率降低 | `shared_buffers` 被 dead tuple 佔據 → `pg_stat_bgwriter.buffers_backend` 飆升 |
+| 備份變慢 | `pg_dump` 必須逐 page 掃描，dead page 也必須讀 → 備份時間翻倍 |
+| Replication lag 增加 | WAL 量不變但 standby apply 時需處理更多 page → lag 增加 |
+| 無法使用 Index-Only Scan | VM 被重置 → engine 被迫 access heap → 查詢從 I/O-free 變 I/O-bound |
+
 ---
 
-## 2. 三種重建方案對比
+## 2. 三種重建方案深度對比
 
-當 Bloat 已經發生、一般的 VACUUM 無法收縮（因為一般 VACUUM 只標記空間可重用，不歸還磁盤空間給 OS），我們需要重建（rewrite）整張表。以下是三種方案的詳細對比。
+當 Bloat 已經發生、一般 VACUUM 無法收縮時（因為一般 VACUUM 只標記空間可重用，不歸還磁盤空間給 OS），需要重建整張表。
+
+> **生產選型速查**：
+> - 有維護窗口 → `VACUUM FULL`（最簡單、最徹底）
+> - 無維護窗口 + 任何表 → **`pg_repack`**（生產驗證最成熟）
+> - 高寫入吞吐 + 有 PK → `pg_squeeze`（需監控 WAL slot）
+> - 僅 index bloat → `REINDEX CONCURRENTLY`（PG 12+，最快）
 
 ### I. VACUUM FULL / CLUSTER
 
@@ -701,6 +945,15 @@ CLUSTER table_name USING index_name;
 - **機制**：完整重寫表（new FILENODE），複製 live row → 刪除舊檔案
 - **優點**：內建、不需 extension、回收最徹底（包括 index bloat）
 - **缺點**：鎖表時間長（取決於表大小），對線上系統不可接受
+
+**生產 Lock 時間估算**（NVMe SSD 環境）：
+
+| 表大小 | 預估鎖定時間 | 建議 |
+|--------|------------|------|
+| < 10 GB | < 30s | 凌晨維護窗口可接受 |
+| 10-100 GB | 1-10 分鐘 | 需評估業務影響 |
+| 100 GB - 1 TB | 10 分鐘 - 2 小時 | 不建議，改用 pg_repack |
+| > 1 TB | > 2 小時 | 不可行，必須用 pg_repack |
 
 ```mermaid
 sequenceDiagram
@@ -733,6 +986,17 @@ pg_repack -t table_name -d database
   5. 切換 FILENODE（鎖定極短）
 - **優點**：生產驗證最成熟、支援 index 重建/重排
 - **缺點**：**trigger 帶來的 DML 效能開銷**（每個 INSERT/UPDATE/DELETE 都要寫入 delta log table）
+
+**生產執行時長參考**（NVMe SSD，低負載環境）：
+
+| 表大小 | pg_repack 耗時 | DML overhead 期間 |
+|--------|---------------|-------------------|
+| < 10 GB | < 5 分鐘 | 幾乎無感 |
+| 10-100 GB | 5-30 分鐘 | DML 延遲 +5~15% |
+| 100 GB - 1 TB | 30 分鐘 - 4 小時 | DML 延遲 +10~20% |
+| > 1 TB | > 4 小時 | 需評估，可分批 repack index 或 partition |
+
+> **生產技巧**：pg_repack 支援 `--jobs=N` 並行索引重建（PG 12+）。對多索引的大表，`--jobs=4` 可將總耗時縮短 2-3 倍。
 
 ```mermaid
 sequenceDiagram
@@ -839,73 +1103,99 @@ flowchart TD
 
 ## 4. 使用 pg_squeeze 的注意事項
 
-1. **Replication Slot 數量**：`max_replication_slots` 需預留足夠數量。每個 pg_squeeze worker 消耗 1 個 slot；若有 streaming replication standby，也需各自的 slot。建議 `max_replication_slots = standby_count + concurrent_squeeze_workers + 5`
+### Replication Slot 監控（生產必備）
 
-2. **高峰期風險**：不建議對繁忙資料庫開啟自動收縮。自動觸發可能在高峰期啟動，帶來額外的 I/O / WAL / CPU 負擔。可設定 `squeeze.schedule` 限制只在離峰時段執行
+pg_squeeze 最大的風險是 **replication slot 堆積 WAL**。如果 background worker 故障或重建時間過長，slot 未被消費的 WAL 會無限制累積 → 磁盤爆滿。務必設置以下監控並 Alert：
 
-3. **Bloat 閾值設定**：基於 Free Space Map（FSM）和 `pgstattuple` extension 的 dead tuple ratio 計算。可設定 `squeeze.min_size`（最小表大小）、`squeeze.bloat_threshold`（空間浪費百分比）來忽略小表或輕度膨脹的表
+```sql
+-- 監控所有 replication slot 的 WAL 堆積量
+SELECT slot_name, database, active,
+       pg_size_pretty(pg_wal_lsn_diff(
+           pg_current_wal_lsn(), restart_lsn
+       )) AS wal_retained,
+       restart_lsn
+FROM pg_replication_slots
+WHERE slot_type = 'logical';
+-- Alert: wal_retained > 5 GB → Warning, > 20 GB → Critical
+```
 
-4. **Cybertec 官方說明**（原文節錄）：
+### 配置建議
 
-> pg_squeeze is implemented as a background worker process that periodically monitors user-defined tables. When it detects that a table exceeded the "bloat threshold", it kicks in and rebuilds that table automatically. Rebuilding happens concurrently in the background with minimal storage and computational overhead due to use of Postgres' built-in replication slots together with logical decoding to extract possible table changes during the rebuild from XLOG.
+1. **Replication Slot 數量**：`max_replication_slots = standby_slots + concurrent_squeeze_workers + 5` 預留緩衝
+2. **高峰期保護**：設定 `squeeze.schedule` 限制只在離峰時段執行，或手動 trigger 而非自動觸發
+3. **超時限制**：設定重建的 max duration，超時自動 abort → 不會卡死 slot
+4. **WAL level**：必須 ≥ `replica`。檢查 `SHOW wal_level;`
+
+### 現狀評估
+
+pg_squeeze 原為 Cybertec 開發，2016 年後社群活躍度不如 pg_repack。**2025 年生產建議**：
+
+| 場景 | 選擇 |
+|------|------|
+| 通用、任何情況 | **pg_repack** |
+| 極高寫入吞吐 + trigger overhead 不可接受 + 願意承擔 slot 風險 | pg_squeeze |
+| 僅 index bloat | **REINDEX CONCURRENTLY** |
 
 ---
 
-## 5. 現代最佳實踐
+## 5. 生產環境完整決策流程
 
-> 補充（Senior Dev）：
->
-> **2016 年到今天的方案演進**：
->
-> | 工具 | 當前狀態 | 建議 |
-> |------|---------|------|
-> | VACUUM FULL | PG 內建 | 緊急情況、維護窗口可用時 |
-> | pg_repack | 社群最活躍的 online rebuild 方案 | **生產第一選擇** |
-> | pg_squeeze | 2016 beta，更新停滯 | 僅在需自動 + trigger-free 場景 |
-> | REINDEX CONCURRENTLY | PG 12+ 內建 | 僅 index bloat 時用，不需重建表 |
-> | pgcompacttable | 減少 dead tuple 但不重建 FILENODE | 輕度膨脹的過渡方案 |
->
-> **避免膨脹的預防措施（分層策略）**：
+### 決策樹：我的表膨脹了，該怎麼辦？
 
 ```mermaid
 flowchart TD
-    subgraph 預防層
-        P1["調低 autovacuum_vacuum_scale_factor<br/>大表建議 0.01~0.05"] --> P
-        P2["設置 idle_in_transaction_session_timeout<br/>(PG 9.6+) 防止長交易阻塞"] --> P
-        P3["設置 old_snapshot_threshold<br/>(PG 9.6+) 讓舊 snapshot 過期"] --> P
-        P4["使用分區表 (Partition)<br/>用 DROP PARTITION 取代 DELETE"] --> P
-        P5["優化 SQL：使用 HOT UPDATE<br/>只更新非索引欄位"] --> P
-        P6["PG 13+ INSERT-only 表獨立真空閾值"] --> P
-        P["🛡️ 預防策略"]
-    end
-    subgraph 監控層
-        M1["監控 pg_stat_user_tables<br/>n_dead_tup / n_live_tup"] --> M
-        M2["使用 pgstattuple 精確診斷<br/>dead_tuple_percent > 20% 建議處理"] --> M
-        M3["監控 pg_stat_activity<br/>backend_xid / backend_xmin 長期非空"] --> M
-        M["📊 監控策略"]
-    end
-    subgraph 處置層
-        R1["緊急: VACUUM FULL (需停機)"] --> R
-        R2["線上: pg_repack (生產首選)"] --> R
-        R3["僅索引: REINDEX CONCURRENTLY"] --> R
-        R["🔧 處置策略"]
-    end
-    P --> M --> R
+    A["表已膨脹"] --> B{"能接受停機維護？"}
+    B -->|是| C{"表 > 100GB？"}
+    C -->|否| D["VACUUM FULL<br/>深夜跑，鎖表 < 10 分鐘"]
+    C -->|是| E["pg_repack<br/>大表鎖定時間不可控"]
+    B -->|否| F{"僅索引膨脹？"}
+    F -->|是| G["REINDEX CONCURRENTLY<br/>PG 12+，不鎖表"]
+    F -->|否| H{"表有 Primary Key？"}
+    H -->|有| I{"寫入吞吐 > 1k TPS？"}
+    I -->|是| J{"OPS 團隊能監控 WAL slot？"}
+    J -->|是| K["pg_squeeze<br/>trigger-free，需監控 slot"]
+    J -->|否| L["pg_repack<br/>trigger overhead 可接受"]
+    I -->|否| L
+    H -->|沒有| L
 ```
 
-> 1. 調低 `autovacuum_vacuum_scale_factor` → 提高觸發頻率（大表建議 0.01-0.05）
-> 2. 設置 `idle_in_transaction_session_timeout`（PG 9.6+）→ 防止長 transaction 阻擋 VACUUM
-> 3. 設置 `old_snapshot_threshold`（PG 9.6+）→ 讓長時間 snapshot 過期
-> 4. 監控 `pg_stat_user_tables.n_dead_tup` / `n_live_tup` → 計算 bloat ratio
-> 5. 使用 `pgstattuple` extension 精確診斷：
-> ```sql
-> CREATE EXTENSION pgstattuple;
-> SELECT * FROM pgstattuple('your_table');
-> -- dead_tuple_percent 超過 20-30% 建議處理
-> ```
-> 6. **Partition**：按時間 partition 的表可以 `DROP PARTITION` 直接釋放空間，完全不需要 VACUUM / repack
-> 7. PG 13+ `autovacuum_vacuum_insert_scale_factor` 獨立控制 INSERT-only 表的 VACUUM 觸發
-> 8. 使用 **HOT UPDATE**（更新 non-indexed column）減少 index bloat
+### 預防 > 治療：避免走到重建這一步
+
+| # | 措施 | 一句話 |
+|---|------|--------|
+| 1 | `autovacuum_vacuum_scale_factor = 0.01` | 大表不要等 20% 才觸發 |
+| 2 | `idle_in_transaction_session_timeout = 10min` | 自動 kill 掛著不 commit 的 session |
+| 3 | Partition by time | `DROP PARTITION` 取代 `DELETE`，秒殺 |
+| 4 | 只用 READ COMMITTED | RR/Serializable 的 snapshot 會卡到整個事務結束 |
+| 5 | 批量操作拆分小事務 | 每次 1k~10k 行就 COMMIT |
+| 6 | 監控 dead ratio | `n_dead_tup > n_live_tup × 0.3` → 安排 repack |
+
+### 排程建議
+
+```sql
+-- 每小時檢查一次的監控 query，搭配 cron / pg_cron
+SELECT relname,
+       CASE WHEN n_dead_tup * 1.0 / NULLIF(n_live_tup, 0) > 0.5
+            THEN 'CRITICAL: 建議立即 rebuild'
+            WHEN n_dead_tup * 1.0 / NULLIF(n_live_tup, 0) > 0.3
+            THEN 'WARNING: 安排離峰 rebuild'
+            ELSE 'OK'
+       END AS status
+FROM pg_stat_user_tables
+WHERE n_live_tup > 0
+ORDER BY n_dead_tup DESC
+LIMIT 10;
+```
+
+### 工具現狀速查（2025）
+
+| 工具 | 狀態 | 推薦度 | 何時用 |
+|------|------|--------|--------|
+| VACUUM FULL | PG 內建 | ★★★ | 小表 + 有維護窗口 |
+| pg_repack | 社群活躍 | ★★★★★ | **生產重建首選** |
+| REINDEX CONCURRENTLY | PG 12+ 內建 | ★★★★★ | 僅 index bloat |
+| pg_squeeze | 更新停滯 | ★★ | 特定高寫入場景 |
+| pgcompacttable | 減少 dead tuple 不重建 FILENODE | ★★ | 輕度膨脹過渡方案 |
 
 ---
 

@@ -3256,6 +3256,705 @@ flowchart TD
 3. [pg_jieba](https://github.com/jaiminpan/pg_jieba) / [zhparser](https://github.com/amutu/zhparser)
 
 
+# 八、PostgreSQL 索引失效的 20 個場景與解法
+
+> 以下 20 個場景來自生產環境實戰，每個場景都附有 EXPLAIN ANALYZE 輸出對比與具體解法。理解這些場景可以幫助你在設計索引時避開常見陷阱，並在排查慢查詢時快速判斷索引是否被正確使用。
+
+## 1 索引列存在多個 or 連接
+
+當查詢條件中存在多個 OR 連接時， PostgreSQL 需要將所有條件的結果集進行合並，而這個合並操作可能會導致索引失效。
+
+**模擬環境**
+
+```sql
+postgres=# create table idxidx as select * from pg_class;
+SELECT 445
+postgres=# create index idx_11 on idxidx(oid);
+CREATE INDEX
+```
+
+**測試情況**
+
+一個 or 連接兩個索引列 （走索引）
+
+```sql
+postgres=# explain analyze select oid,relname,relnamespace  from idxidx where oid =17726 or oid=17743;
+                                                    QUERY PLAN                                                      
+---------------------------------------------------------------------------------------------------------------------
+Bitmap Heap Scan on idxidx  (cost=8.56..14.14 rows=2 width=72) (actual time=0.018..0.019 rows=1 loops=1)
+  Recheck Cond: ((oid = '17726'::oid) OR (oid = '17743'::oid))
+  Heap Blocks: exact=1
+  ->  BitmapOr  (cost=8.56..8.56 rows=2 width=0) (actual time=0.012..0.013 rows=0 loops=1)
+        ->  Bitmap Index Scan on idx_11  (cost=0.00..4.28 rows=1 width=0) (actual time=0.011..0.011 rows=1 loops=1)
+              Index Cond: (oid = '17726'::oid)
+        ->  Bitmap Index Scan on idx_11  (cost=0.00..4.28 rows=1 width=0) (actual time=0.001..0.001 rows=0 loops=1)
+              Index Cond: (oid = '17743'::oid)
+Planning Time: 0.061 ms
+Execution Time: 0.038 ms
+(10 rows)
+```
+  
+兩個 or 連接三個索引列（走全表掃描）
+
+```sql
+postgres=# explain analyze select oid,relname,relnamespace  from idxidx where oid = 17726 or oid = 17765 or oid = 17743;
+                                           QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
+Seq Scan on idxidx  (cost=0.00..19.79 rows=3 width=72) (actual time=0.012..0.064 rows=1 loops=1)
+  Filter: ((oid = '17726'::oid) OR (oid = '17765'::oid) OR (oid = '17743'::oid))
+  Rows Removed by Filter: 444
+Planning Time: 0.059 ms
+Execution Time: 0.079 ms
+(5 rows)
+ 
+```
+  
+要避免這種情況，可以嘗試對查詢條件進行重寫，例如使用 UNION ALL 連接多個查詢條件 , 例如如如下這種方式
+
+```sql
+postgres=# explain analyze select oid,relname,relnamespace from idxidx where oid = 17726 union all  select oid,relname,relnamespace  from idxidx where oid=17765 union all  select oid,relname,relnamespace  from idxidx where oid=17743;
+                                                         QUERY PLAN                                                          
+-------------------------------------------------------------------------------------------------------------------------------
+Append  (cost=0.27..24.92 rows=3 width=72) (actual time=0.041..0.046 rows=1 loops=1)
+  ->  Index Scan using idx_11 on idxidx  (cost=0.27..8.29 rows=1 width=72) (actual time=0.041..0.042 rows=1 loops=1)
+        Index Cond: (oid = '17726'::oid)
+  ->  Index Scan using idx_11 on idxidx idxidx_1  (cost=0.27..8.29 rows=1 width=72) (actual time=0.002..0.002 rows=0 loops=1)
+        Index Cond: (oid = '17765'::oid)
+  ->  Index Scan using idx_11 on idxidx idxidx_2  (cost=0.27..8.29 rows=1 width=72) (actual time=0.001..0.001 rows=0 loops=1)
+        Index Cond: (oid = '17743'::oid)
+Planning Time: 0.169 ms
+Execution Time: 0.082 ms
+(9 rows)
+```
+
+## 2 數據量太小
+
+對於非常小的表或者索引，使用索引可能會比全表掃描更慢。這是因為使用索引需要進行額外的 I/O 操作，而這些操作可能比直接掃描表更慢。
+
+**模擬環境**
+
+```sql
+postgres=# create table tn(id int,name varchar);
+CREATE TABLE
+postgres=# insert into tn values(1,'ysl');
+INSERT 0 1
+postgres=# insert into tn values(2,'ysl');
+INSERT 0 1
+postgres=# insert into tn values(2,'ysll');
+INSERT 0 1
+postgres=# insert into tn values(2,'ysll');
+INSERT 0 1
+ 
+postgres=# create index idx_tn on tn(id);
+CREATE INDEX
+postgres=# \d tn
+                     Table "public.tn"
+Column |       Type        | Collation | Nullable | Default
+--------+-------------------+-----------+----------+---------
+id     | integer           |           |          |
+name   | character varying |           |          |
+Indexes:
+   "idx_tn" btree (id)
+ 
+postgres=# select * from tn;
+id | name
+----+------
+ 1 | ysl
+ 2 | ysl
+ 2 | ysll
+ 2 | ysll
+(4 rows)
+```
+
+**測試**
+
+```sql
+postgres=# explain analyze select * from tn where id=2;
+                                        QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+Seq Scan on tn  (cost=0.00..1.05 rows=1 width=36) (actual time=0.007..0.007 rows=3 loops=1)
+  Filter: (id = 2)
+  Rows Removed by Filter: 1
+Planning Time: 0.053 ms
+Execution Time: 0.021 ms
+(5 rows)
+ 
+postgres=# explain analyze select * from tn where id=1;
+                                        QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+Seq Scan on tn  (cost=0.00..1.05 rows=1 width=36) (actual time=0.011..0.012 rows=1 loops=1)
+  Filter: (id = 1)
+  Rows Removed by Filter: 3
+Planning Time: 0.057 ms
+Execution Time: 0.026 ms
+(5 rows
+```
+
+## 3 選擇性不好
+  
+如果索引列中有大量重複的數據，或者一個字段全是一個值，這個時候，索引可能並不能發揮它的作用，起到加快檢索的作用，因為這個索引並不能顯著地減少需要掃描的行數，所以計算的代價可能遠遠大於走別的執行計劃的代價。
+
+基數：數據庫基數是指數據庫中不同值的數量
+
+```sql
+select count(distinct column_name) from table_name;
+```
+
+選擇性：基數和總行數的比值再乘以 100% 就是某個列的選擇性。  
+
+```sql
+select count(distinct column_name) /count（ column_name）* 100% from table_name;
+```
+
+**模擬環境**
+
+```sql
+postgres=# create table tb_t1 as select * from pg_class;
+SELECT 465
+postgres=# create index idx_tb_t1 on tb_t1(oid);
+CREATE INDEX
+```
+
+**測試**
+  
+可以看到，原本 oid 這一列，選擇性較好，分布較均勻的時候，可以正常使用到索引。而選擇性不好的情況下，則
+
+```sql
+postgres=# explain analyze select * from tb_t1 where oid=17726;
+                                                   QUERY PLAN                                                    
+------------------------------------------------------------------------------------------------------------------
+Bitmap Heap Scan on tb_t1  (cost=4.29..9.86 rows=2 width=236) (actual time=0.024..0.025 rows=1 loops=1)
+  Recheck Cond: (oid = '17726'::oid)
+  Heap Blocks: exact=1
+  ->  Bitmap Index Scan on idx_tb_t1  (cost=0.00..4.29 rows=2 width=0) (actual time=0.021..0.021 rows=1 loops=1)
+        Index Cond: (oid = '17726'::oid)
+Planning Time: 0.220 ms
+Execution Time: 0.059 ms
+(7 rows)
+ 
+postgres=# update tb_t1 set oid=1;
+UPDATE 465
+postgres=# reindex  index idx_tb_t1;
+REINDEX
+ 
+postgres=# explain analyze select * from tb_t1 where oid=1;
+                                             QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+Seq Scan on tb_t1  (cost=0.00..29.81 rows=465 width=274) (actual time=0.013..0.080 rows=465 loops=1)
+  Filter: (oid = '1'::oid)
+Planning Time: 0.344 ms
+Execution Time: 0.111 ms
+(4 rows)
+```
+  
+上邊的這個例子，在我做完 update 後，列的基數是 select count(distinct oid)  from tb\_t1; 也就是 1 。而選擇性是 select count(distinct oid)/count(oid) 100%  from tb\_t1; 也就是 1/465 100%  選擇性特別低。索引不能起到減少掃描的行數，反而在原本的基礎上多了回表的動作，代價就增多了。因此 CBO 沒有選擇走這個索引的執行計劃。
+
+## 4 查詢條件模糊
+  
+如果查詢條件模糊，例如使用了不等於（<>）、 LIKE 等運算符或者使用了函數等，那麽索引可能無法被使用。
+
+因為正常情況下，等於（=）操作符可以直接利用 B-tree 或哈希索引進行查找。這是因為，這些操作符只需要在索引樹中查找與給定值相等的項，就可以快速地定位到符合條件的記錄。
+
+而不等於（<>）操作符則需要查找所有不符合條件的記錄，這會導致需要遍歷整個索引樹來找到匹配的記錄，因此使用索引的成本比全表掃描更高。  
+LIKE 操作符也可能導致不使用索引。這是因為， LIKE 操作符通常需要執行模糊匹配，即查找包含你給的關鍵字的記錄。雖然可以使用 B-tree 索引進行模糊匹配，但是如果模式以通配符開頭（例如’%abc’），則索引將不會被使用，因為這種情況下需要遍歷整個索引樹來查找符合條件的記錄。
+
+這兩種方式在列上有索引的時候，都是不能顯著地減少需要掃描的行數。甚至加大 SQL 執行的代價，因此可能上邊的索引不會被 CBO 選擇為最後最優的執行計劃。
+
+**模擬環境**
+
+```sql
+postgres=# create table tb_l1 as select * from pg_class;
+SELECT 465
+postgres=# create index idx_tb_l1 on tb_l1(oid);
+CREATE INDEX
+```
+
+**測試**
+
+```sql
+postgres=# explain analyze select * from tb_l1 where oid=17726;
+                                                   QUERY PLAN                                                    
+-------------------------------------------------------------------------------------------------------------------
+Index Scan using idx_tb_l1 on tb_l1  (cost=0.27..8.29 rows=1 width=274) (actual time=0.029..0.030 rows=1 loops=1)
+  Index Cond: (oid = '17726'::oid)
+Planning Time: 0.473 ms
+Execution Time: 0.083 ms
+(4 rows)
+ 
+postgres=# explain analyze select * from tb_l1 where oid<>17726;
+                                             QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+Seq Scan on tb_l1  (cost=0.00..17.81 rows=464 width=274) (actual time=0.007..0.103 rows=464 loops=1)
+  Filter: (oid <> '17726'::oid)
+  Rows Removed by Filter: 1
+Planning Time: 0.069 ms
+Execution Time: 0.132 ms
+(5 rows)
+```
+
+## 5 表的一個列上有重複索引
+  
+在 PostgreSQL 裡，是允許在一列上建立多個索引的，也就是如下這種方式，是不會報錯說索引重複的，這也就導致了，使用過程中表上可能存在多餘的重複索引，索引不會全部被使用到，而且可能引起性能問題。
+
+```sql
+postgres=# create index idx_tb_l1 on tb_l1(oid);
+CREATE INDEX
+postgres=# create index idx_tb_l2 on tb_l1(oid);
+CREATE INDEX
+```
+
+**模擬環境**
+
+```sql
+postgres=# create table tb_l1 as select * from pg_class;
+SELECT 465
+postgres=# create index idx_tb_l1 on tb_l1(oid);
+CREATE INDEX
+postgres=# create index idx_tb_l2 on tb_l1(oid);
+CREATE INDEX
+postgres=# \d tb_l1
+                       Table "public.tb_l1"
+      Column        |     Type     | Collation | Nullable | Default
+---------------------+--------------+-----------+----------+---------
+oid                 | oid          |           |          |
+relname             | name         |           |          |
+relnamespace        | oid          |           |          |
+reltype             | oid          |           |          |
+reloftype           | oid          |           |          |
+relowner            | oid          |           |          |
+... ...
+... ...
+Indexes:
+   "idx_tb_l1" btree (oid)
+   "idx_tb_l2" btree (oid)
+```
+
+**測試**
+
+```sql
+postgres=# explain analyze select * from tb_l1 where oid=17726;                                                    QUERY PLAN                                                    
+-------------------------------------------------------------------------------------------------------------------
+Index Scan using idx_tb_l2 on tb_l1  (cost=0.27..8.29 rows=1 width=274) (actual time=0.025..0.025 rows=1 loops=1)
+  Index Cond: (oid = '17726'::oid)
+Planning Time: 0.364 ms
+Execution Time: 0.043 ms
+(4 rows)
+```
+  
+測試可以看到，在一個表的同一列上的兩個索引其實作用是一樣的，僅僅名字不一樣，屬於重複索引，這種情況下，就算用到索引，同一時刻也就會使用到一個索引。
+
+使用如下的 SQL 可以找到數據庫裡的重複索引，可以定期巡檢的時候進行檢查，並在確認後合理優化掉重複的索引
+
+```sql
+SELECT
+ indrelid :: regclass              AS table_name,
+ array_agg(indexrelid :: regclass) AS indexes
+FROM pg_index
+GROUP BY
+ indrelid, indkey
+HAVING COUNT(*) > 1;
+
+
+-- 一个執行的結果如下所示：
+postgres=# SELECT
+ indrelid :: regclass              AS table_name,
+ array_agg(indexrelid :: regclass) AS indexes
+FROM pg_index
+GROUP BY
+ indrelid, indkey
+HAVING COUNT(*) > 1;
+table_name |        indexes        
+------------+-----------------------
+tb_l1      | {idx_tb_l1,idx_tb_l2}
+t1         | {ind1,idx2}
+(2 rows)
+ 
+postgres=# \di+ idx_tb_l1
+                                       List of relations
+Schema |   Name    | Type  |  Owner  | Table | Persistence | Access method | Size  | Description
+--------+-----------+-------+---------+-------+-------------+---------------+-------+-------------
+public | idx_tb_l1 | index | xmaster | tb_l1 | permanent   | btree         | 32 kB |
+(1 row)
+ 
+postgres=# \di+ idx_tb_l2
+                                       List of relations
+Schema |   Name    | Type  |  Owner  | Table | Persistence | Access method | Size  | Description
+--------+-----------+-------+---------+-------+-------------+---------------+-------+-------------
+public | idx_tb_l2 | index | xmaster | tb_l1 | permanent   | btree         | 32 kB |
+(1 row）
+```
+
+## 6 優化器選項關閉了索引掃描
+
+PostgreSQL 裡有著很多的可以影響優化器的參數，例如 enable\_indexscan, enable\_bitmapscan, enable\_hashjoin, enable\_sort 等等，這些參數可以在 session，用戶，數據庫級別進行設置。可以通過設置這些參數的值，來改變相關 SQL 執行時的執行計劃。但是需要注意的是，為了個別的 SQL，去盲目改變這些參數的值，往往是得不償失的，操作的時候需要嚴謹並且仔細考慮，否則，這些類型的參數的改變，對於數據庫的性能影響可能是巨大的。
+
+**模擬環境**
+
+```sql
+postgres=# create table tb_l1 as select * from pg_class;
+SELECT 465
+postgres=# create index idx_tb_l1 on tb_l1(oid);
+CREATE INDEX
+```
+
+**測試**
+
+```sql
+-- 開啟了對應優化器選項
+postgres=# show enable_indexscan ;
+enable_indexscan
+------------------
+on
+(1 row)
+ 
+postgres=# show enable_bitmapscan ;
+enable_bitmapscan
+-------------------
+on
+(1 row)
+ 
+postgres=# explain analyze select * from tb_l1 where oid=17721;
+                                                   QUERY PLAN                                                    
+-------------------------------------------------------------------------------------------------------------------
+Index Scan using idx_tb_l2 on tb_l1  (cost=0.27..8.29 rows=1 width=274) (actual time=0.017..0.018 rows=1 loops=1)
+  Index Cond: (oid = '17721'::oid)
+Planning Time: 0.088 ms
+Execution Time: 0.038 ms
+(4 rows)
+```
+  
+關閉對應的優化器選項，可以看到 CBO 受到設置的參數的影響，選擇了 seq scan 的執行計劃，而沒有用到字段上的索引。
+
+```sql
+postgres=# set enable_indexscan=off;
+SET
+postgres=# set enable_bitmapscan=off;
+SET
+postgres=# explain analyze select * from tb_l1 where oid=17721;
+                                           QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
+Seq Scan on tb_l1  (cost=0.00..17.81 rows=1 width=274) (actual time=0.024..0.137 rows=1 loops=1)
+  Filter: (oid = '17721'::oid)
+  Rows Removed by Filter: 464
+Planning Time: 0.079 ms
+Execution Time: 0.192 ms
+(5 rows)
+```
+
+## 7 統計信息不準確
+  
+因為 CBO 本身是基於代價的優化器，而計算代價要根據統計信息去做計算，統計信息不準確，得到的執行計劃可能不是最優，這一點不做具體的舉例。
+
+## 8  Hints 影響執行計劃
+  
+[PostgreSQL 數據庫 ](https://so.csdn.net/so/search?q=PostgreSQL%E6%95%B0%E6%8D%AE%E5%BA%93&spm=1001.2101.3001.7020) 裡有著像 ORACLE 裡類似的 Hints 功能，即 pg\_hint\_plan 工具，用 Hints 能夠改變 sql 語句的執行計劃， hint 就是優化器的一種指示。雖然功能上和效果是類似的，但是 PostgreSQL 和 ORACLE 的 Hints 並不完全一致的，例如全表掃描等的關鍵字是不同的，需要進行區分。
+
+**準備環境**
+
+數據庫需安裝 pg\_hint\_plan 插件
+
+```sql
+create table test_hint(id int,c varchar(100));
+
+insert into test_hint select i,'test'||i from generate_series(1,10000) i;
+
+create index idx_test_hint_id on test_hint(id);
+```
+
+**測試**
+
+默認會走索引掃描，但是使用了 hint，讓其走了 seqscan，沒有使用到對應的字段上的索引。
+
+```sql
+postgres=# explain analyze select * from test_hint where id=10;
+                                                        QUERY PLAN                                                          
+-----------------------------------------------------------------------------------------------------------------------------
+Index Scan using idx_test_hint_id on test_hint  (cost=0.29..8.30 rows=1 width=12) (actual time=0.008..0.008 rows=1 loops=1)
+  Index Cond: (id = 10)
+Planning Time: 0.111 ms
+Execution Time: 0.024 ms
+(4 rows)
+ 
+postgres=# explain analyze select /*+seqscan(t) */ * from test_hint t where id=10;
+                                              QUERY PLAN                                              
+--------------------------------------------------------------------------------------------------------
+Seq Scan on test_hint t  (cost=0.00..180.00 rows=1 width=12) (actual time=0.022..2.691 rows=1 loops=1)
+  Filter: (id = 10)
+  Rows Removed by Filter: 9999
+Planning Time: 0.311 ms
+Execution Time: 2.712 ms
+(5 rows)
+```
+
+## 9 查詢條件中使用函數
+
+當查詢條件中包含函數調用時， PostgreSQL 裡可能無法使用索引，因為它需要對所有數據進行計算，而不是只計算索引值。
+
+**準備環境**
+
+```sql
+CREATE TABLE test_table (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    age INTEGER
+);
+
+CREATE INDEX age_index ON test_table(age);
+
+INSERT INTO test_table (name, age) VALUES
+    ('Alice', 25),
+    ('Bob', 30),
+    ('Charlie', 35),
+    ('David', 40),
+    ('Eve', 45),
+    ('Frank', 50);
+
+CREATE OR REPLACE FUNCTION search_age(p_age INTEGER) 
+RETURNS SETOF test_table AS $$
+BEGIN
+    RETURN QUERY SELECT * FROM test_table WHERE age > p_age;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+**測試**
+
+可以看到，當查詢條件中包含函數調用時，沒有使用到索引，而是使用了一個 Function Scan。這個 Function Scan 也是一種特殊的掃描方式，是從函數中獲取數據。 PostgreSQL 會調用指定的函數來處理查詢結果，並且會為函數的輸出結果創建一個虛擬的關係表，以便後續的節點可以使用這個關係表繼續執行查詢。
+
+```sql
+postgres=# EXPLAIN ANALYZE SELECT * FROM test_table WHERE age > 35;
+                                                    QUERY PLAN                                                    
+--------------------------------------------------------------------------------------------------------------------
+Bitmap Heap Scan on test_table  (cost=7.25..22.25 rows=400 width=40) (actual time=0.008..0.009 rows=3 loops=1)
+  Recheck Cond: (age > 35)
+  Heap Blocks: exact=1
+  ->  Bitmap Index Scan on age_index  (cost=0.00..7.15 rows=400 width=0) (actual time=0.004..0.004 rows=3 loops=1)
+        Index Cond: (age > 35)
+Planning Time: 0.075 ms
+Execution Time: 0.027 ms
+(7 rows)
+ 
+postgres=# EXPLAIN ANALYZE SELECT * FROM search_age(35);
+                                                 QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+Function Scan on search_age  (cost=0.25..10.25 rows=1000 width=40) (actual time=0.147..0.147 rows=3 loops=1)
+Planning Time: 0.027 ms
+Execution Time: 0.162 ms
+(3 rows)
+```
+
+## 10 查詢條件中有不等於運算符
+
+因為在索引掃描期間，不等於運算符會導致索引中的每一行都需要進行比較，因此需要走全表掃描，不會走索引。
+
+**環境準備**
+
+```sql
+postgres=# create table tb_l1 as select * from pg_class;
+SELECT 465
+postgres=# create index idx_tb_l1 on tb_l1(oid);
+CREATE INDEX
+```
+
+**測試**
+
+```sql
+postgres=# explain analyze select * from tb_l1 where oid<>17721;
+                                             QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+Seq Scan on tb_l1  (cost=0.00..17.81 rows=464 width=274) (actual time=0.007..0.063 rows=464 loops=1)
+  Filter: (oid <> '17721'::oid)
+  Rows Removed by Filter: 1
+Planning Time: 0.064 ms
+Execution Time: 0.091 ms
+(5 rows)
+ 
+postgres=# explain analyze select * from tb_l1 where oid =17721;
+                                                   QUERY PLAN                                                    
+-------------------------------------------------------------------------------------------------------------------
+Index Scan using idx_tb_l2 on tb_l1  (cost=0.27..8.29 rows=1 width=274) (actual time=0.019..0.021 rows=1 loops=1)
+  Index Cond: (oid = '17721'::oid)
+Planning Time: 0.107 ms
+Execution Time: 0.051 ms
+(4 rows)
+ 
+postgres=# explain analyze select * from tb_l1 where oid !=17721;
+                                             QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+Seq Scan on tb_l1  (cost=0.00..17.81 rows=464 width=274) (actual time=0.012..0.072 rows=464 loops=1)
+  Filter: (oid <> '17721'::oid)
+  Rows Removed by Filter: 1
+Planning Time: 0.071 ms
+Execution Time: 0.102 ms
+(5 rows)
+```
+
+
+## 11 數據類型不匹配
+
+當查詢條件中的值與索引列的數據類型不一致時， PostgreSQL 可能無法使用索引。例如，索引是 integer 類型，但查詢時使用了字符串，導致隱式類型轉換：
+
+```sql
+-- 假設 id 是整數類型，但查詢時傳遞字符串
+EXPLAIN ANALYZE SELECT * FROM test_table WHERE id = '100';  -- 隱式轉換
+```
+
+解決方案：確保查詢條件的數據類型與索引列完全一致。
+
+## 12 部分索引的限制
+
+如果索引是部分索引（ Partial Index），僅包含滿足特定條件的行，而查詢條件不匹配該條件時，索引不會被使用：
+
+```sql
+-- 創建僅包含 age > 30 的索引
+CREATE INDEX partial_age_index ON test_table(age) WHERE age > 30;
+
+-- 查詢 age <= 30 的語句不會使用該索引
+EXPLAIN ANALYZE SELECT * FROM test_table WHERE age = 25;
+```
+
+解決方案：確保查詢條件與部分索引的定義匹配，或創建完整索引。
+
+## 13 索引損壞
+
+索引文件損壞可能導致無法使用索引（罕見但可能發生）：
+
+```sql
+-- 檢查索引是否損壞
+REINDEX INDEX index_name;
+
+-- 強制使用索引（即使優化器認為代價高）
+SET enable_seqscan = off;
+EXPLAIN ANALYZE SELECT * FROM table_name WHERE column = value;
+```
+
+解決方案：定期維護索引，使用 REINDEX 修覆損壞的索引。
+
+## 14 覆合索引列順序
+覆合索引的列順序影響索引使用。若查詢未使用前綴列，索引可能失效：
+
+```sql
+-- 創建覆合索引 (a, b)
+CREATE INDEX idx_a_b ON table_name(a, b);
+
+-- 僅查詢 b 時，索引無法使用
+EXPLAIN ANALYZE SELECT * FROM table_name WHERE b = 10;
+```
+
+解決方案：
+1. 調整索引列順序，將高頻查詢列放在前面。
+2. 創建覆蓋索引： CREATE INDEX idx_b ON table_name(b)。
+
+## 15  IS NULL 或 IS NOT NULL 條件
+
+如果索引列包含大量 NULL 值，且查詢使用 IS NULL 或 IS NOT NULL，索引可能失效：
+
+```sql
+-- 索引列允許 NULL，但大多數值為 NULL
+CREATE INDEX idx_nullable ON table_name(nullable_column);
+
+-- 查詢 IS NULL 可能走全表掃描
+EXPLAIN ANALYZE SELECT * FROM table_name WHERE nullable_column IS NULL;
+```
+
+解決方案：
+1. 使用部分索引： CREATE INDEX idx_null ON table_name(nullable_column) WHERE nullable_column IS NULL。
+2. 調整表設計，減少 NULL 值。
+
+## 16 並行查詢影響
+
+PostgreSQL 的並行查詢可能優先選擇全表掃描而非索引：
+
+```sql
+-- 強制關閉並行查詢
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN ANALYZE SELECT * FROM large_table WHERE column = value;
+```
+
+解決方案：根據數據分布調整並行查詢參數（如 max_parallel_workers_per_gather）。
+
+## 17 索引類型不匹配
+索引類型與查詢操作不兼容。例如， B-tree 索引無法加速 LIKE '%abc%，但 Gin 索引可以：
+
+```sql
+-- 創建 Gin 索引支持模糊查詢
+CREATE EXTENSION pg_trgm;
+CREATE INDEX gin_name_idx ON test_table USING gin (name gin_trgm_ops);
+
+-- 使用 Gin 索引加速模糊查詢
+EXPLAIN ANALYZE SELECT * FROM test_table WHERE name LIKE '%abc%';
+```
+
+解決方案：根據查詢模式選擇合適的索引類型（如 Gin、 Gist、 BRIN 等）。
+
+## 18 臨時表或未提交事務
+臨時表或未提交事務中的索引可能未被統計信息識別：
+
+```sql
+-- 在事務中插入大量數據但未提交
+BEGIN;
+INSERT INTO test_table (name, age) VALUES (...);
+-- 查詢可能不使用新數據的索引
+EXPLAIN ANALYZE SELECT * FROM test_table WHERE age = 30;
+COMMIT;
+```
+
+解決方案：提交事務後執行 ANALYZE 更新統計信息。
+
+## 19 表達式索引與查詢條件不匹配
+
+如果索引基於表達式（如函數或計算），但查詢條件未使用相同的表達式，索引將無法被使用。
+
+示例：
+
+```sql
+-- 創建表達式索引
+CREATE INDEX idx_lower_name ON test_table (LOWER(name));
+
+-- 查詢未使用相同表達式，索引失效
+EXPLAIN ANALYZE SELECT * FROM test_table WHERE name = 'Alice';  -- 不走索引
+```
+
+解決方案：
+
+確保查詢條件與表達式索引定義完全一致：
+
+```sql
+SELECT * FROM test_table WHERE LOWER(name) = 'alice';  -- 走索引
+```
+
+
+## 20 分區表未命中分區條件
+如果表是分區表（ Partitioned Table），但查詢未包含分區鍵條件，優化器可能掃描所有分區，導致索引失效。
+
+示例：
+
+```sql
+-- 創建分區表
+CREATE TABLE sales (id INT, sale_date DATE, amount NUMERIC) 
+    PARTITION BY RANGE (sale_date);
+
+CREATE TABLE sales_2023 PARTITION OF sales 
+    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+
+CREATE INDEX idx_sales_date ON sales(sale_date);
+
+-- 未指定分區鍵的查詢會掃描所有分區
+EXPLAIN ANALYZE SELECT * FROM sales WHERE amount > 1000;  -- 全表掃描
+```
+
+解決方案：
+
+查詢時始終包含分區鍵條件：
+1. 
+```sql
+SELECT * FROM sales 
+WHERE sale_date BETWEEN '2023-01-01' AND '2023-12-31' 
+AND amount > 1000;
+```
+2. 對每個分區單獨創建索引。
+
+
 # 附錄、索引選擇速查表
 
 > 以下為 PostgreSQL 各索引類型的場景對照與 SQL Server 對應概念，適合作為快速查閱。
