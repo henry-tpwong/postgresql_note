@@ -1,8 +1,8 @@
 # PostgreSQL Lock 機制完全指南
 
-> 本文由 8 篇 PostgreSQL Lock 主題筆記合併整理而成，涵蓋從鎖的基礎概念、內部機制、監控除錯，到 Advisory Lock 的 4 個實戰應用場景（高並發更新、秒殺、排隊控制、無縫 ID）。
+> 本文由 8 篇 PostgreSQL Lock 主題筆記合併整理而成，加上新增的「行鎖 vs 表鎖深度解析」章節，涵蓋從鎖的基礎概念、內部機制、監控除錯，到 Advisory Lock 的 4 個實戰應用場景（高並發更新、秒殺、排隊控制、無縫 ID），以及 PG 與 DB2/MSSQL 在鎖升級上的根本架構差異。
 >
-> **閱讀路徑**：新手建議從頭依序閱讀（第一篇 §1~§5 打基礎 → 第二篇 §1~§5 學應用）。有經驗的讀者可直接跳到需要的場景。
+> **閱讀路徑**：新手建議從頭依序閱讀（第一篇 §1~§5 打基礎 → 第二篇 §1~§5 學應用）。有 DB2/MSSQL 背景的讀者可直接跳到**第三篇**理解行鎖機制與無鎖升級原理。有經驗的 PG 讀者可跳到需要的場景。
 >
 > 原始來源：[digoal（德哥）blog](https://github.com/digoal/blog) 系列文章，補充 PG 9.6~18 現代化演進與 Senior Dev 實戰註解。
 
@@ -86,6 +86,53 @@ sequenceDiagram
 
 即使是 `SELECT`，只要在 transaction 內（`BEGIN` 之後未 `COMMIT`），對 table 持有的 `AccessShareLock` 直到 transaction 結束才釋放。這意味著一個「閒置的 long transaction」可以長時間持有 shared lock。
 
+> **為什麼 `SELECT` 拿的是表級鎖、不是行鎖？**
+>
+> `AccessShareLock` **只有表級版本，沒有行級版本**。純 `SELECT`（不帶 `FOR UPDATE` / `FOR SHARE`）完全不會碰行鎖——tuple header 的 `xmax` 保持不動：
+>
+> ```
+> SELECT * FROM users WHERE id = 1;
+> 
+> 拿的鎖：
+>   表級：AccessShareLock ✅     ← 只擋 AccessExclusiveLock（DDL），不擋任何 DML
+>   行級：無                     ← MVCC snapshot 保證讀取一致性，根本不需要行鎖
+> ```
+>
+> 行鎖（`xmax`）是寫操作（`UPDATE` / `DELETE` / `SELECT FOR UPDATE`）才會碰的東西。純讀取的安全性完全由 **MVCC snapshot** 保障——交易開始時拍一張快照，並行寫入自動不可見，不需要靠鎖來保護讀取。這也是 PostgreSQL 跟 DB2/MSSQL 的根本差異之一：讀取在 PG 中是零鎖開銷的。
+
+> **補充：裸 SELECT 不寫 BEGIN 就沒事了嗎？**  
+> PostgreSQL 預設 `AUTOCOMMIT = ON`——當你直接在 psql 輸入 `SELECT * FROM users;` 時，PG 在背後自動幫你包一層隱式 transaction：`自動 BEGIN → SELECT → 自動 COMMIT`。整個過程通常不到 1ms，所以「跑完就釋放」和「COMMIT 才釋放」**在這種情況下根本是同一件事**。  
+>   
+> 真正會出事的，是以下兩種場景：  
+> 1. **你手動寫了 `BEGIN`**，跑完 `SELECT` 後忘了 `COMMIT`——鎖從此懸掛  
+> 2. **ORM / 連線工具關掉了 autocommit**——每條看似裸的 SQL 背後其實是一座沒關門的 transaction  
+>   
+> ```mermaid
+> sequenceDiagram
+>     participant Auto as 裸 SELECT<br/>(AUTOCOMMIT=ON)
+>     participant Manual as 顯式 BEGIN<br/>(AUTOCOMMIT=OFF 或手動)
+>     participant LM as Lock Manager
+> 
+>     Note over Auto: PG 自動 BEGIN（隱式）
+>     Auto->>LM: AccessShareLock
+>     Note over Auto: SELECT 執行中...（0.1ms）
+>     Note over Auto: PG 自動 COMMIT（隱式）
+>     Auto->>LM: 釋放 AccessShareLock ✅
+>     Note over Auto,LM: 全程不到 1ms<br/>鎖幾乎瞬間釋放，沒問題
+> 
+>     Manual->>Manual: BEGIN（手動）
+>     Manual->>LM: AccessShareLock
+>     Note over Manual: SELECT 執行中...（0.1ms）
+>     Note over Manual: SELECT 跑完了，但沒 COMMIT
+>     Note over LM: 🔴 鎖還是掛著！
+>     Note over Manual: 程式跑去處理別的事...
+>     Note over LM: 10 分鐘後，鎖還在 💀
+>     Manual->>Manual: COMMIT（終於）
+>     Manual->>LM: 釋放 AccessShareLock
+> ```
+> 
+> **一句話**：裸 `SELECT`（autocommit）很安全；但一旦進入顯式 transaction，鎖的生命週期就從「SQL 執行時間」變成了「你忘記 COMMIT 的時間」。
+
 常見觸發源：
 - **ORM 框架**自動開啟 implicit transaction，開發者忘記 commit
 - **pgAdmin / DBeaver 查詢後未 commit**，而 auto-commit 被關閉
@@ -103,7 +150,7 @@ WHERE state = 'idle in transaction'
   AND now() - xact_start > interval '5 minutes';
 ```
 
-建議在 production 設定 `idle_in_transaction_session_timeout`（PG 9.6+），例如 10min，自動 kill 這些 zombie transaction。
+建議在 production 設定 `idle_in_transaction_session_timeout`（PG 9.6+），預設值為 `0`（**關閉，不限時**）。設為 `10min` 後，任何 transaction 在 `idle in transaction` 狀態超過 10 分鐘，PG 會自動發送 `SIGTERM` 終止該 session 並 `ROLLBACK`，釋放其持有的所有鎖。
 
 ```mermaid
 sequenceDiagram
@@ -147,6 +194,20 @@ sequenceDiagram
 ### I. 核心發現：pg_get_indexdef 請求的是 Table Lock，非 Index Lock
 
 當你對一個表執行 DDL（如 `ALTER TABLE ... ADD COLUMN`）時，該表被加上 `AccessExclusiveLock`。此時你可能覺得只讀 index 定義不受影響——**但實際上 `pg_get_indexdef()` 會請求該 index 的父表 `AccessShareLock`**，因此被 DDL 阻塞。
+
+> **補充：ADD COLUMN 到底多快？會不會把整張表卡死？**
+>
+> `AccessExclusiveLock` 跟所有鎖衝突，所以 **ADD COLUMN 期間確實連 SELECT 都會被擋**。但實際影響取決於寫法：
+>
+> | 寫法 | 底層行為 | 耗時 |
+> |------|---------|------|
+> | `ADD COLUMN x INT;`（nullable，無 default） | 只改 catalog，不碰資料行 | **毫秒級**，表再大都一樣 |
+> | `ADD COLUMN x INT DEFAULT 42;`（PG 11+） | default 存在 catalog，不 rewrite 表 | **毫秒級** |
+> | `ADD COLUMN x INT NOT NULL;` | 需全表掃描檢查每行是否 NULL | **取決於表大小**，可能很久 |
+>
+> 也就是說，nullable + 無 default 的 ADD COLUMN 是瞬間完成的——即使 1TB 的表，SELECT 也只被卡幾毫秒。真正危險的是 `ADD COLUMN ... NOT NULL`（全表掃描期間表級鎖全程持有）以及舊版 PostgreSQL 的 volatile default。
+>
+> **至於查 table schema（`\d table`、`information_schema.columns` 等）**，底層拿的是 `AccessShareLock`——跟 `SELECT` 同一級。所以查 schema **不會阻塞任何 DML**，只會被正在跑的 DDL 阻塞；反過來，查 schema 本身也不會卡住別人。
 
 **複現：**
 
@@ -205,6 +266,7 @@ sequenceDiagram
 1. Session A 運行一個大型 `SELECT`（無鎖，但事務未結束）
 2. Session B 想對同表執行 DDL → 請求 `AccessExclusiveLock` → 因為 A 的事務未結束，B 進入 waiting queue
 3. Session C 想讀取該表（`SELECT`，需要 `AccessShareLock`）→ **也被 B 阻塞**，因為 B 在 waiting queue 中
+4. Session D 同樣執行 `SELECT`（需要 `AccessShareLock`）→ **下場與 C 完全一樣**，明明跟 A 不衝突，卻被 pending 的 B 卡在門外
 
 ```mermaid
 sequenceDiagram
@@ -226,6 +288,7 @@ sequenceDiagram
 
     D->>LM: SELECT → AccessShareLock
     LM-->>D: ❌ 也被 B 阻擋！
+    Note over D,LM: D 跟 C 處境一模一樣<br/>明明跟 A 不衝突<br/>卻被 pending 的 B 擋在外面
 
     Note over LM,D: 結果：只有 A 能正常工作<br/>B、C、D 全部卡住<br/>整張表癱瘓！
 ```
@@ -259,10 +322,93 @@ ORDER BY query_start;
 **4. 使用 CONCURRENTLY 替代傳統 DDL：**
 
 ```sql
-CREATE INDEX CONCURRENTLY idx_test ON test (col);  -- ShareUpdateExclusiveLock
+-- 傳統寫法：拿 ShareLock (Level 5)，會阻塞所有 INSERT / UPDATE / DELETE
+CREATE INDEX idx_test ON test (col);
+
+-- CONCURRENTLY 寫法：拿 ShareUpdateExclusiveLock (Level 4)，不阻塞 DML
+CREATE INDEX CONCURRENTLY idx_test ON test (col);
 ```
 
-注意：`ALTER TABLE ADD COLUMN` 至今仍需 `AccessExclusiveLock`（PG 18 仍如此），無法繞過。
+**CONCURRENTLY 內部機制（三步驟建索引）：**
+
+傳統 `CREATE INDEX` 一次全表掃描就收工，但全程持有 `ShareLock`——期間所有 `INSERT` / `UPDATE` / `DELETE`（需要 `RowExclusiveLock`，Level 3）全部被擋。`CONCURRENTLY` 則把建立索引拆成**三次掃描**，付出的代價雖然是稍慢（三次掃碼自然比一次久），但換來的是它只拿 `ShareUpdateExclusiveLock`（Level 4），**完全不跟 `RowExclusiveLock` 衝突**——DML 照跑，線上交易不受影響。
+
+> **實例對比：哪些操作從「被卡死」變成「可以跑」？**
+>
+> **例 1：INSERT**——傳統 `CREATE INDEX` 期間，任何 `INSERT` 都被 `ShareLock` 擋住，App 端直接積壓。改用 `CONCURRENTLY` 後，`INSERT` 拿的 `RowExclusiveLock`（Level 3）與 `ShareUpdateExclusiveLock`（Level 4）完全不衝突，**App 端的寫入請求照常執行，用戶無感**。
+>
+> **例 2：UPDATE / DELETE**——情境同上。傳統寫法下，即使只 `UPDATE` 一行，也要等整個索引建完（大表可能數分鐘到數小時）。`CONCURRENTLY` 下 `UPDATE` / `DELETE` 拿的 `RowExclusiveLock` 照樣可以跟索引建構並行，**線上交易零中斷**。
+>
+> ```mermaid
+> sequenceDiagram
+>     participant CI as CREATE INDEX<br/>(ShareLock)
+>     participant CIC as CREATE INDEX CONCURRENTLY<br/>(ShareUpdateExclusiveLock)
+>     participant DML as INSERT / UPDATE / DELETE<br/>(RowExclusiveLock)
+> 
+>     Note over CI,DML: 傳統方式——衝突！
+>     CI->>CI: ShareLock 🔒
+>     DML->>CI: 請求 RowExclusiveLock
+>     CI-->>DML: ❌ 衝突！等索引建完
+>     Note over DML: App 端寫入卡死 💀
+> 
+>     Note over CIC,DML: CONCURRENTLY 方式——互不干擾
+>     CIC->>CIC: ShareUpdateExclusiveLock 🔒
+>     DML->>CIC: 請求 RowExclusiveLock
+>     CIC-->>DML: ✅ 不衝突！同時執行
+>     Note over CIC,DML: 索引一邊建、DML 一邊跑 ✅
+> ```
+>
+> 簡言之，`CREATE INDEX CONCURRENTLY` 讓原本會被傳統 `CREATE INDEX` 長時間堵死的**所有寫入操作（INSERT / UPDATE / DELETE）全部解鎖**——代價只是索引建構時間變長（2~3 倍）。對需要 24x7 運行的 OLTP 系統來說，這筆交易非常划算。
+
+| 步驟 | 動作 | 持有的鎖 |
+|:----:|------|---------|
+| **Step 1** | 掃描全表，建立索引條目（不含正在進行中的 transaction 的變更） | `ShareUpdateExclusiveLock` |
+| **Step 2** | 再次掃描，補上 Step 1 期間新提交的 row（等 pending transaction 完成） | `ShareUpdateExclusiveLock` |
+| **Step 3** | 最後一次掃描，確認無遺漏 → 將索引標記為 valid → 啟用 | `ShareUpdateExclusiveLock` |
+
+> **新手白話**：傳統索引建立就像「圖書館閉館一天，一個人進去把所有書上架」。CONCURRENTLY 就像「圖書館照常營業，館員趁沒人注意時分批上架」——慢了一點，但讀者從頭到尾都可以進出。
+
+**CONCURRENTLY 支援的操作：**
+
+| 操作 | 語法 | 替代的傳統寫法 |
+|------|------|-------------|
+| 建索引 | `CREATE INDEX CONCURRENTLY` | `CREATE INDEX`（拿 ShareLock） |
+| 重建索引 | `REINDEX INDEX CONCURRENTLY`（PG 12+） | `REINDEX INDEX`（拿 AccessExclusiveLock） |
+| 刪索引 | `DROP INDEX CONCURRENTLY` | `DROP INDEX`（拿 AccessExclusiveLock） |
+
+**代價與注意事項：**
+
+- **效能**：三次全表掃描，總耗時約為傳統寫法的 2~3 倍
+- **交易隔離**：必須在 `AUTOCOMMIT = ON` 的環境下執行（不能包在 `BEGIN ... COMMIT` 裡）
+- **中途異常**：如果 Step 2 或 Step 3 期間有 unique violation（別人的寫入造成索引鍵重複），整個操作會失敗，留下一個 `INVALID` 狀態的索引——需要手動 `DROP INDEX CONCURRENTLY` 清理後重試
+- **暫存磁碟空間**：建構期間持續寫入尚未標記為 valid 的索引頁，需要額外磁碟空間
+
+> **限制與實戰對策**：`ALTER TABLE ADD COLUMN` 沒有 CONCURRENTLY 版本，至今仍需 `AccessExclusiveLock`（PG 18 仍如此），無法繞過。這是 PG 最頑固的 DDL 瓶頸，但可以透過**分段策略**把傷害降到最低：
+>
+> **核心思路**：nullable + 不給 default = 瞬間完成。後續的 non-null / default 需求用批次 DML 補上，避免讓 DDL 本身成為瓶頸。
+>
+> **標準三步策略：**
+>
+> ```sql
+> -- Step 1：瞬間完成，只鎖幾毫秒（只改 catalog，不碰資料行）
+> ALTER TABLE users ADD COLUMN age INT;  -- nullable, 無 default
+>
+> -- Step 2：批次回填（分批 UPDATE，每批只鎖少數行，不影響並行寫入）
+> -- 使用 SKIP LOCKED 或 advisory lock 分片類似二篇 §2 的策略
+> UPDATE users SET age = 0 WHERE age IS NULL AND id BETWEEN 1 AND 1000;
+> UPDATE users SET age = 0 WHERE age IS NULL AND id BETWEEN 1001 AND 2000;
+> -- ... 重複直到全表填完
+>
+> -- Step 3：最後才加 NOT NULL（如果業務需要）
+> ALTER TABLE users ALTER COLUMN age SET NOT NULL;  -- 全表掃描驗證無 NULL，但此時表裡已經沒 NULL 了
+> ```
+>
+> | 做法 | AccessExclusiveLock 持鎖時間 | 風險 |
+> |------|:--:|------|
+> | `ADD COLUMN x INT DEFAULT 0 NOT NULL` 一步到位 | **全表 rewrite 時間** | 鎖全程持有，大表直接癱瘓 |
+> | `ADD COLUMN x INT`（nullable 無 default）→ 批次 UPDATE → `SET NOT NULL` | Step1 幾 ms / Step3 僅掃描不 rewrite | 每個階段都極短，可控可中斷 |
+>
+> **為什麼連 DEFAULT 都不建議放在 ADD COLUMN 裡？** 即使 PG 11+ 的 volatile default 已最佳化為 catalog-only（不 rewrite），但一旦同時加 `NOT NULL`，PG 仍需要驗證全表沒有 NULL——這一步拿的還是 `AccessExclusiveLock`，鎖全程。拆開執行讓 nullable ADD 瞬間跑完、確認沒有 NULL 後再 `SET NOT NULL`，把風險降到最低。
 
 > **原始碼關鍵函數速查**：
 >   - `relation_open()`（`relation.c`）→ 打開 relation 時自動拿鎖，是「隱式鎖」的根源
@@ -378,69 +524,78 @@ flowchart LR
 使用以下 SQL 找出鎖等待鏈（誰阻塞了誰）：
 
 ```sql
-WITH t_wait AS (
-    SELECT a.mode, a.locktype, a.database, a.relation,
-           a.page, a.tuple, a.classid,
-           a.objid, a.objsubid, a.pid, a.virtualtransaction,
-           a.virtualxid, a.transactionid,
-           b.query, b.xact_start, b.query_start,
-           b.usename, b.datname
-    FROM pg_locks a, pg_stat_activity b
-    WHERE a.pid = b.pid AND NOT a.granted
-),
-t_run AS (
-    SELECT a.mode, a.locktype, a.database, a.relation,
-           a.page, a.tuple,
-           a.classid, a.objid, a.objsubid, a.pid,
-           a.virtualtransaction, a.virtualxid,
-           a.transactionid, b.query, b.xact_start,
-           b.query_start, b.usename, b.datname
-    FROM pg_locks a, pg_stat_activity b
-    WHERE a.pid = b.pid AND a.granted
-)
+-- 方法一：列出所有正在等待鎖的 session，以及誰擋住了它
 SELECT
-    r.locktype, r.mode AS r_mode,
-    r.usename AS r_user, r.datname AS r_db,
-    r.relation::regclass, r.pid AS r_pid,
-    r.xact_start AS r_xact_start,
-    now() - r.query_start AS r_locktime,
-    r.query AS r_query,
-    w.mode AS w_mode,
-    w.pid AS w_pid,
-    now() - w.query_start AS w_locktime,
-    w.query AS w_query
-FROM t_wait w, t_run r
-WHERE r.locktype IS NOT DISTINCT FROM w.locktype
-  AND r.database IS NOT DISTINCT FROM w.database
-  AND r.relation IS NOT DISTINCT FROM w.relation
-  AND r.page IS NOT DISTINCT FROM w.page
-  AND r.tuple IS NOT DISTINCT FROM w.tuple
-  AND r.classid IS NOT DISTINCT FROM w.classid
-  AND r.objid IS NOT DISTINCT FROM w.objid
-  AND r.objsubid IS NOT DISTINCT FROM w.objsubid
-  AND r.transactionid IS NOT DISTINCT FROM w.transactionid
-  AND r.pid <> w.pid
-ORDER BY (
-    (CASE w.mode WHEN 'AccessShareLock' THEN 1 WHEN 'RowShareLock' THEN 2
-     WHEN 'RowExclusiveLock' THEN 3 WHEN 'ShareUpdateExclusiveLock' THEN 4
-     WHEN 'ShareLock' THEN 5 WHEN 'ShareRowExclusiveLock' THEN 6
-     WHEN 'ExclusiveLock' THEN 7 WHEN 'AccessExclusiveLock' THEN 8 ELSE 0 END) +
-    (CASE r.mode WHEN 'AccessShareLock' THEN 1 WHEN 'RowShareLock' THEN 2
-     WHEN 'RowExclusiveLock' THEN 3 WHEN 'ShareUpdateExclusiveLock' THEN 4
-     WHEN 'ShareLock' THEN 5 WHEN 'ShareRowExclusiveLock' THEN 6
-     WHEN 'ExclusiveLock' THEN 7 WHEN 'AccessExclusiveLock' THEN 8 ELSE 0 END)
-) DESC, r.xact_start;
+    blocked.pid              AS blocked_pid,
+    blocked.usename          AS blocked_user,
+    blocked.query            AS blocked_query,
+    now() - blocked.wait_start AS blocked_wait_duration,
+    blocking.pid             AS blocking_pid,
+    blocking.usename         AS blocking_user,
+    blocking.query           AS blocking_query,
+    now() - blocking.xact_start AS blocking_xact_duration,
+    blocking.state           AS blocking_state
+FROM pg_stat_activity blocked
+JOIN pg_stat_activity blocking
+    ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
+WHERE blocked.wait_event_type = 'Lock'
+  AND blocked.state <> 'idle'
+ORDER BY blocked.wait_start;
 ```
 
-> PG 9.6+ 簡化版：`SELECT * FROM pg_stat_activity WHERE pid = ANY(pg_blocking_pids(<blocked_pid>))`
+```sql
+-- 方法二：遞迴展開整條等待鏈（A ← B ← C ← ...）
+WITH RECURSIVE lock_chain AS (
+    -- 起點：所有正在等待鎖的 session
+    SELECT
+        pid,
+        wait_start,
+        array[pid] AS chain_pids,
+        1 AS depth
+    FROM pg_stat_activity
+    WHERE wait_event_type = 'Lock'
+      AND state <> 'idle'
+
+    UNION ALL
+
+    -- 往上找：誰在擋這個 session
+    SELECT
+        blk.pid,
+        lc.wait_start,
+        lc.chain_pids || blk.pid,
+        lc.depth + 1
+    FROM lock_chain lc
+    JOIN pg_stat_activity blk
+        ON blk.pid = ANY(pg_blocking_pids(lc.pid))
+    WHERE NOT blk.pid = ANY(lc.chain_pids)  -- 防止死循環
+)
+SELECT DISTINCT ON (chain_pids[1])
+    chain_pids[1]                       AS blocked_pid,
+    now() - wait_start                  AS blocked_wait,
+    chain_pids[array_length(chain_pids, 1)] AS root_blocker_pid,
+    array_to_string(chain_pids, ' ← ')  AS wait_chain,
+    depth
+FROM lock_chain
+ORDER BY chain_pids[1], depth DESC;
+```
+
+| 欄位 | 含義 |
+|------|------|
+| `blocked_pid` | 被卡住的 session PID |
+| `blocked_wait_duration` | 等了多久 |
+| `blocking_pid` / `root_blocker_pid` | 誰在擋（方法一查直接阻擋者，方法二查根源） |
+| `wait_chain` | 完整等待鏈，如 `12345 ← 12367 ← 12389` |
+| `blocking_state` | 阻擋者目前狀態——若是 `idle in transaction` 代表忘了 COMMIT |
+
+> 方法一適合日常排查（一鍵找阻塞者）。方法二適合複雜死鎖場景——當 A 等 B、B 等 C、C 等 D 時，`wait_chain` 會顯示完整的 `pid1 ← pid2 ← pid3 ← pid4` 鏈，直接定位鏈尾根源。
 
 ### IV. 根治方案
 
 | 方案 | 做法 |
 |------|------|
-| **強制 Lock Timeout** | `SET lock_timeout = '5s';` — 等待超時自動 cancel |
+| **強制 Lock Timeout** | `SET lock_timeout = '5s';` — 等待超時自動 cancel。適用任何 SQL，但**實務上最常用在 DDL**：DDL 拿 `AccessExclusiveLock`，最容易卡在 lock queue 等不到、卡住後又引發 pileup（見 §2.III）。DDL 等不到鎖就直接 cancel 是正確行為——排隊等下去只會癱瘓整張表。DML 也可用但謹慎：正常寫入衝突本來就該排隊，設太短反而誤傷 |
 | **Connection Pool 管理** | PgBouncer 設定 idle connection timeout |
-| **idle_in_transaction_session_timeout** | PG 9.6+，自動 terminate idle-in-transaction |
+| **idle_in_transaction_session_timeout** | PG 9.6+，自動 terminate idle-in-transaction，預設 `0`（關閉） |
 | **監控 Lock Chain 與告警** | 定時執行上述 lock chain SQL，queue 過長 → alert |
 | **DDL 執行規範** | DDL 前檢查 `pg_stat_activity` + `lock_timeout` 保護 + 考慮 online tooling |
 
@@ -448,7 +603,7 @@ ORDER BY (
 > 1. 所有 DDL 在執行前應檢查是否有 idle-in-transaction
 > 2. DDL 加 `lock_timeout` 保護（如 `SET lock_timeout = '2s'; ALTER TABLE ...;`）
 > 3. 可使用 `LOCK TABLE ... NOWAIT` 測試鎖是否可立即取得
-> 4. 大表的 DDL 考慮用 online tooling：`pg_repack`、`CREATE INDEX CONCURRENTLY`
+> 4. 大表的 DDL 考慮用 online tooling：`pg_repack`（詳見下方 §5）、`CREATE INDEX CONCURRENTLY`（詳見 §2.IV）
 
 > **原始碼關鍵函數速查**：
 >   - `pg_blocking_pids()` → PG 9.6+ 內建函數，直接查誰在擋你，底層調用 `GetBlockerPidsData()`
@@ -456,12 +611,157 @@ ORDER BY (
 >   - `idle_in_transaction_session_timeout` 的實現：檢查 `xact_start` 和 `state`，超時的 session 會被發送 SIGTERM
 >   - spinlock 競爭：當大量 backend 同時搶 lock，lock manager 的內部 spinlock (`LWLock` 系列) 競爭急劇上升
 
+### V. pg_repack：不停機的表空間重組
+
+> 雖然 `pg_repack` 不是 PostgreSQL 內建功能（PG 17 仍需手動安裝），但它是 **OLTP 環境最實用的 online DDL 工具之一**，與鎖機制深度相關，值得獨立一節說明。
+
+#### A. 問題：為什麼 `VACUUM FULL` 和 `CLUSTER` 不適合生產環境
+
+當一張大表頻繁 `UPDATE` / `DELETE` 後，dead tuple 堆積、實體儲存不連續，查詢效能下降。PG 內建有兩個解決方案：
+
+> **什麼是 dead tuple 與 bloat？**
+>
+> PostgreSQL 的 `UPDATE` **不是在原位置修改資料**——它是「標記舊版本為無效、插入一個新版本」。`DELETE` 也不是真的刪除，只是標記 `xmax = 當前 txid`。這些被標記但尚未被 `VACUUM` 清理的舊版本就是 **dead tuple（死元組）**。
+>
+> 當一張表被反覆 UPDATE 後，dead tuple 會像垃圾一樣塞在原本的資料頁中。Seq Scan 掃表時，PG 還是要讀過這些 dead tuple 再跳過（因為 MVCC 要判斷可見性）——表檔案越來越大、但「有效資料」其實沒那麼多。這就是 **bloat（膨脹）**。
+>
+> 同時，「實體儲存不連續」指的是：行的邏輯順序(主鍵順序)和磁碟上的實體順序不一致——例如 `id=1` 在頁面 100、`id=2` 卻在頁面 3。範圍查詢 `WHERE id BETWEEN 1 AND 100` 本來只該讀一兩頁，結果因為資料四散，變成要隨機讀幾十頁。
+>
+> ```mermaid
+> flowchart TD
+>     subgraph initial["初期：compact（緊密且有序）"]
+>         P1A["page 1<br/>⬛ id=1 | ⬛ id=2 | ⬛ id=3 | __"]
+>         P2A["page 2<br/>⬛ id=4 | ⬛ id=5 | ⬛ id=6 | __"]
+>         P3A["page 3<br/>⬛ id=7 | ⬛ id=8 | ⬛ id=9 | __"]
+>     end
+>
+>     subgraph after_blast["經過大量 UPDATE / DELETE 後：bloat + 離散"]
+>         P1B["page 1<br/>💀 dead(id=1) | ⬛ id=2(v2) | 💀 dead(id=2v1) | __"]
+>         P2B["page 2<br/>💀 dead(id=4) | 💀 dead(id=5) | ⬛ id=10(new) | __"]
+>         P3B["page 3<br/>⬛ id=7(v2) | 💀 dead(id=7v1) | 💀 dead(id=8) | ⬛ id=99(new)"]
+>     end
+>
+>     subgraph after_repack["VACUUM FULL / pg_repack 後：重新 compact"]
+>         P1C["page 1<br/>⬛ id=2 | ⬛ id=7 | ⬛ id=10 | ⬛ id=99"]
+>         P2C["page 2<br/>__ | __ | __ | __"]
+>         P3C["page 3<br/>__ | __ | __ | __"]
+>     end
+>
+>     initial -->|"大量 UPDATE"| after_blast
+>     after_blast -->|"pg_repack"| after_repack
+> ```
+>
+> 上圖範例：原本 3 頁存 9 行。經過大量 UPDATE 後 dead tuple 佔了大半空間（有效行只剩 4 行卻散在 3 頁裡），`id=10` 和 `id=99` 的新版本四散在不同的頁——這就是「不連續」。重整後變回 1 頁內有 4 行，空間回收、順序統一。
+>
+> **兩種「膨脹」的區別：**
+>
+> | | 空間膨脹（Dead Tuple Bloat） | 邏輯離散（Physical Scatter） |
+> |---|---|---|
+> | 成因 | UPDATE / DELETE 留下舊版本 | 新資料寫入時找不到原位，四散在別頁 |
+> | 影響 | Seq Scan 要讀大量無用頁 → IO 浪費 | 範圍查詢需要隨機讀多個頁面 → 快取命中率下降 |
+> | `VACUUM` 可解？ | 普通 `VACUUM` 可標記空間重用，但不還給 OS | ❌ 無法 |
+> | `VACUUM FULL` 可解？ | ✅ 可，但全程鎖表 | ✅ 可，但全程鎖表 |
+> | `pg_repack` 可解？ | ✅ 可，且不鎖表 | ✅ 可，且不鎖表 |
+>
+> **MSSQL 對照：VACUUM、REBUILD INDEX，傻傻分不清？**
+>
+> `VACUUM` 是 MVCC 引擎特有的垃圾回收機制，**MSSQL 沒有對等的東西**——因為 MSSQL 採用原地更新（in-place update），不產生 dead tuple。但這不代表 MSSQL 沒有碎片問題：
+>
+> | 概念 | PostgreSQL | MSSQL |
+> |------|-----------|-------|
+> | 舊版 row 清理 | `VACUUM`（autovacuum 自動觸發） | 無。只有 snapshot isolation 時在 tempdb version store 暫存舊版，由 background cleaner 自動清理 |
+> | 碎片整理 | `VACUUM FULL` / `CLUSTER` / `pg_repack` | `ALTER INDEX ... REORGANIZE`（線上，不鎖）或 `ALTER INDEX ... REBUILD`（可選 `ONLINE = ON`，Enterprise 限定） |
+> | 重建索引 | `REINDEX` / `REINDEX CONCURRENTLY` | `ALTER INDEX ... REBUILD` |
+>
+> **MSSQL REBUILD INDEX 該每天跑嗎？** 不建議。MSSQL 的維護策略是依碎片率決定：
+>
+> | 碎片率 | 建議 |
+> |--------|------|
+> | < 5% | 不動 |
+> | 5~30% | `ALTER INDEX ... REORGANIZE`（線上、不鎖、log 增長可控） |
+> | > 30% | `ALTER INDEX ... REBUILD`（可選 `ONLINE = ON`） |
+>
+> 每天無差別 REBUILD 的問題：log 暴增（等於重寫整個 index）、即使 `ONLINE` 最後切換仍需短暫 schema stability lock、低碎片 index 重建後效能提升為零。
+>
+> 實務上通常用 Ola Hallengren 之類的維護腳本，只在碎片超標時才動，頻率通常是**每週**而非每天。這跟 PG 的 `VACUUM` 定位完全不同——`VACUUM` 是防止表無限膨脹的**必需背景維護**，不是效能調優。
+
+| 操作 | 作用 | 鎖 | 大表執行時的後果 |
+|------|------|---|------|
+| `VACUUM FULL` | 回收 dead tuple 空間，壓縮表 | `AccessExclusiveLock` 全程持有 | 幾百 GB 的表可能鎖數小時，SELECT/DML 全部癱瘓 |
+| `CLUSTER` | 按 index 重排實體儲存順序 | `AccessExclusiveLock` 全程持有 | 同上，等同整張表下線 |
+
+`AccessExclusiveLock`（Level 8）跟所有鎖衝突——這就是蝴蝶效應（見 §3.II）的完美觸發器。
+
+#### B. pg_repack 五步驟原理
+
+`pg_repack` 把重組拆成五步，透過影子表（shadow table）和 trigger 機制，只在最後瞬間拿 `AccessExclusiveLock`：
+
+| 步驟 | 動作 | 持有的鎖 |
+|:----:|------|------|
+| 1 | 建立一張空的「影子表」（結構與原表相同 + 目標 index） | 無鎖 |
+| 2 | 全量複製原表資料到影子表（按指定 index 順序寫入，類似 CLUSTER 效果） | `AccessShareLock`（與 SELECT 同級，不擋 DML） |
+| 3 | 在影子表上建立索引 | `AccessShareLock` |
+| 4 | 在原表上建立 trigger → 追蹤 Step 2~3 期間的增量 DML → 同步寫入影子表 | `AccessShareLock` |
+| 5 | 短暫拿 `AccessExclusiveLock` → 將影子表與原表交換 → 刪除舊表 → 釋放鎖 | **只鎖幾毫秒** |
+
+```mermaid
+sequenceDiagram
+    participant Orig as 原表 (users)
+    participant Shadow as 影子表
+    participant App as Application
+
+    Note over Orig,Shadow: Step 1-2：建立影子表並全量複製
+    Shadow->>Orig: 全量複製 (AccessShareLock)
+    App->>Orig: INSERT / UPDATE / DELETE──照常執行 ✅
+
+    Note over Orig,Shadow: Step 3-4：建索引 + trigger 同步增量
+    Shadow->>Orig: 追蹤變更並同步到影子表
+    App->>Orig: DML 繼續照跑 ✅
+
+    Note over Orig,Shadow: Step 5：最終切換（毫秒級）
+    Orig-->>Shadow: AccessExclusiveLock → 影子表變正式 → 釋放
+    App->>Orig: 只有這瞬間被擋 ⚡
+```
+
+#### C. 常用命令
+
+```bash
+# 重整單表（回收 dead tuple 空間 + 重建索引）
+pg_repack -t users -d mydb
+
+# 只重整特定索引（索引肥大時不用重整全表）
+pg_repack -i idx_users_email -d mydb
+
+# 按指定 index 順序重排實體儲存（等同 CLUSTER 但不鎖表，範圍查詢效能大幅提升）
+pg_repack -t users --order-by=users_pkey -d mydb
+```
+
+#### D. 與內建操作對比
+
+| | `VACUUM FULL` | `CLUSTER` | `pg_repack` |
+|---|---|---|---|
+| 內建 | ✅ | ✅ | ❌（需 `CREATE EXTENSION pg_repack`） |
+| 鎖等級 | `AccessExclusiveLock`（全程） | `AccessExclusiveLock`（全程） | 只在最後切換拿 `AccessExclusiveLock`（毫秒級） |
+| SELECT 中斷 | 全程堵死 | 全程堵死 | 不堵（只在最後瞬間） |
+| INSERT/UPDATE/DELETE 中斷 | 全程堵死 | 全程堵死 | 不堵（只在最後瞬間） |
+| 回收空間 | ✅ | ✅ | ✅ |
+| 重排實體順序 | ❌ | ✅ | ✅ |
+
+#### E. 限制與注意事項
+
+- **需要額外磁碟空間**：影子表等於原表大小（步驟 2~5 期間原表 + 影子表同時存在）
+- **不能放在 transaction 內**：`pg_repack` 是一個獨立的 CLI 工具，不走 SQL
+- **Superuser 權限**：需要建立 trigger、交換表名，必須 superuser
+- **不支援某些表類型**：partitioned table 的個別 partition 可以，但不能對整個 partitioned table 操作
+
+> 一句話：`pg_repack` = 不停機版的 `VACUUM FULL` + `CLUSTER`。它是 OLTP 環境中大表維護的標配工具，雖然需要額外安裝（`CREATE EXTENSION pg_repack`），但換來的是業務零中斷。
+
 ---
 
 ## 4. Lock Wait 追蹤與監控
 
 > 來源：[digoal - PostgreSQL 锁等待跟踪 (2016-03-18)](https://github.com/digoal/blog/blob/master/201603/20160318_02.md)
-> 更新於 2026-05-17，補充 PG 9.6~18 現代化監控技術棧
+> 更新於 2026-05-30，聚焦 PG 14+ 現代化監控技術棧
 
 ### I. 核心問題：lock wait time 被計入 total duration 但無拆分
 
@@ -489,7 +789,7 @@ flowchart TD
     style CPU fill:#6bcf7f
 ```
 
-### II. 方法一：log_lock_waits（無需重編譯）
+### II. 方法一：log_lock_waits（事後分析，無需重編譯）
 
 ```ini
 # postgresql.conf
@@ -512,9 +812,9 @@ LOG:  process 10220 acquired ShareLock on transaction 574614690 after 100194.020
 
 結合 auto_explain + log_lock_waits，可精確推算：總耗時 = lock wait + 實際運算。
 
-> PG 13 起 `log_lock_waits` 輸出還包含 wait_event 資訊。搭配 `log_line_prefix = '%m [%p] %q%a '` 中的 `%p`（PID），可以在單條 log 中完成 PID → query → wait duration 的全鏈路追蹤。
+> 搭配 `log_line_prefix = '%m [%p] %q%a '` 中的 `%p`（PID），可以在單條 log 中完成 PID → query → wait duration 的全鏈路追蹤。
 
-### III. 方法二：pg_stat_activity 實時監控（現代推薦）
+### III. 方法二：pg_stat_activity 即時監控（現代推薦，PG 14+）
 
 ```sql
 -- 找出所有正在等待 lock 的 session 及其等待時間
@@ -529,46 +829,26 @@ WHERE wait_event_type = 'Lock'
 ORDER BY wait_start;
 ```
 
-### IV. 方法三：LOCK_DEBUG 重編譯（最深粒度）
+`pg_stat_activity` 在 PG 14 引入 `wait_start` 欄位後成為最強的即時排查工具——不再需要從 log 反推等待時間，直接就能看到「誰卡了多久」以及「誰在擋他」。
 
-修改 `src/include/pg_config_manual.h` → `#define LOCK_DEBUG` → 重編譯 PG → 配置 `trace_locks = true`。輸出每個 lock acquire/release/grant/conflict check 的內部細節。
+### IV. 兩種方法選擇
 
-Lock ID 解碼格式 `id(db_oid, rel_oid, 0, block, tuple, 1)`：
-
-| Lock Mode | Bitmask | 說明 |
-|-----------|---------|------|
-| AccessShareLock | `1<<0` | SELECT |
-| RowShareLock | `1<<1` | SELECT FOR UPDATE / FOR SHARE |
-| RowExclusiveLock | `1<<2` | INSERT / UPDATE / DELETE |
-| ShareUpdateExclusiveLock | `1<<3` | VACUUM / ANALYZE / CREATE INDEX CONCURRENTLY |
-| ShareLock | `1<<4` | CREATE INDEX (non-concurrent) |
-| ShareRowExclusiveLock | `1<<5` | Triggers, some DDL |
-| ExclusiveLock | `1<<6` | REFRESH MATERIALIZED VIEW CONCURRENTLY |
-| AccessExclusiveLock | `1<<7` | ALTER TABLE / DROP TABLE / TRUNCATE |
-
-### V. 三種方法選擇矩陣
-
-| 方法 | 需要重編譯 | 適用場景 | 粒度 |
-|------|-----------|---------|------|
-| `log_lock_waits` | **否** | 生產環境常駐，日常 lock monitoring | lock type + waiting PID + duration |
-| `pg_stat_activity` | **否** | 即時排查，整合 wait_event + blocking chain | 實時 snapshot |
-| `LOCK_DEBUG` + `trace_locks` | **是** | 極端深度除錯、lock manager 內部行為分析 | 每個 lock acquire/release/grant/conflict check |
-
-> 現代 PG（14+）的 `pg_stat_activity.wait_event` 已覆蓋 80% 日常需求，再加上 `log_lock_waits` 和 `pg_blocking_pids()`，幾乎不需要再重編譯。
+| 方法 | 適用場景 | 優勢 |
+|------|---------|------|
+| `log_lock_waits` | 日常監控、事後分析、告警基礎 | 自動寫入 PG log，不佔 CPU，適合 24x7 常駐；搭配 `deadlock_timeout` 控制記錄粒度 |
+| `pg_stat_activity` | 即時排查、正在發生的問題 | 一鍵查出當前所有等待者、等待時間、blocking chain，零配置 |
 
 ```mermaid
 flowchart TD
     Q["你需要做什麼？"]
-    Q -->|"日常監控、事後分析"| L1["<b>log_lock_waits</b><br/>✅ 無需重編譯<br/>自動寫入 PostgreSQL log<br/>適合「出事後找原因」"]
-    Q -->|"即時排查、正在發生的事"| L2["<b>pg_stat_activity</b><br/>✅ 無需重編譯<br/>即時查 blocking chain<br/>適合「現在誰卡住了？」"]
-    Q -->|"深入了解 lock manager 內部"| L3["<b>LOCK_DEBUG</b><br/>❌ 需要重編譯 PG<br/>每個 lock acquire/release 都記錄<br/>適合「PG 鎖機制研究」"]
+    Q -->|"日常監控、事後分析"| L1["<b>log_lock_waits</b><br/>自動寫入 PostgreSQL log<br/>適合「出事後找原因」"]
+    Q -->|"即時排查、正在發生的事"| L2["<b>pg_stat_activity</b><br/>即時查 blocking chain + wait_duration<br/>適合「現在誰卡住了？」"]
 
     style L1 fill:#6bcf7f
     style L2 fill:#6bcf7f
-    style L3 fill:#ffd93d
 ```
 
-### VI. 生產環境配置（無需重編譯）
+### V. 生產環境配置
 
 ```ini
 # postgresql.conf
@@ -590,17 +870,13 @@ WHERE wait_event_type = 'Lock'
 
 | 功能 | 引入版本 |
 |------|---------|
-| `wait_event_type` / `wait_event` | PG 9.6 |
 | `pg_blocking_pids(pid)` | PG 9.6 |
-| `log_lock_waits` 增強（附加 wait_event） | PG 13 |
+| `wait_event_type` / `wait_event` | PG 9.6 |
+| `log_lock_waits` 輸出附加 wait_event | PG 13 |
 | `wait_start` | PG 14 |
 | `pg_stat_activity.wait_for` | PG 17 |
 
-> **原始碼關鍵函數速查**：
->   - `log_lock_waits` 的觸發路徑：`ProcSleep()` 中進入等待時記錄開始時間 → `deadlock_timeout` 觸發 `CheckDeadLock()` → 如仍在等則輸出一條 `LOG` 記錄
->   - `wait_event` 的實現：`pgstat_report_wait_start()` / `pgstat_report_wait_end()`，在進入/退出 lock 等待時更新 `pg_stat_activity.wait_event`
->   - `pg_blocking_pids()` → 底層函數 `GetBlockerPidsData()` 掃描 `pg_locks` 找到阻塞者
->   - `LOCK_DEBUG` 機制：編譯時定義巨集 → `trace_locks` GUC 參數控制輸出 → 每個 lock 操作都呼叫 `elog(DEBUG3, ...)`
+> PG 14+ 的 `pg_stat_activity` 已覆蓋絕大多數日常需求——`wait_start` 直接顯示等待多久、`pg_blocking_pids()` 直接找出誰在擋。加上 `log_lock_waits` 做為補強（事後分析 / 告警），不需要再重編譯 PG 或使用 LOCK_DEBUG。
 
 ---
 
@@ -613,6 +889,14 @@ WHERE wait_event_type = 'Lock'
 核心問題：PostgreSQL 中 table / index / sequence 等物件數量越多，單表操作的效能是否會下降？
 
 答案分兩層：對於**單表操作**（DML），效能幾乎不受影響；真正的隱患在於 **catalog metadata 的記憶體佔用**與 **shared lock table 的插槽上限**。
+
+> **名詞解釋：catalog metadata 的記憶體佔用**
+>
+> PostgreSQL 把每張表的結構資訊（欄位名、型別、index、constraint）存在系統表 `pg_class` / `pg_attribute` 等 catalog table 中。每個 backend connection 第一次訪問某張表時，會把這些 metadata 載入自己的記憶體快取（relcache）。relcache 是 **per-connection、不跨連線共享**的——100 個連線意味著同一份 table metadata 可能在記憶體中被複製了 100 份。
+>
+> **名詞解釋：shared lock table 的插槽**
+>
+> Lock Manager 在 shared memory 中維護一張固定大小的 hash table，每個「強鎖」（Level 3+，或發生衝突的弱鎖）需要在其中佔一個 slot。slot 總數由兩個參數決定：`max_locks_per_transaction ×（max_connections + max_prepared_transactions）`。slot 耗盡時 PG 報錯 `out of shared memory`——這不是 OS 記憶體真的用光，而是 lock table 的預留空間被填滿、無法再發出新鎖。
 
 > **新手白話**：想像一個圖書館有 50 萬本書 vs 只有 1 本書。你要拿一本書來看（單表 DML），找書的速度幾乎一樣——因為有索引目錄。但問題是：50 萬本書的「目錄卡片」本身就佔了 35GB 的空間，而且每個進來的人（每個 connection）都要複製一份目錄到自己的腦袋裡（per-backend relcache），這樣一下子記憶體就爆了。
 
@@ -677,54 +961,65 @@ flowchart LR
 
 > **新手白話**：每個 connection (backend) 都有自己的「小抄」(relcache)，存著它訪問過的表的結構資訊。50 萬張表雖然存在資料庫裡，但只要你的連線只訪問其中幾張，就不會全部載入。但如果你用 `pg_dump` 或 ORM 初始化時的「全表掃描」，就會把目錄裡所有表的資訊都載入記憶體——每個連線一份！
 
-**Lock Slot 耗盡機制：**
+**Application 層的放大效應：連線池讓 relcache 問題更嚴重**
 
-`max_locks_per_transaction` 控制 shared memory 中的 lock table slot 數量。公式：
+如果你是 .NET 8 + Dapper + Npgsql 的開發者，這一點特別重要——因為你**幾乎一定在用連線池**：
 
-```
-shared lock table size = max_locks_per_transaction * (max_connections + max_prepared_transactions)
-```
+| Client 寫法 | 底層 | PG 端 Backend 數量 | relcache 行為 |
+|---|---|---|------|---|
+| `new NpgsqlConnection()`（預設） | Npgsql Connection Pool，`Pooling=true`，預設 `MaxPoolSize=100` | 最多 100 個常駐 backend | 每個 backend 的 relcache 累積不釋放，100 份 metadata |
+| `NpgsqlDataSource`（Npgsql 7.0+，.NET 8 推薦） | 同上，只是封裝更乾淨 | 同上 | 同上 |
 
-若不足，報錯：`ERROR: out of shared memory` / `HINT: You might need to increase max_locks_per_transaction.`
-
-> PG 為常見的 weak lock（AccessShareLock、RowShareLock 等）提供了 fast-path 機制，這些 lock 不佔用 shared lock table slot，直到發生衝突時才遷移到 main table。因此 `max_locks_per_transaction = 64` 在大多數場景足夠。真正需要調大的情況：大批次 DDL、大量 concurrent transaction 同時對大量不同 table 取強鎖、pg_dump 並行模式。
+連線池的核心問題：PG 端 backend 是 **長生命週期**（應用程式活著就不回收），每個 backend 的 relcache 只增不減。如果 ORM 初始化階段掃過所有表的 schema（Entity Framework Core 會，純 Dapper 不會），每個池連線都會載入全套 metadata。
 
 ```mermaid
-flowchart TD
-    subgraph "lock table slot 分配機制"
-        FP["<b>Fast-Path (快速通道)</b><br/>弱鎖 (Level 1-2)<br/>不佔用 shared lock slot<br/>✅ 快速通過"]
-        MP["<b>Main Table (主表)</b><br/>強鎖或有衝突時<br/>佔用 shared lock slot<br/>⚠️ 數量有限"]
+flowchart LR
+    subgraph dotnet[".NET 8 App"]
+        DAP["Dapper"]
+        NP["NpgsqlDataSource<br/>Connection Pool (100)"]
+        DAP --> NP
     end
 
-    FP -->|"發生衝突時<br/>自動遷移"| MP
-    MP -->|"slot 耗盡時"| ERR["ERROR: out of shared memory<br/>💀 需要調大 max_locks_per_transaction"]
-    
-    style FP fill:#6bcf7f
-    style MP fill:#ffd93d
-    style ERR fill:#ff6b6b,color:#fff
+    subgraph pg["PostgreSQL Server"]
+        B1["Backend 1<br/>relcache: table_1, table_2, ...<br/>≈ 5MB"]
+        B2["Backend 2<br/>relcache: table_1, table_3, ...<br/>≈ 5MB"]
+        B3["... 100 個 backend"]
+        B100["Backend 100<br/>relcache: table_5, table_8, ...<br/>≈ 5MB"]
+    end
+
+    NP -->|"每個池連線對應 1 個長壽 backend"| B1
+    NP --> B2
+    NP --> B3
+    NP --> B100
+
+    Note1["⚠️ 100 backend × 5MB relcache = 500MB<br/>還沒算上 shared_buffers / work_mem"]
 ```
 
-> **新手白話**：PG 對於常見的弱鎖（像 SELECT 的 AccessShareLock）走「快速通道」，不佔用共享記憶體的 slot 配額。只有強鎖（Level 3+）或發生衝突時，才搬到主表佔用 slot。這是為什麼預設 64 個 slot 看起來很少，但大部分場景夠用的原因——弱鎖都走快速通道了。
+> **NpgsqlDataSource vs PgBouncer 的差別：**
+>
+> Npgsql 的連線池是 **client 端池**——每個 client process 自己維護 100 條連線，直接通向 PG。如果有 5 個 app instance，PG 端就會有 500 個 backend。
+>
+> PgBouncer（transaction pooling 模式）是 **server 端池**——放在 PG 前面，把大量的 client connection 收斂到少量（例如 20 個）PG backend：
 
-### IV. Catalog 掃描影響
+```
+無 PgBouncer：
+  .NET App × 5 → 各開 100 條連線 → PG Server 端 500 個 backend
+  → 500 份 relcache → 記憶體爆炸
 
-| 操作 | Catalog 掃描方式 | 大量 table 的影響 |
-|------|-----------------|------------------|
-| 單表 DML | Index lookup（OID / relname） | 幾乎無影響 |
-| autovacuum launcher cycle | 掃 `pg_class` 找候選 | 線性增長 |
-| pg_dump | 掃多張 catalog table | 線性增長 |
-| `\dt` / `\d` | 掃 `pg_class` + join | 線性增長 |
-| ORM / framework startup | 可能全掃 catalog | 易成為瓶頸 |
-| Logical replication startup | 逐表檢查 | 線性增長 |
+有 PgBouncer：
+  .NET App × 5 → 各開 100 條連線 → PgBouncer (500 conns)
+  → PgBouncer 只轉發到 PG 的 20 個 backend
+  → 20 份 relcache → 記憶體安全
+```
 
-> 實務建議：盡量避免單一 database 中有數十萬張獨立 table。如需隔離資料，優先考慮 Partition（PG 10+ declarative partitioning）或 schema-per-tenant。
+**對你的 stack 的具體建議：**
 
-> **原始碼關鍵函數速查**：
->   - `max_locks_per_transaction` 的初始化：`LockShmemSize()` 計算共享記憶體大小 → `InitLocks()` 分配 lock hash table
->   - fast-path 的實現：`FastPathGrantRelationLock()` 在 `lock.c` 中，弱鎖走 fast-path；`FastPathUnGrantRelationLock()` 釋放
->   - fast-path → main table 的遷移：`FastPathTransferRelationLocks()` — 當強鎖請求來時，把衝突的 fast-path lock 遷移到 main table
->   - relcache (relation cache) 的初始化：`RelationCacheInitialize()` → `RelationBuildDesc()` → 從 `pg_class`/`pg_attribute` 讀取並建立 cache 條目
->   - catalog 掃描成本：`systable_beginscan()` / `systable_endscan()` → 對系統表做 sequential scan 時成本隨 row 數線性增長
+| 場景 | 建議 |
+|------|------|
+| 用 Dapper（純手寫 SQL，不掃 schema） | 連線池安全，relcache 只載入你實際訪問的表 |
+| 用 EF Core（啟動時掃 `DbSet<>` 全部表） | 注意池大小，大量表時考慮 PgBouncer |
+| 多 app instance 連同一個 PG | 必有 PgBouncer，否則 backend 數量 = 各 instance 池大小總和 |
+| 表數量少（< 500 張） | 不需擔心，就算 100 backend 也吃不了多少記憶體 |
 
 ---
 
@@ -784,17 +1079,24 @@ sequenceDiagram
 
 > **選擇建議**：如果你需要「一筆交易裡拿到鎖，交易結束自動釋放」→ 用 **Transaction lock**（`xact` 系列）。如果你需要「跨多筆交易保持鎖定」→ 用 **Session lock**，但要記得手動 `unlock`，不然會鎖到 session 斷開。
 
-> Lock 數量無上限（不佔 `max_locks_per_transaction` slot，advisory lock 使用獨立的 shared memory hash table）。PG 9.6+ 可透過 `pg_locks` 查看：`SELECT * FROM pg_locks WHERE locktype = 'advisory'`。
+> **我什麼時候會真的用到 Advisory Lock？——四場景決策表**
+>
+> Advisory Lock 不是日常 CRUD 會碰到的東西——一般 `INSERT` / `UPDATE` / `DELETE` 的鎖都是 PG 自動管理。只有當你需要「**手動協調跨交易 / 跨 session 的互斥邏輯**」時才需要它。以下四個場景是實戰中最常見的：
+>
+> | 場景 | 核心問題 | Advisory Lock 的角色 | 有沒有更簡單的替代方案？ |
+> |------|---------|---------------------|----------------------|
+> | **高並發批次更新**（§2） | 100 個 session 同時更新 10,000 rows，如何不撞行？ | `pg_try_advisory_xact_lock(row_id)` 當作「這行我先搶了」的令牌 | `SKIP LOCKED`（PG 9.5+，更簡單，純 SQL） |
+> | **秒殺 / 限量搶購**（§3） | 1000 人搶 10 件商品，沒搶到的人應立刻知道失敗 | `FOR UPDATE NOWAIT` 或 `SKIP LOCKED` 讓沒拿到鎖的 session 立刻失敗 | 無，這兩者就是標準解法 |
+> | **OLTP 並發控管**（§4） | 8000 個連線同時搶 CPU，如何限制真正並行的數量？ | Advisory lock 當作「令牌」，只有拿到的人可以執行 SQL，其他人 sleep | PgBouncer transaction pooling（根本解，但需額外部署） |
+> | **無縫自增 ID**（§5） | 需要沒有空洞的遞增流水號（如發票號碼），SEQUENCE 會有洞 | `pg_try_advisory_xact_lock(id)` 確保每個 ID 只被一個人寫入 | `SERIAL`（有空洞但效能好 10 倍，99% 場景用這個就夠） |
+>
+> **一句話決策**：如果你可以用 PG 內建的 `SKIP LOCKED` / `FOR UPDATE NOWAIT` / `SERIAL` 解決，就不要用 Advisory Lock。它能做到的事幾乎都有更簡單的替代方案——除非你需要的協調邏輯跨越多張表、或超出 row lock 能表達的範圍（如 §4 的令牌控管）。
 
-> **原始碼關鍵函數速查**：
->   - advisory lock 的儲存：使用獨立的 shared memory hash table（`AdvisoryLockHash`），不跟 table-level lock 共用 slot
->   - Session lock 實現：`pg_advisory_lock()` → `LockAcquire()` with `locktag_type = LOCKTAG_ADVISORY`
->   - Transaction lock 實現：`pg_advisory_xact_lock()` → lock 自動註冊到當前 transaction 的 `ResourceOwner`，COMMIT 時 `LockReleaseAll()` 一併釋放
->   - `try` 版本：`pg_try_advisory_lock()` → 呼叫 `LockAcquire()` 但設置 `dontWait = true`，拿不到就立刻返回 false
+> Lock 數量無上限（不佔 `max_locks_per_transaction` slot，advisory lock 使用獨立的 shared memory hash table）。PG 9.6+ 可透過 `pg_locks` 查看：`SELECT * FROM pg_locks WHERE locktype = 'advisory'`。
 
 ---
 
-## 2. 高並發全表更新：Advisory Lock vs SKIP LOCKED
+## 2. 高並發全表更新：SKIP LOCKED 實戰
 
 > 來源：[digoal - PostgreSQL 使用advisory lock或skip locked消除行锁冲突 (2016-10-18)](https://github.com/digoal/blog/blob/master/201610/20161018_01.md)
 
@@ -827,62 +1129,19 @@ flowchart TD
     style Q fill:#ffd93d
 ```
 
-**兩種解法**：Advisory Lock（用自訂暗號標記「這行我在處理」）vs SKIP LOCKED（PG 內建機制，自動跳過被鎖的行）。
+**解法**：`SKIP LOCKED`——PG 內建機制，自動跳過被鎖的行，純 SQL 不須額外管理。
 
-### II. 方法一：Advisory Lock
+### II. SKIP LOCKED 核心用法
 
-每次更新前嘗試取得該 row 對應的 advisory lock，拿到鎖才更新：
-
-```sql
-FOR v_id IN SELECT id FROM table LOOP
-    IF pg_try_advisory_xact_lock(v_id) THEN
-        UPDATE ... WHERE id = v_id;
-    END IF;
-END LOOP;
-```
-
-Benchmark（100 並行）：latency average = 4,407ms（vs 80s 單線程 → 18x 加速）。
-
-### III. 方法二：SKIP LOCKED（PG 9.5+）
+每次拿一批未被鎖定的行來處理，被別人鎖住的直接跳過：
 
 ```sql
+-- 拿 1 行來處理（queue / job 模式）
 SELECT id INTO v_id FROM table
 ORDER BY id LIMIT 1
 FOR UPDATE SKIP LOCKED;
-```
 
-Benchmark（100 並行）：latency average = 4,204ms（與 advisory lock 相當）。
-
-### IV. 兩種方法對比
-
-| 維度 | Advisory Lock | SKIP LOCKED |
-|------|--------------|-------------|
-| PG 最低版本 | 9.4 | 9.5 |
-| 實現難度 | 中（需管理 lock ID 全域唯一性） | 低（純 SQL） |
-| 全域 ID 衝突風險 | 有 | 無 |
-| Transaction 要求 | Transaction-level | Statement 結束釋放 |
-| Connection Pool | 需 transaction pooling | 無此限制 |
-
-```mermaid
-flowchart TD
-    Q["要保證 100 session 不搶同一行"]
-    Q --> AL["<b>方法一：Advisory Lock</b><br/>用手動暗號 (key=row_id)<br/>try_lock 成功 → 更新<br/>try_lock 失敗 → 跳過"]
-    Q --> SK["<b>方法二：SKIP LOCKED</b><br/>PG 內建機制<br/>FOR UPDATE SKIP LOCKED<br/>自動跳過被鎖的行"]
-    
-    AL --> AL_RESULT["✅ 加速 18x<br/>⚠️ 需管理 lock ID 唯一性<br/>⚠️ 需配合 transaction pooling"]
-    SK --> SK_RESULT["✅ 加速 18x<br/>✅ 純 SQL，不需額外管理<br/>✅ 無 connection pool 限制"]
-    
-    style SK_RESULT fill:#6bcf7f
-    style AL_RESULT fill:#ffd93d
-```
-
-> **現代建議**：PG 9.5+ 環境優先用 **SKIP LOCKED**——純 SQL、不需管理 ID、沒有 pool 限制。只有在需要跨多個 table 的複雜協調時，才考慮 Advisory Lock。
-
-### V. 現代化方案
-
-**PG 15+ MERGE 批次處理：**
-
-```sql
+-- 拿 100 行批次處理（batch 模式）
 WITH batch AS (
     SELECT id FROM table
     WHERE id > :last_id ORDER BY id LIMIT 100
@@ -892,7 +1151,149 @@ UPDATE table t SET info = array_append(info, 1)
 FROM batch b WHERE t.id = b.id;
 ```
 
-**分片方案（無需 advisory lock 也不需 SKIP LOCKED）：**
+**實際演練：一張 10 行的小表，三個 session 並行**
+
+```sql
+-- 環境準備：
+CREATE TABLE jobs (id INT PRIMARY KEY, status TEXT DEFAULT 'pending');
+INSERT INTO jobs (id) VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+SELECT * FROM jobs ORDER BY id;
+
+-- 輸出：
+--  id | status
+-- ----+---------
+--   1 | pending
+--   2 | pending
+--   3 | pending
+--   4 | pending
+--   5 | pending
+--   6 | pending
+--   7 | pending
+--   8 | pending
+--   9 | pending
+--  10 | pending
+-- (10 rows)
+```
+
+接著 Session A 先拿 3 行，鎖定 id 1~3（尚未 COMMIT）：
+
+```sql
+-- Session A
+BEGIN;
+SELECT id FROM jobs ORDER BY id LIMIT 3 FOR UPDATE SKIP LOCKED;
+-- 輸出：
+--  id   ← Session A 拿到並鎖定了 id 1, 2, 3
+-- ----
+--   1
+--   2
+--   3
+-- (3 rows)
+```
+
+Session B 也來要 5 行，但 id 1~3 被 Session A 鎖著，自動跳過：
+
+```sql
+-- Session B
+BEGIN;
+SELECT id FROM jobs ORDER BY id LIMIT 5 FOR UPDATE SKIP LOCKED;
+-- 輸出：
+--  id   ← 跳過了 1,2,3，從 4 開始拿，B 鎖定了 4,5,6,7,8
+-- ----
+--   4
+--   5
+--   6
+--   7
+--   8
+-- (5 rows)
+```
+
+Session C 再來要 10 行，只剩 9, 10 還沒被鎖：
+
+```sql
+-- Session C
+BEGIN;
+SELECT id FROM jobs ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED;
+-- 輸出：
+--  id   ← 1~8 都已鎖，只拿到 9, 10
+-- ----
+--   9
+--  10
+-- (2 rows)
+```
+
+```mermaid
+flowchart LR
+    subgraph all["jobs 表 10 rows"]
+        direction LR
+        R1["id=1 🔒A"]
+        R2["id=2 🔒A"]
+        R3["id=3 🔒A"]
+        R4["id=4 🔒B"]
+        R5["id=5 🔒B"]
+        R6["id=6 🔒B"]
+        R7["id=7 🔒B"]
+        R8["id=8 🔒B"]
+        R9["id=9 🔒C"]
+        R10["id=10 🔒C"]
+    end
+
+    subgraph sessions["三個 session 各拿各的，互不衝突"]
+        SA["Session A<br/>拿了 id=1,2,3 ✅"]
+        SB["Session B<br/>拿了 id=4,5,6,7,8 ✅"]
+        SC["Session C<br/>拿了 id=9,10 ✅"]
+    end
+
+    style R1 fill:#f4a261
+    style R2 fill:#f4a261
+    style R3 fill:#f4a261
+    style R4 fill:#6bcf7f
+    style R5 fill:#6bcf7f
+    style R6 fill:#6bcf7f
+    style R7 fill:#6bcf7f
+    style R8 fill:#6bcf7f
+    style R9 fill:#457b9d,color:#fff
+    style R10 fill:#457b9d,color:#fff
+```
+
+**關鍵觀察：**
+- 三個 session 拿到的 row **完全不重疊**——沒有 row lock conflict，沒有等待
+- Session B 拿 5 行只出了 5 行（跳過 3 行被鎖定的），Session C 拿 10 行只出了 2 行
+- 如果你的 business 邏輯吃 `LIMIT` 拿不到足夠行數，有兩種應對：`LIMIT` 等於 0 代表全表處理完畢，可以結束；或者降低每個 session 的 `LIMIT`，讓更多 session 都有工作
+
+**`FOR UPDATE` 拿到的鎖什麼時候釋放？**
+
+取決於你有沒有包在 `BEGIN ... COMMIT` 裡：
+
+| 情境 | 鎖釋放時機 | 典型用法 |
+|------|-----------|---------|
+| 顯式 Transaction（`BEGIN`） | `COMMIT` 或 `ROLLBACK` 時釋放 | Queue / Job 模式——拿行 → 處理 → 標記完成 → `COMMIT`，處理期間鎖全程持有，防止別人重複拿同一行 |
+| Autocommit（裸 SQL，無 `BEGIN`） | 該條 SQL 執行完**立刻釋放** | 只讀不寫的查詢——拿完就放，下一條 SQL 再拿新的 |
+
+上例中三個 session 都寫了 `BEGIN` 但沒 `COMMIT`——那些 `🔒` 標記的 row 鎖**還在持有中**。實戰中應在最前面例子之後立刻 `UPDATE ... SET status = 'done' WHERE id = :id`，然後 `COMMIT`——整個過程一氣呵成。
+
+```mermaid
+sequenceDiagram
+    participant S as Session (worker)
+    participant DB as PostgreSQL
+
+    S->>DB: BEGIN
+    S->>DB: SELECT id FROM jobs<br/>ORDER BY id LIMIT 1<br/>FOR UPDATE SKIP LOCKED
+    DB-->>S: id=42 ✅（行鎖持有中）
+
+    Note over S: 處理 id=42<br/>（call API / 運算 / 寫檔...）
+
+    S->>DB: UPDATE jobs SET status='done'<br/>WHERE id=42
+    S->>DB: COMMIT
+    Note over DB: 🔓 COMMIT 瞬間釋放 id=42 的行鎖<br/>下一個 worker 立刻可以搶下一行
+```
+
+> **關鍵**：如果忘了 `COMMIT`（或處理過程中 crash），行鎖會懸掛直到 session 斷開或 `idle_in_transaction_session_timeout` 觸發。這也是為什麼前面的例子都寫了 `BEGIN` 沒寫 `COMMIT`——為了展示鎖的持有狀態。生產上務必在處理完後 `COMMIT`。
+
+Benchmark（100 並行）：latency average = 4,204ms（vs 80s 單線程 → 18x 加速）。
+
+### III. 分片 + SKIP LOCKED（大規模場景）
+
+當 row 數量極大，每個 session 有固定責任範圍（`mod(id, N)`），不需掃描全表：
 
 ```sql
 SELECT id FROM table
@@ -901,16 +1302,11 @@ ORDER BY id LIMIT 100
 FOR UPDATE SKIP LOCKED;
 ```
 
-每個 session 有固定責任範圍（`mod(id, N)`），不需掃描全表。
-
-> **原始碼關鍵函數速查**：
->   - `SKIP LOCKED` 的實現：`ExecLockRows()` 中，當 `heap_lock_tuple()` 回傳 `HeapTupleWouldBlock` 時，如果設了 `SKIP LOCKED`，則跳過該行繼續下一行
->   - `pg_try_advisory_xact_lock()` → lock 在 COMMIT 時自動釋放，保證「拿到鎖 → 更新 → COMMIT → 釋放」的原子性
->   - `FOR UPDATE` + `SKIP LOCKED`：row-level lock 在 statement 結束就釋放（除非在 explicit transaction 中），比 advisory lock 更短命
+每個 session 只掃它負責的分片，`SKIP LOCKED` 進一步保證即使分片內有行被別的 session 鎖住也不會卡住。
 
 ---
 
-## 3. 秒殺場景優化：Advisory Lock vs FOR UPDATE NOWAIT
+## 3. 秒殺場景優化：NOWAIT 與 SKIP LOCKED
 
 > 來源：[digoal - PostgreSQL 秒杀场景优化 (2015-09-14)](https://github.com/digoal/blog/blob/master/201509/20150914_01.md)
 
@@ -918,111 +1314,165 @@ FOR UPDATE SKIP LOCKED;
 
 秒殺場景典型瓶頸：多個 concurrent session 同時更新同一條 record，獲得 row lock 的 session 處理期間，其他 session 全部等待——對於沒搶到鎖的用戶，等待毫無意義。
 
-> **新手白話**：秒殺就像限量球鞋發售——1000 個人搶 10 雙鞋。只有一個人能拿到庫存的那一行 lock，其他 999 人應該立刻看到「已售罄」，而不是排隊等。但 PG 預設的行為是「排隊等」，這 999 個人全卡在資料庫裡，CPU 都被等待消耗掉了。
+> **新手白話**：秒殺就像限量球鞋發售——1000 個人搶 10 雙鞋，但櫃檯一次只能服務一個人。
+> - **傳統做法（無優化）**：所有人排成一條長隊，第 1 人買走第 1 雙（庫存 9）→ 第 2 人買走第 2 雙 → ... → 第 10 人買走最後一雙。**第 11~1000 人排了老半天，輪到櫃檯才被告知「賣完了」**——白排一場，DB 裡的 row lock queue 塞滿了 990 個無意義的等待。
+> - **NOWAIT / SKIP LOCKED 做法**：跑到櫃檯看一眼，若櫃檯有人在辦就立刻回頭（不排隊），稍後再衝。櫃檯前永遠不卡人龍。
+
+```mermaid
+sequenceDiagram
+    participant U1 as 用戶 1
+    participant DB as PostgreSQL
+    participant U2 as 用戶 2
+    participant U3 as 用戶 3
+
+    rect rgb(255, 230, 230)
+    Note over U1,U3: ❌ Baseline：沒有 NOWAIT / SKIP LOCKED，所有人排隊等 row lock
+
+    U1->>DB: UPDATE ... WHERE id=100<br/>(獲得 row lock)
+    Note over U1,DB: U1 處理中...（庫存 10 → 9）
+
+    U2->>DB: UPDATE ... WHERE id=100
+    DB-->>U2: ⏳ row lock 被 U1 持有 → 進入等待隊列
+    Note over U2: U2 卡在 queue 裡等...
+
+    U3->>DB: UPDATE ... WHERE id=100
+    DB-->>U3: ⏳ row lock 被 U1 持有 → 進入等待隊列
+    Note over U3: U3 也卡在 queue 裡等...
+
+    U1->>DB: COMMIT（釋放 row lock）
+    DB->>U2: ✅ 授予 row lock
+    Note over U2,DB: U2 處理中...（庫存 9 → 8）
+    U2->>DB: COMMIT
+    DB->>U3: ✅ 授予 row lock
+    Note over U3,DB: U3 處理中...（庫存 8 → 7）
+
+    Note over U1,U3: 第 11 個人要排到天荒地老才發現賣完 😱
+    end
+```
 
 ```mermaid
 sequenceDiagram
     participant U1 as 用戶 1 (拿到鎖 ✅)
     participant DB as PostgreSQL
-    participant U2 as 用戶 2 (搶不到 ❌)
-    participant U3 as 用戶 3 (搶不到 ❌)
+    participant U2 as 用戶 2 (NOWAIT → 拋 error)
+    participant U3 as 用戶 3 (SKIP LOCKED → 0 row)
 
-    U1->>DB: UPDATE ... WHERE id=100<br/>(獲得 row lock)
-    Note over U1,DB: 正在處理...
+    rect rgb(230, 255, 230)
+    Note over U1,U3: ✅ NOWAIT / SKIP LOCKED：不排隊，立刻知道結果
 
-    U2->>DB: UPDATE ... WHERE id=100
-    DB-->>U2: ❌ row lock 被 U1 持有<br/>NOWAIT → 直接返回錯誤<br/>不排隊！
+    U1->>DB: SELECT ... FOR UPDATE NOWAIT
+    DB-->>U1: ✅ 獲得 row lock
+    Note over U1,DB: U1 處理中...（庫存 10 → 9）
 
-    U3->>DB: UPDATE ... WHERE id=100
-    DB-->>U3: ❌ 同樣直接返回錯誤
+    U2->>DB: SELECT ... FOR UPDATE NOWAIT
+    DB-->>U2: ❌ ERROR: 55P03<br/>could not obtain lock on row
+    Note over U2: App catch PostgresException<br/>SqlState=55P03 → 等一下重試
 
-    Note over U2,U3: ✅ 用戶 2、3 立刻知道失敗<br/>不需要浪費時間排隊等待
+    U3->>DB: SELECT ... FOR UPDATE SKIP LOCKED
+    DB-->>U3: ⬜ 回傳 0 row（無聲跳過）
+    Note over U3: App 檢查 ROW_COUNT=0<br/>→ 重試或回傳失敗
+
+    U1->>DB: COMMIT（釋放 row lock）
+
+    U2->>DB: SELECT ... FOR UPDATE NOWAIT（重試）
+    DB-->>U2: ✅ 獲得 row lock
+    Note over U2,DB: U2 重試成功！
+
+    U3->>DB: SELECT ... FOR UPDATE SKIP LOCKED（重試）
+    DB-->>U3: ✅ row id=100
+    Note over U3,DB: U3 重試成功！
+    end
 ```
 
-> **核心思路**：「拿不到就立刻失敗」比「等看看」更適合秒殺場景。四種方案的核心區別在於：**如何讓拿不到鎖的 session 最快認輸？**
+### II. 方案一：FOR UPDATE NOWAIT（拋例外、App 重試）
 
-### II. 四種方案 Benchmark
-
-**方案 A：無優化 Baseline**
+拿到鎖就處理，拿不到鎖 PG 直接拋 error，不進等待隊列：
 
 ```sql
-UPDATE t1 SET info = now()::text WHERE id = :id;
+BEGIN;
+SELECT * FROM t1 WHERE id = :id FOR UPDATE NOWAIT;
+-- 拿到鎖 → 更新庫存
+UPDATE t1 SET stock = stock - 1 WHERE id = :id AND stock > 0;
+COMMIT;
 ```
 
-128 concurrent, 100s: TPS = **2,855**。
-
-**方案 B：FOR UPDATE NOWAIT**
-
-```sql
-PERFORM 1 FROM t1 WHERE id = i_id FOR UPDATE NOWAIT;
-UPDATE t1 SET info = now()::text WHERE id = i_id;
+拿不到鎖時 PG 回傳：
+```
+ERROR:  could not obtain lock on row in relation "t1"
 ```
 
-128 concurrent, 100s: TPS = **66,623**（提升 ~23 倍）。無法即刻獲得 row lock 的 session 直接返回 error，不等待。
-
-**方案 C：pg_try_advisory_xact_lock（Direct UPDATE）**
-
-```sql
-UPDATE t1 SET info = now()::text
-WHERE id = :id AND pg_try_advisory_xact_lock(:id);
+App 端處理：
+```csharp
+// C# / Dapper 範例
+while (retries < maxRetries)
+{
+    try
+    {
+        await using var tx = await conn.BeginTransactionAsync();
+        var row = await conn.QuerySingleOrDefaultAsync<Product>(
+            "SELECT * FROM t1 WHERE id = @id FOR UPDATE NOWAIT", new { id });
+        if (row?.Stock <= 0) break;
+        await conn.ExecuteAsync(
+            "UPDATE t1 SET stock = stock - 1 WHERE id = @id AND stock > 0", new { id });
+        await tx.CommitAsync();
+        return "搶購成功";
+    }
+    catch (PostgresException ex) when (ex.SqlState == "55P03")
+    {
+        // 55P03 = lock_not_available → 等一下重試
+        await Task.Delay(Random.Shared.Next(10, 50));
+    }
+}
+return "搶購失敗";
 ```
 
-20 concurrent, 60s: TPS = **23,194**（比 FOR UPDATE NOWAIT 提升 ~75%）。
+> PG 內部對應的 error code 是 `55P03`（`lock_not_available`）。App 用這個 code 判斷是 lock 衝突（重試）還是其他錯誤（log 告警）。
 
-**方案 D：Advisory Lock + Function 包裝（消除無用掃描）**
+### III. 方案二：FOR UPDATE SKIP LOCKED（拋 0 row、App 判斷）
 
-先純 CPU 判斷 advisory lock 是否取得，拿到才做 UPDATE：
-
-80 concurrent, 60s: TPS = **231,197**（對比 baseline 提升 ~81 倍）。
-
-### III. 總結對比
-
-| 方案 | TPS (20C) | TPS (128C/80C) | 無用掃描 | 說明 |
-|------|-----------|----------------|---------|------|
-| 無優化 | — | 2,855 | — | row lock 排隊等待 |
-| FOR UPDATE NOWAIT | 13,196 | 66,623 | 大量 | 即刻失敗不等待 |
-| Advisory Lock (direct) | 23,194 | — | 大量 | TPS 高但大量無用 scan |
-| Advisory Lock + 先判斷 | 20,283 | 231,197 | 極少 | 消除無用 scan |
-
-```mermaid
-flowchart LR
-    subgraph baseline["方案 A: 無優化"]
-        A["TPS: 2,855<br/>😱 大家都在排隊等"]
-    end
-    subgraph nowait["方案 B: NOWAIT"]
-        B["TPS: 66,623<br/>✅ 拿不到立刻失敗<br/>提升 23x"]
-    end
-    subgraph adv["方案 C: Advisory (直接)"]
-        C["TPS: 23,194<br/>⚠️ 大量無用掃描"]
-    end
-    subgraph adv2["方案 D: Advisory + 先判斷"]
-        D["TPS: 231,197<br/>🚀 消除無用掃描<br/>提升 81x"]
-    end
-
-    A --> B --> C --> D
-```
-
-### IV. SKIP LOCKED 現代模式（PG 9.5+）
+同樣的邏輯，但拿不到鎖時不拋 error，而是回傳 0 row——App 端用 row count 判斷：
 
 ```sql
 WITH locked AS (
-    SELECT id FROM tbl
-    WHERE upd_cnt + 1 <= 5
-    ORDER BY id LIMIT 1
+    SELECT id FROM t1
+    WHERE id = :id AND stock > 0
+    LIMIT 1
     FOR UPDATE SKIP LOCKED
 )
-UPDATE tbl SET info = now(), upd_cnt = upd_cnt + 1
-FROM locked WHERE tbl.id = locked.id;
+UPDATE t1 SET stock = stock - 1
+FROM locked WHERE t1.id = locked.id
+RETURNING t1.id;
 ```
 
-既消除了 advisory lock 的全局 ID 管理問題，又做到了不等待、不無用掃描。
+如果 `RETURNING` 沒回傳任何 row = 有人正在處理這行，App 端重試或回傳失敗。
 
-> 實戰注意：Advisory lock ID 必須全局唯一（不同業務可能共用同一 lock namespace）；分段秒殺：庫存打散成多條 record 進一步提高並發；Pool 模式：必須用 transaction pooling（非 session pooling）。
+### IV. 選擇對比
 
-> **原始碼關鍵函數速查**：
->   - `FOR UPDATE NOWAIT`：`heap_lock_tuple()` 中當 `nowait = true` 且 lock 拿不到時，直接回傳 `HeapTupleWouldBlock`，不進入等待佇列
->   - `pg_try_advisory_xact_lock()` vs `pg_advisory_xact_lock()`：差別在 `LockAcquire()` 的 `dontWait` 參數設為 true → 拿不到就回傳 false，不 block
->   - 方案 D 為什麼最快：先用純 CPU 的 `try_lock` 判斷（不走 disk I/O），只有拿到鎖才做 UPDATE（才會有 disk I/O），大幅減少無用的磁碟讀寫
+| | `FOR UPDATE NOWAIT` | `FOR UPDATE SKIP LOCKED` |
+|---|---|---|
+| 拿不到鎖時 | 拋 `ERROR: could not obtain lock`（`SqlState: 55P03`） | 回傳 0 row（靜默跳過） |
+| App 端判斷 | `try-catch`，檢查 `SqlState == "55P03"` | 檢查 `ROW_COUNT == 0` 或 `RETURNING` 是否為空 |
+| 語意 | 「有人在處理，你等一下再來」 | 「有人在處理，你沒搶到」 |
+| 適用場景 | 秒殺（必須拿到才繼續），需要明確 error 做 log / 告警 | 秒殺（同上），Queue 批次處理（見 §2） |
+| Benchmark（128 並行） | TPS = 66,623（提升 23x vs baseline 2,855） | 與 NOWAIT 相當 |
+
+> **現代建議**：秒殺場景 `NOWAIT` 和 `SKIP LOCKED` 都可用，效能相當。選 NOWAIT 的時機是你需要明確的 error log / 監控告警；選 SKIP LOCKED 的時機是你偏好用 row count 做流程控制、不想寫 try-catch。99% 的秒殺場景這兩者擇一即可，不需 Advisory Lock。
+
+### V. 分段庫存（提高並發上限）
+
+如果全部庫存存在單一 row，row lock 本身就是瓶頸（同一秒只有一個人能鎖那行）。生產上常見的解法是**把庫存打散成 N 條 record**，每個 session 隨機選一條來扣：
+
+```sql
+-- 1000 雙鞋拆成 100 條 record，每條存 10 雙
+UPDATE t1 SET stock = stock - 1
+WHERE id = (SELECT id FROM t1 WHERE stock > 0
+            ORDER BY random() LIMIT 1
+            FOR UPDATE SKIP LOCKED)
+  AND stock > 0
+RETURNING id;
+```
+
+N 條 record = N 倍的並發吞吐量。代價是總庫存管理變複雜（需要 SUM 才能知道總量），但對秒殺場景來說這個 trade-off 通常值得。
 
 ---
 
@@ -1062,31 +1512,182 @@ flowchart TD
 
 **10 active + 7990 idle backend：** TPS ≈ **29,000**（idle connection 對效能幾乎無影響）
 
-> 關鍵結論：只有真正執行 SQL 的 backend 才會參與 CPU 競爭。8000 idle 連接只佔用 memory（約 40-80GB），不參與 ProcArray lock / snapshot 競爭。
+> 關鍵結論：只有真正執行 SQL 的 backend 才會參與 CPU 競爭。8000 idle 連接只佔用 memory（每個 backend 約 2~5MB，8,000 個 ≈ 16~40GB，若 catalog 膨脹則更高），不參與 ProcArray lock / snapshot 競爭。
 
-### III. Advisory Lock 排隊方案（Admission Control）
+### III. .NET 8 + NpgsqlDataSource：為什麼會有 7990 個 idle backend
 
-限制真正並行處理的 backend 數量，多出限制的連線等待：
+這是每個 .NET 開發者都該理解的核心機制：**你的 app 有幾條連線，PG 端就有幾個 backend**——而且它們不會自動回收。
+
+#### A. 連線池的本質
+
+NpgsqlDataSource（Npgsql 7.0+）在底層就是一個**連線池**（connection pool）。預設行為：你的 app 有幾條池內連線，PG 端就有幾個 backend——而且它們不會自動回收。
+
+> **為什麼「不會自動回收」？兩層原因疊加：**
+>
+> 1. **Npgsql 端**：`Dispose()` 是歸還到池，不是關閉 TCP。連線會一直活著直到 `Connection Idle Lifetime`（預設 300 秒）過期後，Npgsql 才會在下一次 `Pruning Interval`（每 10 秒）檢查時真正關閉它。300 秒內如果 app 又發請求，同一條連線繼續復用——對 PG 來說那條 backend 從頭到尾沒斷過。
+>
+> 2. **PG 端**：`idle_session_timeout` 預設值是 `0`（**關閉**）。意思是 PG 不會主動 kill 任何 idle 連線——就算它從尖峰過後閒置了 3 小時也一樣。只有當 Npgsql 端主動關閉 TCP（或因 app crash 導致 TCP RST），PG 才會回收那條 backend。
+>
+> 兩層都沒設回收閾值 → backend 活到天荒地老。
+
+```csharp
+// 建立 DataSource（全 app 共用一個 singleton）
+var dataSource = NpgsqlDataSource.Create(builder.ConnectionString);
+
+// 每次拿連線都是從池裡取（或新建）
+await using var conn = await dataSource.OpenConnectionAsync();
+// ... 執行 SQL ...
+await using var cmd = new NpgsqlCommand("SELECT 1", conn);
+await cmd.ExecuteScalarAsync();
+// Dispose 時連線「歸還」到池，不真正關閉
+```
+
+關鍵參數（在 connection string 裡）：
+
+| 參數 | 預設值 | 含義 |
+|------|:--:|------|
+| `Pooling` | `true` | 開啟連線池 |
+| `Max Pool Size` | `100` | 每個 DataSource 最多 100 條實體 TCP 連線 |
+| `Min Pool Size` | `0` | 池裡最少保持幾條連線；0 = 閒置過久會斷開 |
+| `Connection Idle Lifetime` | `300`（秒） | 池內閒置連線超過此時間會被清除 |
+| `Connection Pruning Interval` | `10`（秒） | 每 10 秒檢查一次池內是否需要清除 |
+
+#### B. 一條連線的一生（從 Open 到 Dispose）
+
+```mermaid
+sequenceDiagram
+    participant CSharp as .NET 8 App
+    participant Pool as Npgsql Connection Pool
+    participant PG as PostgreSQL Server
+
+    Note over CSharp,PG: 1. 建立 DataSource（singleton）
+    CSharp->>Pool: new NpgsqlDataSource(...)
+    Note over Pool: 池是空的（Min Pool Size = 0）
+
+    Note over CSharp,PG: 2. 第一次 OpenConnection
+    CSharp->>Pool: await OpenConnectionAsync()
+    Pool->>PG: 建立 TCP 連線（3-way handshake）
+    PG-->>Pool: ✅ Backend PID=12345 啟動
+    Pool-->>CSharp: 交給你一條連線
+
+    Note over CSharp,PG: 3. 執行 SQL
+    CSharp->>PG: conn.ExecuteScalarAsync("SELECT 1")
+    Note over PG: state = 'active'
+    PG-->>CSharp: 1
+
+    Note over CSharp,PG: 4. 跑完 SQL，還沒 Dispose
+    Note over PG: state = 'idle' ← 連線活著但不做事
+    Note over CSharp: C# 可能在處理 JSON、call API...
+
+    Note over CSharp,PG: 5. Dispose Connection
+    CSharp->>Pool: conn.DisposeAsync()
+    Note over Pool: 連線歸還到池
+    Note over PG: state = 'idle' ← 還是 idle！
+    Note over Pool: 這條 TCP 連線還活著，等下次有人要
+
+    Note over CSharp,PG: 6. 第二次 OpenConnection
+    CSharp->>Pool: await OpenConnectionAsync()
+    Note over Pool: 池裡有現成的連線 → 秒給
+    Pool-->>CSharp: 同一條 TCP 連線（PID=12345）
+    Note over PG: 沒新 backend 啟動
+```
+
+**關鍵洞察**：`Dispose()` 不是關閉 TCP 連線，是把連線「還給池」。PG 端那條 backend 仍然活著，`state = 'idle'`，直到 `Connection Idle Lifetime`（預設 300 秒）過後才被 Npgsql 真正關閉。
+
+#### C. 7990 idle 是怎麼來的
+
+```
+一個 .NET 8 app instance
+  → 1 個 NpgsqlDataSource（singleton）
+  → 尖峰時 100 個 concurrent request 同時要連線
+  → Npgsql 開了 100 條 TCP 連線到 PG
+  → 尖峰過後，只剩下 10 個 request
+  → 90 條連線還待在池裡（沒過 Idle Lifetime）
+  → PG 端那 90 個 backend 全部 state = 'idle'
+
+5 個 app instance × 每個 100 條池連線 = 500 個 backend 常駐 PG
+20 個 app instance × 100 = 2000 個 backend
+...
+```
+
+```mermaid
+flowchart TD
+    subgraph apps[".NET 8 App Instances"]
+        A1["App 1<br/>Pool: 100 conns"]
+        A2["App 2<br/>Pool: 100 conns"]
+        A3["App 3<br/>Pool: 100 conns"]
+        A4["..."]
+    end
+
+    subgraph pg["PostgreSQL Server"]
+        B1["Backend 1..100 ← App1"]
+        B2["Backend 101..200 ← App2"]
+        B3["Backend 201..300 ← App3"]
+        STATUS["尖峰過了，200 條連線 idle<br/>佔用記憶體但不吃 CPU"]
+    end
+
+    A1 --> B1
+    A2 --> B2
+    A3 --> B3
+```
+
+#### D. idle 與 idle in transaction 的天壤之別
+
+```
+state = 'idle'
+  → 連線開著、連線池留著、TCP 沒斷
+  → PG 端 backend 在等下一條 SQL
+  → 不持鎖、不擋人、只佔記憶體
+  → 「你沒在用但車子沒熄火」
+
+state = 'idle in transaction'
+  → 有未 COMMIT 的交易（你開了 DbTransaction 但忘了 Commit）
+  → 所有拿過的鎖（AccessShareLock、RowExclusiveLock、xmax）還在
+  → 會擋 DDL、可能引發 lock queue pileup
+  → 「車子沒熄火而且橫停在馬路中間」
+```
+
+```csharp
+// ❌ 最常見的 idle in transaction 製造機
+await using var conn = await dataSource.OpenConnectionAsync();
+await using var tx = await conn.BeginTransactionAsync();  // BEGIN
+
+await conn.ExecuteAsync("UPDATE users SET name = @n WHERE id = @id", ...);
+
+var result = await httpClient.GetAsync("https://slow-api/path");  // ← 3 秒！
+
+await tx.CommitAsync();  // 這 3 秒內，整條 row lock 掛在 PG 上
+```
+
+> **鐵律**：`BeginTransactionAsync` 和 `CommitAsync` 之間不能有任何 IO（HTTP call、file read、Redis）、不能有任何非 SQL 的 CPU 運算。鎖的生命週期 = 這兩行之間的距離。
+
+### IV. 解法：Advisory Lock Admission Control
+
+**為什麼這個場景只能用 Advisory Lock？**
+
+§2 和 §3 的解法（`SKIP LOCKED` / `FOR UPDATE NOWAIT`）都依賴一個前提：**你有一行可以鎖**。但 Admission Control 要限流的是「同時執行的 transaction 數量」——這是一個抽象概念，沒有具體的 row 可以讓你 `FOR UPDATE`。Advisory Lock 正是為這種場景設計的：用一個數字 key 代表「執行資格令牌」。
 
 ```sql
 CREATE OR REPLACE FUNCTION upd(l INT, v_id INT) RETURNS void AS $$
 BEGIN
     LOOP
         IF pg_try_advisory_xact_lock(l) THEN
+            -- 拿到令牌，可以執行 SQL
             UPDATE test_8000 SET cnt = cnt + 1 WHERE id = v_id;
             UPDATE test_8000 SET cnt = cnt + 2 WHERE id = v_id;
-            RETURN;
+            RETURN;  -- COMMIT 後自動釋放令牌
         ELSE
-            PERFORM pg_sleep(30 * random());
+            -- 沒拿到令牌，隨機 sleep 後重試
+            PERFORM pg_sleep(0.03 * random());
         END IF;
     END LOOP;
 END;
 $$ LANGUAGE plpgsql STRICT;
 ```
 
-**實驗三：Advisory Lock 排隊（8000 backend，最多 10 個同時執行）**
+參數 `l` 是令牌範圍（例如 `l=10` 代表最多 10 個 concurrent），每個 transaction 嘗試 `pg_try_advisory_xact_lock(l)` 搶令牌——拿到就執行，拿不到就等。
 
-TPS ≈ **26,774**，相比不排隊（9,124）提升約 **2.9 倍**。CPU idle 仍高達 93.9%——大部分 backend 處於 `pg_sleep()` 狀態。
+Benchmark（8000 backend，最多 10 個同時執行）：TPS ≈ **26,774**，相比不排隊（9,124）提升約 **2.9 倍**。
 
 ```mermaid
 flowchart TD
@@ -1096,7 +1697,7 @@ flowchart TD
         W1 --> W2
     end
 
-    subgraph with["✅ 有 Admission Control"]
+    subgraph with["✅ 有 Admission Control（Advisory Lock）"]
         A1["Advisory Lock 當作「令牌」<br/>最多 10 個同時拿到"]
         A2["只有 10 個 backend 在執行 SQL"]
         A3["其他 7990 個在 pg_sleep() 等待"]
@@ -1106,24 +1707,30 @@ flowchart TD
     end
 ```
 
-> **新手白話**：Admission Control 就像夜店的「人數管制」——門口保鏢（advisory lock）只放 10 個人進去跳舞（執行 SQL），其他人（7990 人）在外面排隊喝飲料（pg_sleep）。這樣裡面不會擠爆（CPU 不超載），外面的人雖然在等，但不會消耗太多 CPU。缺點是：還是佔用了 8000 個 backend process 的記憶體空間。
+> **新手白話**：Admission Control 就像夜店的「人數管制」——門口保鏢（advisory lock）只放 10 個人進去跳舞（執行 SQL），其他人（7990 人）在外面排隊喝飲料（pg_sleep）。這樣裡面不會擠爆（CPU 不超載），外面的人雖然在等，但不會消耗太多 CPU。
 
-### IV. 現代解決方案對比
+### V. 根本解 vs 補救解
 
-| 方案 | 優點 | 缺點 |
-|------|------|------|
-| Advisory Lock 排隊 | 應用層可控、不需外部組件 | 仍佔用 8000 backend process（memory） |
-| pgbouncer transaction pooling | 成熟穩定、極低 overhead | 不支援 prepared statement 跨 transaction |
-| PG 14+ `idle_session_timeout` | 無需外部組件 | 不如 pgbouncer 精細 |
-| `SKIP LOCKED`（PG 9.5+） | 天然支援工作佇列模式 | 僅適用於 queue-like table design |
+Advisory Lock Admission Control 的核心弱點在於：**它只阻止了 backend 同時執行 SQL，但 8000 個 backend process 仍然活在 PG 裡**，佔用 memory（≈ 40-80GB）、參與 ProcArray lock 競爭。
 
-> **現代最佳實踐**：pgbouncer transaction pooling + `max_client_conn = 10000` / `default_pool_size = 200` + PG 端 `max_connections = 200`。把 10,000 個 client 連線收斂到 200 個真正的 PG backend。
+| 解法 | 層級 | 記憶體 | Backend 數量 | 適用場景 |
+|------|:--:|------|:--:|------|
+| **PgBouncer transaction pooling** | 根本解 | 低（200 backend × 2~5MB ≈ 1GB） | PG 端只有 200 | ✅ 所有場景。從源頭限制 PG backend 數量 |
+| **Advisory Lock Admission Control** | 補救解 | 高（8000 backend × 2~5MB ≈ 16~40GB） | PG 端仍有 8000 | ⚠️ 無法部署 PgBouncer 時的備案。解決了 CPU 過載，但沒解決記憶體 |
 
-> **原始碼關鍵函數速查**：
->   - Context switch 的成本來源：PG 的 backend 是 OS process（不是 thread），每個 process 切換都需要完整的 context switch（register save/restore、TLB flush 等）
->   - Admission Control 的核心：`pg_try_advisory_xact_lock(l)` 限制同時執行的 backend 數 → 多餘的用 `pg_sleep()` 讓出 CPU
->   - `ProcArrayLock` 競爭：每個 active backend 在建立 snapshot 時都要獲取這個輕量級鎖（LWLock），backend 越多競爭越激烈
->   - PgBouncer transaction pooling：client 連到 pgbouncer（10000 conns）→ pgbouncer 轉發到 PG（只有 200 conns），從根本上減少 PG backend 數量
+```mermaid
+flowchart LR
+    subgraph pgbouncer["✅ 根本解：PgBouncer"]
+        PB_CL["10000 client conns"] -->|"收斂"| PB["PgBouncer"]
+        PB -->|"轉發"| PG_PB["PG: 200 backend<br/>記憶體 ≈ 1GB ✅"]
+    end
+
+    subgraph advisory["⚠️ 補救解：Advisory Lock"]
+        AL_CL["10000 client conns"] --> PG_AL["PG: 10000 backend<br/>但只有 10 個能同時跑 SQL<br/>記憶體 ≈ 20~50GB ⚠️"]
+    end
+```
+
+> **現代建議**：PgBouncer 是根本解——如果 backend 數量不超載，根本不需要 admission control。Advisory Lock 是 PgBouncer 無法部署時的補救方案，它是這個特定場景下最合適的應用層工具（因為沒有 row 可以讓你 `SKIP LOCKED`）。
 
 ---
 
@@ -1283,6 +1890,332 @@ $$ LANGUAGE plpgsql;
 >   - `pg_try_advisory_xact_lock()` 在這裡的角色：當作 CAS (Compare-And-Swap) 的鎖機制——誰先用 advisory lock 鎖住 ID=N，誰就擁有寫入 ID=N 的權利
 >   - `SELECT max(id)` 的成本：隨著表增大，需要 PK index scan（Index Only Scan），O(log n)，但在高並發下每次都要等 I/O
 >   - counter table 的 trade-off：省了 `SELECT max(id)` 的掃描，但 `UPDATE id_counter` 變成 single-row bottleneck，所有 session 排隊等同一行
+
+---
+
+# 三、Row Lock vs Table Lock — 行鎖與表鎖深度解析
+
+> 本節專為有 DB2 / MSSQL 背景的讀者撰寫，系統性地釐清 PostgreSQL 在行鎖與表鎖上與傳統 RDBMS 的**根本性架構差異**。如果你只知道「鎖升級」這個概念，請務必讀完 §3.1 到 §3.3。
+
+## 1. 雙層鎖架構：一條 UPDATE 同時拿了什麼鎖
+
+每當 PostgreSQL 執行一條 `UPDATE`（或 `INSERT`、`DELETE`），它會**同時**取得兩層鎖。這兩層鎖儲存在完全不同的位置，服從完全不同的管理機制：
+
+| 層級 | 鎖類型 | 儲存位置 | 生命週期 | 目的 |
+|:----:|--------|---------|---------|------|
+| **表級** | `RowExclusiveLock`（Level 3） | Lock Manager shared memory | Transaction 結束由 `LockReleaseAll()` 統一釋放 | 阻止 DDL（如 ALTER TABLE）與本操作同時執行 |
+| **行級** | `xmax = 當前 transaction ID` | Tuple header（被修改的那一行的 `t_xmax` 欄位） | Transaction 結束時 xmax 變成已提交標記 | 阻止其他 transaction 同時修改同一行 |
+
+> **新手白話**：可以把每條 DML 想像成「同時用兩種鎖捍衛自己」：表級鎖是「警衛站在大樓門口」——確保別人不會趁你在裡面工作時把大樓拆掉（DDL）。行級鎖是「你鎖上自己正在用的房間門」——確保別人不會同時進這間房跟你打架。兩個機制互補，但彼此獨立。
+
+```mermaid
+flowchart TD
+    subgraph lock_mgr["Lock Manager（Shared Memory）"]
+        TBL["🔒 RowExclusiveLock on 'users'<br/>→ 衝突對象：ShareLock / ExclusiveLock / AccessExclusiveLock<br/>→ 不衝突對象：AccessShareLock (SELECT)"]
+    end
+
+    subgraph heap["Heap Tuple（磁碟 / Buffer Pool）"]
+        R1["Tuple row_1: xmax = 1234<br/>→ 其他 UPDATE 同一行 → xmax 衝突、進入等待"]
+        R2["Tuple row_2: xmax = 0<br/>→ SELECT 可自由讀取（MVCC 看舊版本）"]
+        R3["Tuple row_3: xmax = 0<br/>→ 其他 UPDATE row_3 也可立刻鎖定"]
+    end
+
+    TBL -.->|"同時持有，互不干涉"| R1
+
+    style lock_mgr fill:#ffd93d
+    style heap fill:#6bcf7f
+```
+
+---
+
+## 2. PostgreSQL 無鎖升級（No Lock Escalation）
+
+這是最關鍵的架構差異：**PostgreSQL 永遠不會把行鎖升級成表鎖**——無論一個 transaction 修改了多少行。
+
+### I. 先回顧 DB2 / MSSQL 為什麼需要鎖升級
+
+在 DB2 和 SQL Server 中，**行鎖本身就是 Lock Manager 中的獨立物件**：
+
+```
+UPDATE row_1 → Lock Manager 建立 lock object "row_1, X lock"（佔 ~64 bytes 記憶體）
+UPDATE row_2 → Lock Manager 建立 lock object "row_2, X lock"（佔 ~64 bytes 記憶體）
+...
+UPDATE row_5000 → Lock Manager 已累積 5000 個 row lock objects
+              → 達到記憶體閾值 → 觸發 Lock Escalation
+              → 把 5000 個 row lock 合併成 1 個 table X lock
+              → 整張表被鎖死：所有 SELECT 全部堵在門外
+```
+
+這不是 Bug，是 DB2/MSSQL 架構下的必然取捨——每個 row lock 都要吃記憶體，鎖管理器必須設上限。
+
+> **新手白話**：DB2/MSSQL 的行鎖就像「每鎖一個房間就在警衛室掛一個牌子」，房間越多牌子越多，警衛室（Lock Manager）快被牌子淹沒時，就把所有牌子收掉、改掛一個「整棟樓禁止進入」——這就是鎖升級。SQL Server DBA 最怕 `sys.dm_tran_locks` 爆量，因為下一秒就可能整張表鎖死。
+
+> **MSSQL 排查：當 `sys.dm_tran_locks` 爆量時怎麼處理？**
+>
+> **1. 先看誰在囤鎖：**
+> ```sql
+> -- 列出鎖數量最多的 session
+> SELECT
+>     request_session_id AS spid,
+>     COUNT(*) AS lock_count,
+>     resource_type,
+>     request_mode,
+>     DB_NAME(resource_database_id) AS db
+> FROM sys.dm_tran_locks
+> WHERE resource_type <> 'DATABASE'
+> GROUP BY request_session_id, resource_type, resource_database_id, request_mode
+> ORDER BY lock_count DESC;
+> ```
+> `lock_count > 5000` 是即將觸發鎖升級的危險信號。
+>
+> **2. 看這個 session 在跑什麼：**
+> ```sql
+> SELECT
+>     r.session_id, r.blocking_session_id, r.wait_type,
+>     t.text AS query
+> FROM sys.dm_exec_requests r
+> CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+> WHERE r.session_id = <SPID>;
+> ```
+>
+> **3. 是否已經鎖升級？**
+> ```sql
+> -- 有 OBJECT + X 鎖出現 → 整張表已被鎖死
+> SELECT resource_type, request_mode, COUNT(*)
+> FROM sys.dm_tran_locks
+> WHERE resource_type = 'OBJECT' AND request_mode IN ('X', 'S')
+> GROUP BY resource_type, request_mode;
+> ```
+>
+> **4. 根源通常是沒 index 的 Table Scan：**
+> ```csharp
+> // ❌ age 沒 index → Table Scan → 5000 row lock → Escalation → Table X lock
+> conn.Execute("UPDATE users SET status = 'done' WHERE age > 30");
+> ```
+> 修法：加 index 讓 `UPDATE` 走 Index Seek 而非 Table Scan。
+>
+> **5. 緊急處理（生產爆炸時）：** `SELECT session_id FROM sys.dm_exec_requests WHERE blocking_session_id > 0;` → `KILL <session_id>`
+>
+> 對比 PG 的好處：這整套流程在 PG 根本不存在，因為行鎖在 tuple header 不在 Lock Manager，永遠不會觸發鎖升級。
+
+### II. PostgreSQL 為什麼不需要鎖升級
+
+**因為 PostgreSQL 的行鎖根本不存在於 Lock Manager 中。** 它不掛牌子，而是直接在房間門上（tuple header）寫一行字：
+
+```
+UPDATE row_1 → 在 row_1 的 tuple header 寫入 xmax = 1234
+UPDATE row_2 → 在 row_2 的 tuple header 寫入 xmax = 1234
+UPDATE row_3 → 在 row_3 的 tuple header 寫入 xmax = 1234
+...
+UPDATE row_1000000 → 在 row_1000000 的 tuple header 寫入 xmax = 1234
+
+Lock Manager 狀態：只有 1 個物件 → RowExclusiveLock on 'table_name'
+```
+
+| 對比維度 | DB2 / MSSQL | PostgreSQL |
+|---------|------------|-----------|
+| 行鎖儲存位置 | Lock Manager shared memory | Tuple header（`xmax` + `t_infomask`） |
+| 行鎖的記憶體成本 | ~64 bytes / row | **0 bytes**（僅寫入 tuple 既有的 header 欄位） |
+| 鎖定 100 萬行的記憶體壓力 | ~64MB+（可能觸發升級） | **0**（完全不會觸發任何事） |
+| 鎖升級（Lock Escalation） | **會發生** | **永遠不會發生** |
+| 大量行鎖後並行 SELECT | 升級後全部堵死 | **不受影響**（MVCC 讀舊版本） |
+
+> **新手白話**：PG 的行鎖是 MVCC 內建的副產品，不是 Lock Manager 管理的物件。`xmax` 本來就在每行的 header 裡——它就是存這行的「死亡交易 ID」的欄位。PG 只是把它拿來順便當成鎖的標記，**零額外成本**。所以無論你鎖 1 行還是 1 億行，Lock Manager 根本不為所動——它只知道自己發過一個 `RowExclusiveLock`（表級），完全不清楚底下有多少行被鎖。
+
+```mermaid
+flowchart TD
+    subgraph mssql["🔴 MSSQL / DB2：行鎖是獨立物件"]
+        M1["每鎖一行 → Lock Manager 建立一個物件"]
+        M2["鎖 5000 行 → 5000 個物件 → 記憶體達閾值"]
+        M3["Lock Escalation：5000 row locks → 1 table X lock 🔥"]
+        M4["所有 SELECT 被 table X lock 阻塞 💀"]
+        M1 --> M2 --> M3 --> M4
+    end
+
+    mssql -->|"架構差異"| pg
+
+    subgraph pg["🟢 PostgreSQL：行鎖是 tuple header 的附屬品"]
+        P1["每鎖一行 → 只在 tuple header 寫 xmax"]
+        P2["鎖 1000 萬行 → Lock Manager 仍是 1 個 RowExclusiveLock"]
+        P3["SELECT 看 MVCC 舊版本 → 完全不受影響 ✅"]
+        P1 --> P2 --> P3
+    end
+
+    style M4 fill:#ff6b6b,color:#fff
+    style P3 fill:#6bcf7f
+```
+
+### III. 為什麼 DB2/MSSQL 在沒 Index 的 UPDATE 時特別容易鎖表
+
+這也是你從 DB2/MSSQL 帶過來最關鍵的認知差異：**「沒有命中 index / PK 的 UPDATE 會鎖全表」**——這句話在 DB2/MSSQL 為真，在 PostgreSQL 為假。原因出在兩者的鎖獲取邏輯根本不同。
+
+**DB2/MSSQL：每個讀取的行都要鎖。** 當執行一條 `UPDATE users SET name = 'A' WHERE age = 18` 且 `age` 沒有 index 時，引擎走 Table Scan。在掃描過程中，DB2/MSSQL 對每一行做的是：
+
+```
+讀取 row（檢查 age = 18?）
+  → 檢查前先鎖定這一行（row-level X / U lock，放入 Lock Manager）
+  → 檢查 WHERE 條件：如果是 → 留在鎖定狀態，準備 UPDATE；如果不是 → 釋放鎖
+  → 繼續下一行...
+```
+
+這意味著掃描 1000 萬行的表、只匹配 100 行——Lock Manager 仍然**建立並釋放了 1000 萬個 row lock object**（MSSQL 對鎖有最佳化，不符合的行會釋放，但「先鎖後放」的過程本身就是巨大的 Lock Manager 壓力）。更致命的是，閾值通常只算「同一瞬間持有的鎖數量」——SQL Server 的鎖升級閾值預設約 5000 個同顆粒度的鎖，一張大表走到一半就觸發了，**直接升級成 Table X Lock，SELECT 全部堵死**。
+
+> **那 `SELECT ... WITH (NOLOCK)` 能穿過 Table X Lock 嗎？**
+>
+> 答案是：**Data X Lock 可穿，但 dirty read；Sch-M Lock 仍然擋死。** `NOLOCK` 的本質是跳過 shared lock 獲取、也不尊重別人的 exclusive data lock。但它不免疫架構鎖：
+>
+> | MSSQL 鎖類型 | 來源 | `NOLOCK` 可讀？ |
+> |---|---|---|
+> | Data X Lock（Table Scan 或 Lock Escalation） | 資料層——某 transaction 鎖定了整張表的資料 | ✅ 可讀到（但拿到的是未提交的 dirty data：重複讀、漏讀、幽靈資料） |
+> | Sch-M Lock（Schema Modification） | 架構層——`ALTER TABLE` 正在改表結構 | ❌ **仍然擋死**——NOLOCK 也穿不過 |
+>
+> DBA 普遍禁止 NOLOCK 不是因為它無效，而是 dirty read 的代價比等鎖更大——你讀到的可能是 rollback 前的幽靈資料。與其 NOLOCK 冒險，不如修根源：**加 index 讓 UPDATE 走 Index Seek 而非 Table Scan**。
+
+| DB2/MSSQL 的 Seq Scan 行為 | PostgreSQL 的 Seq Scan 行為 |
+|---|---|
+| 每讀一行 → Lock Manager 建立 row lock object | 每讀一行 → 只是從 buffer/disk 讀取 tuple |
+| 行鎖計入 Lock Manager 記憶體 | 行鎖寫在 tuple header（零記憶體成本） |
+| 鎖數量到達 5000 → Lock Escalation → Table Lock | 永遠不會觸發任何升級 |
+| 只有匹配的 row 保留鎖，其他釋放（但過程中已消耗大量 CPU） | 只有匹配的 row 才寫入 xmax，不匹配的完全不碰 |
+
+> **新手白話**：DB2/MSSQL 的 Seq Scan 就像**逐家逐戶敲門檢查**——檢查完不是目標就放走，但「敲門」這個動作本身就是 Lock Manager 的開銷。敲了 5000 家門後，警衛室直接受不了，乾脆整條街封鎖（鎖升級）。PostgreSQL 的 Seq Scan 就像**拿著名單在街上走，眼睛掃過去，只在名單上的人家才敲門**——沒在名單上的連看都不看，警衛室完全無感。
+
+**為什麼 PostgreSQL 的 Seq Scan 不需要「先鎖後放」？**
+
+因為 MVCC snapshot 機制。Seq Scan 開始時，PG 會建立一個 transaction snapshot，定義「哪些行的哪些版本對此交易可見」。掃描過程中：
+- 看到的每一行都已經被 snapshot 決定是可見或不可見，**不需行鎖就能安全讀取**
+- 只有真正要 UPDATE 的行才在 tuple header 寫入 `xmax`（行鎖），而這個動作完全繞過 Lock Manager
+
+這也是為什麼 §3.2.II 說「行鎖是 MVCC 的副產品」——Seq Scan 的安全性由 snapshot 保證，不是由鎖保證。鎖只用在寫入的那一瞬間。
+
+---
+
+## 3. 四種行級鎖模式與衝突矩陣（PG 9.3+）
+
+PostgreSQL 9.3 開始把行鎖細分為四種模式，解決了 PG 9.2 之前一個經典問題：`SELECT ... FOR UPDATE` 會堵塞外鍵檢查（因為外鍵檢查也需要行鎖）。
+
+### I. 四種模式速查
+
+| 行鎖模式 | SQL 觸發方式 | 強度 | 典型場景 |
+|---------|------------|:----:|------|
+| **For Key Share** | `SELECT ... FOR KEY SHARE`，外鍵檢查自動使用 | 最弱 | 外鍵約束檢查：確認父表 row 存在，但不修改它 |
+| **For Share** | `SELECT ... FOR SHARE` | 次弱 | 讀取 row 並確保不被修改，但允許其他人也 `FOR SHARE` |
+| **For No Key Update** | `INSERT`、`UPDATE`（不碰 PK/UK）、`DELETE`、`SELECT ... FOR NO KEY UPDATE` | 次強 | 常規 DML——只改非鍵欄位 |
+| **For Update** | `SELECT ... FOR UPDATE`、`UPDATE`（修改 PK/UK） | 最強 | 改主鍵或唯一鍵、或顯式要求獨佔整行 |
+
+> **關鍵認知**：一般的 `UPDATE`（不改主鍵）預設拿的是 **For No Key Update**，不是 For Update！這就是 PG 9.3 的改進——讓外鍵檢查（For Key Share）和一般 UPDATE（For No Key Update）可以並行，不再互卡。
+
+### II. 行鎖衝突矩陣
+
+「持有 x 鎖時，請求 y 鎖會衝突嗎？」
+
+| 持有 ↓ \ 請求 → | For Key Share | For Share | For No Key Update | For Update |
+|:----:|:---:|:---:|:---:|:---:|
+| **For Key Share** | ✅ 不衝突 | ✅ 不衝突 | ✅ 不衝突 | ❌ 衝突 |
+| **For Share** | ✅ 不衝突 | ✅ 不衝突 | ❌ 衝突 | ❌ 衝突 |
+| **For No Key Update** | ✅ 不衝突 | ❌ 衝突 | ❌ 衝突 | ❌ 衝突 |
+| **For Update** | ❌ 衝突 | ❌ 衝突 | ❌ 衝突 | ❌ 衝突 |
+
+> **新手白話**：記憶技巧——從上到下（從 For Key Share 到 For Update），鎖越來越強，容忍的鎖越來越少。For Update 是獨裁者——跟所有模式都衝突。For Key Share 最隨和——只不準 For Update 進來。
+
+```mermaid
+flowchart TD
+    subgraph row_locks["四種行鎖模式 (弱 → 強)"]
+        FKS["🔑 <b>For Key Share</b><br/>(外鍵檢查)"]
+        FS["🔒 <b>For Share</b><br/>(SELECT FOR SHARE)"]
+        FNKU["🔐 <b>For No Key Update</b><br/>(一般 UPDATE / INSERT / DELETE)"]
+        FU["🔴 <b>For Update</b><br/>(UPDATE PK / SELECT FOR UPDATE)"]
+    end
+
+    FKS --> FS --> FNKU --> FU
+
+    subgraph conflict_rule["衝突規則"]
+        C1["For Key Share 只不讓 For Update"]
+        C2["For Share 不讓 No Key Update / For Update"]
+        C3["For No Key Update 不讓 For Share / No Key Update / For Update"]
+        C4["For Update 跟所有人衝突"]
+    end
+
+    style FU fill:#ff6b6b,color:#fff
+    style FKS fill:#6bcf7f
+```
+
+---
+
+## 4. 實務陷阱與避免方法
+
+### I. DDL 的 AccessExclusiveLock 可以無視行鎖堵死一切
+
+**陷阱**：即使你只 `UPDATE` 了一行（行鎖很輕），`ALTER TABLE` 依然要拿 `AccessExclusiveLock`（Level 8，表級最強鎖），而 `RowExclusiveLock`（Level 3）正好與它衝突。結果是：
+
+```
+Session A: UPDATE users SET name = 'foo' WHERE id = 1;  -- 持有 RowExclusiveLock + xmax
+Session B: ALTER TABLE users ADD COLUMN age INT;          -- 等 AccessExclusiveLock → 被 A 的 RowExclusiveLock 擋住
+Session C: SELECT * FROM users WHERE id = 2;              -- 等 AccessShareLock → 被 B 的 pending lock 堵住（Lock Queue Pileup，見一篇 §2.III）
+```
+
+即使 Session A 只鎖了 1 行，Session C 讀取完全不同的行（id=2），仍然被 B 的 pending DDL 堵死。
+
+**避免方法**：
+- DDL 前加 `SET lock_timeout = '2s';`，拿不到鎖就直接失敗而非排隊
+- 先檢查 `pg_stat_activity` 是否有 long transaction
+- 大表的 DDL 考慮使用 `pg_repack`（外部擴展，見 §3.IV 詳解）、`CREATE INDEX CONCURRENTLY` 等 online 方案
+
+### II. 多行更新不按順序 → 死鎖
+
+```sql
+-- Session A
+BEGIN;
+UPDATE users SET name = 'A' WHERE id = 1;
+UPDATE users SET name = 'A' WHERE id = 2;  -- 等 Session B 釋放 id=2
+COMMIT;
+
+-- Session B
+BEGIN;
+UPDATE users SET name = 'B' WHERE id = 2;
+UPDATE users SET name = 'B' WHERE id = 1;  -- 等 Session A 釋放 id=1
+COMMIT;                                     -- 💀 DEADLOCK！
+```
+
+即使 PG 有死鎖檢測（`deadlock_timeout` 預設 1 秒），大量死鎖仍消耗 CPU。
+
+**避免方法**：
+- **固定更新順序**：所有 batch 都按相同順序（如 `ORDER BY id`）鎖定 row
+- **使用 SKIP LOCKED**：批次處理 queue 模型時，跳過被鎖的行（見二篇 §2.II）
+- **減少 transaction 持有行鎖的時間**：把跟鎖無關的邏輯（如外部 HTTP call）移到 transaction 外面
+
+### III. 如何用 `pg_locks` 同時監控行鎖與表鎖
+
+```sql
+-- 查看目前所有鎖（含行鎖 tuple 級別）
+SELECT locktype, mode, granted,
+       relation::regclass AS table_name,
+       page, tuple,
+       pid, now() - wait_start AS wait_duration
+FROM pg_locks
+WHERE locktype IN ('relation', 'tuple')
+ORDER BY granted, wait_start;
+```
+
+| `locktype` | 含義 | 何時出現 |
+|-----------|------|------|
+| `relation` | 表級鎖（8 種等級） | 幾乎每次操作都有 |
+| `tuple` | 行級鎖（出現在 Lock Manager 中） | 僅在**多個 transaction 同時鎖定同一行且有人正在等待**時出現 |
+| `transactionid` | 交易 ID 鎖 | 等待另一個 transaction 完成 |
+
+> **新手白話**：`locktype = 'tuple'` 在 `pg_locks` 中**不常出現**，因為正常情況下行鎖只存在於 tuple header。唯有當「A 鎖了 row_1，B 也來鎖 row_1」時，B 的等待才會在 Lock Manager 中建立一個 `tuple` 類型的等待紀錄。所以 `pg_locks` 中看到 `tuple` 類型條目 = 有行鎖衝突正在排隊。
+
+```mermaid
+flowchart TD
+    Q["如何判斷鎖瓶頸在哪？"]
+    Q -->|"pg_locks 中 locktype = 'relation'<br/>且 mode 是 AccessExclusiveLock"| A1["表級鎖衝突<br/>檢查是否有人在等 DDL"]
+    Q -->|"pg_locks 中 locktype = 'tuple'<br/>有人等待同一行"| A2["行級鎖衝突<br/>檢查 pg_blocking_pids 找阻塞者"]
+    Q -->|"pg_locks 中 locktype = 'transactionid'"| A3["交易 ID 鎖<br/>有一個 transaction 持有鎖但未 COMMIT"]
+
+    style A1 fill:#ff6b6b,color:#fff
+    style A2 fill:#ffd93d
+    style A3 fill:#ffd93d
+```
 
 ---
 
