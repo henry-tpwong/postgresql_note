@@ -62,122 +62,667 @@ flowchart TD
 
 ---
 
-## 2. 監測慢查詢：pg_stat_activity
+## 2. 監測慢查詢：pg_stat_activity 生產環境實戰
 
-### I. 什麼是 pg_stat_activity？
+### I. pg_stat_activity 基本概念
 
-`pg_stat_activity` 是 PostgreSQL 內建的一張系統檢視表（view）。想像它是資料庫的「即時監視器畫面」— 你一眼就能看到現在有多少人在連線、每個人正在跑什麼 SQL、已經跑了多久、有沒有卡住。這是追查慢查詢的「第一線工具」，也是最重要的一張表。
+#### a. 它不是 real-time table，是 shared memory 的 view
 
-### II. 監測查詢
+`pg_stat_activity` 不是一張會被 `INSERT` / `UPDATE` 的實體表。它是 PostgreSQL 從 shared memory 中即時讀取每個 backend process 的狀態資訊、再拼裝出來的 view。這件事有兩個重要含義：
 
-```sql
-SELECT
-  datname, pid, leader_pid, usename, application_name,
-  client_addr, client_port, backend_type,
-  xact_start, query_start, state_change,
-  wait_event_type, wait_event,
-  state, backend_xid, backend_xmin,
-  query_id, query,
-  now() - xact_start AS xact_duration,
-  now() - query_start AS query_duration
-FROM pg_stat_activity
-WHERE state <> 'idle'
-  AND (backend_xid IS NOT NULL OR backend_xmin IS NOT NULL)
-ORDER BY now() - xact_start;
+1. **「即時」有延遲**：`query` 欄位顯示的 SQL 是該 process 上一次更新 shared memory 時的內容。如果 process 正在忙（跑在 CPU 上），它可能還沒來得及更新 `pg_stat_activity` 中的 `query` 欄位，所以你可能看到的是「上一條 SQL」而不是「正在跑的 SQL」
+2. **查詢本身幾乎無鎖**：因為是讀 shared memory，不需要鎖表，在多並發環境下不會造成阻塞
+
+> 補充（Senior Dev）：正因 `pg_stat_activity` 來自 shared memory，「頻繁查詢」本身不會造成 lock contention。但極高頻率的查詢（例如每秒上百次）仍會消耗 CPU，建議 app 端做 caching（如 5-10 秒刷新一次）。
+
+#### b. Session State 狀態機
+
+每個 PostgreSQL session 的核心狀態由 `state` 欄位表示。三種狀態的轉換反映了 session 的生命週期：
+
+```mermaid
+stateDiagram-v2
+    [*] --> idle : 建立連線
+    idle --> active : 收到 SQL 開始執行
+    active --> idle : SQL 執行完畢
+    active --> idle_in_transaction : SQL 跑完但沒 COMMIT
+    idle_in_transaction --> active : 下一條 SQL 開始執行
+    idle_in_transaction --> idle : COMMIT / ROLLBACK
+
+    note right of idle : ✅ 安全狀態\n無鎖、無事務、不佔資源
+    note right of active : ⚡ 正在消耗 CPU / I/O
+    note right of idle_in_transaction : 💀 隱形殺手\n持有鎖、持有 snapshot\n阻止 VACUUM
 ```
 
-### III. 重點欄位白話解釋
+| 狀態 | 含義 | 風險 |
+|------|------|------|
+| `idle` | 連線閒置，沒有正在執行的事務 | 無風險，連線池正常狀態 |
+| `active` | 正在執行 SQL | 正常，但關注 `wait_event` |
+| `idle in transaction` | 有事務開啟但閒置中（沒 COMMIT） | **高風險** — 持有鎖不釋放、持有 snapshot 阻止 VACUUM |
+| `idle in transaction (aborted)` | 事務中發生錯誤但尚未 ROLLBACK | **極高風險** — 同上，且應用程式可能不知道已出錯 |
 
-| 欄位 | 白話含義 | 為什麼重要 |
-|------|---------|-----------|
-| `pid` | 該連線的作業系統 process ID | 你可以用這個 ID 在 OS 層做更深入的分析（如看 stack trace） |
-| `datname` | 正在操作的資料庫名稱 | 確認問題發生在哪個資料庫 |
-| `usename` | 登入的用戶名稱 | 確認是誰觸發的 |
-| `application_name` | 應用程式的名稱 | 確認是從哪個服務發出的 |
-| `client_addr` / `client_port` | 用戶端的 IP 和 port | 追蹤來源機器 |
-| `state` | 當前狀態：`active`（正在執行）/ `idle`（空閒）/ `idle in transaction`（有事務但放著不動） | **idle in transaction 是隱形殺手** — 看起來沒在做事，但持有鎖不放 |
-| `xact_start` | 事務開始的時間 | 用 `now() - xact_start` 就知道事務已經跑了多久 |
-| `query_start` | 當前這條 SQL 開始執行的時間 | 用 `now() - query_start` 就知道這條 SQL 已經跑了多久 |
-| `query` | 正在執行的 SQL 語句 | 讓你看到「兇手長什麼樣子」 |
-| `wait_event_type` / `wait_event` | 正在等待什麼（PG 9.6+） | **最關鍵的欄位** — 直接告訴你瓶頸在哪裡，是等鎖、等 I/O、還是等 CPU |
-| `backend_type` | process 的類型 | 區分是一般用戶查詢、還是 autovacuum、還是 WAL sender |
-| `backend_xid` / `backend_xmin` | 事務 ID 和最小的活躍事務 ID | 非 NULL 表示有事務在進行中，也可能正在阻止 vacuum 清理死資料 |
-| `query_id` | SQL 指紋識別碼（PG 14+） | 可以和 `pg_stat_statements` 關聯，看到這條 SQL 的歷史統計 |
-| `leader_pid` | parallel worker 所屬的主 process（PG 15+） | 當一條查詢用了多個 CPU 平行處理時，可以追溯到主控 process |
+#### c. Slow Query 的根源只有 4 種
 
-> **補充（.NET / IIS / Windows Service）**：`pg_stat_activity.pid` 是 PostgreSQL **內部**的後端 process PID，不是你 .NET 應用程式的 PID，因此無法直接用來對應 IIS 站台或 Windows Service 執行個體。正確做法是透過 Npgsql 連線字串設定 `Application Name`：
->
-> ```
-> Host=xxx;Database=xxx;Username=xxx;Password=xxx;Application Name=WebAPI-Instance01
-> ```
->
-> 這樣在 `pg_stat_activity.application_name` 就能看到是哪個 instance：
->
-> ```sql
-> SELECT pid, application_name, client_addr, state, query
-> FROM pg_stat_activity
-> WHERE application_name LIKE 'WebAPI%';
-> ```
->
-> | 部署方式 | 建議的 Application Name 設定 |
-> |---------|--------------------------|
-> | IIS WebAPI | appsettings.json 或環境變數，每個站台/應用程式集區設不同名稱 |
-> | Windows Service | appsettings.json，每個服務執行個體設不同名稱 |
-> | 多台機器 | 組合 `{ServiceName}-{MachineName}-{Env}` |
->
-> 另一種補強方式：在 Dapper 執行前用 `SET application_name TO 'xxx'` 動態切換，或透過 NpgsqlDataSource 針對不同邏輯區塊設不同名稱。
+```mermaid
+flowchart TB
+    SLOW["🐌 一條 SQL 很慢"]
+    SLOW --> LOCK["🔒 Lock Wait<br/>等別人釋放鎖"]
+    SLOW --> IO["💿 I/O Wait<br/>等磁碟讀寫"]
+    SLOW --> CPU["🧠 CPU Compute<br/>大量計算（sort / hash / JIT）"]
+    SLOW --> CLIENT["🌐 Client Wait<br/>等網路傳輸 / 等應用程式讀取結果"]
 
-### IV. 為什麼過濾條件很重要？
+    style SLOW fill:#ff6b6b,color:#fff
+    style LOCK fill:#e74c3c,color:#fff
+    style IO fill:#ffd43b
+    style CPU fill:#74c0fc
+    style CLIENT fill:#9775fa,color:#fff
+```
 
-過濾條件 `state <> 'idle'` 加上 `backend_xid IS NOT NULL OR backend_xmin IS NOT NULL` 確保只抓仍在 active transaction 中的 session。
+這四種類型對應到 `wait_event_type` 的四個主要分類：`Lock`、`IO`、`CPU`、`Client`。`LWLock` 和 `BufferPin` 是更底層的內部鎖。
+
+**Application Developer 的第一反應不是看 SQL 內容，而是看 `wait_event`**。因為 SQL 是你寫的，你已經知道它長什麼樣子；但瓶頸在哪裡，必須靠 `wait_event` 來判斷。
+
+---
+
+### II. 生產環境最關鍵的 5 個欄位
+
+`pg_stat_activity` 有 30+ 個欄位，但現場排查時你只需要先看這 5 個：
+
+| # | 欄位 | 問的問題 | 典型值 |
+|---|------|---------|--------|
+| 1 | `state` | 「它在做什麼？」 | `active` / `idle` / `idle in transaction` |
+| 2 | `wait_event_type` + `wait_event` | 「它卡在哪裡？」 | `Lock` / `IO` / `Client` / `LWLock` / `CPU` |
+| 3 | `query_start` | 「這條 SQL 跑了多久？」 | `now() - query_start` |
+| 4 | `xact_start` | 「這個事務開了多久？」 | `now() - xact_start`（idle in transaction 時這個值會很大但 query_start 不變） |
+| 5 | `query` | 「它正在跑什麼 SQL？」 | 可能被截斷（預設 1024 bytes），PG 14+ 可調 `track_activity_query_size` |
 
 ```mermaid
 flowchart LR
-    subgraph 所有連線
-        A["idle<br/>（空閒中，沒事）"]
-        B["active<br/>（正在執行 SQL）"]
-        C["idle in transaction<br/>（有事務但放著不動）"]
+    subgraph Core["核心診斷欄位"]
+        S["state"]
+        W["wait_event"]
+        QS["query_start"]
+        XS["xact_start"]
+        Q["query"]
     end
-    
-    subgraph 過濾結果
-        D["❌ idle 被過濾掉"]
-        E["✅ 真正需要關注的<br/>只有 active 和<br/>idle in transaction"]
-    end
-    
-    A --> D
-    B --> E
-    C --> E
-    
-    style D fill:#ddd
-    style E fill:#ffd43b
-```
 
-> 補充（Senior Dev）：`backend_xmin` 非 NULL 代表該 session 持有 snapshot 正在阻止 vacuum 清理 dead tuple，即使 query 本身是 idle 狀態。在排查慢查詢時，這類 session 可能不是「慢」而是「卡住別人」，應一起納入監控。PG 14+ 可用 `wait_event` 欄位直接區分 `Lock` / `LWLock` / `BufferPin` / `IO` 等等待類型，不必再猜測瓶頸方向。
+    S --> |"active + wait_event=Lock"| LOCK["🔒 → 查 pg_blocking_pids()"]
+    S --> |"active + wait_event=IO"| IO["💿 → 查 pg_stat_io"]
+    S --> |"active + wait_event=NULL"| CPU["🧠 → 查 pg_stat_statements"]
+    S --> |"idle in transaction<br/>xact_start 很久以前"| IDLE["💀 → 準備 kill"]
+    S --> |"active + wait_event=Client"| CLIENT["🌐 → 查網路"]
 
-### V. Wait Events：從「猜測瓶頸」到「直接知道瓶頸」
+    W --> LOCK
+    W --> IO
+    W --> CPU
+    W --> CLIENT
 
-在 PG 9.6 之前，只有一個 `waiting` 欄位（true/false），你只知道「有人在等」，但不知道在等什麼。PG 9.6 之後，`wait_event_type` 和 `wait_event` 直接告訴你答案：
-
-```mermaid
-graph TB
-    W["wait_event_type"] --> L["Lock<br/>等待 heavy-weight 鎖"]
-    W --> LW["LWLock<br/>等待輕量級鎖<br/>（內部資料結構保護）"]
-    W --> IO["IO<br/>等待磁碟讀寫"]
-    W --> CPU["CPU<br/>排隊等 CPU"]
-    W --> Client["Client<br/>等用戶端讀取結果"]
-    W --> BufferPin["BufferPin<br/>等 buffer page 解鎖"]
-    W --> IPC["IPC<br/>等其他 process"]
-    
-    style L fill:#ff6b6b,color:#fff
+    style LOCK fill:#ff6b6b,color:#fff
     style IO fill:#ffd43b
     style CPU fill:#74c0fc
+    style IDLE fill:#e74c3c,color:#fff
+    style CLIENT fill:#9775fa,color:#fff
 ```
 
-> [PG 9.6+] `waiting` 欄位在 PG 9.6 被 `wait_event_type` 和 `wait_event` 取代，提供更精細的等待分類（如 `LWLock`、`Lock`、`IO`、`Client`、`CPU` 等）。
+---
+
+### III. 場景 1：用戶說「網站很慢」— 30 秒初步判斷
+
+#### a. 原理
+
+慢查詢的診斷不需要從頭開始猜。你只需要問一個問題：「PostgreSQL 覺得自己在等什麼？」答案就在 `wait_event`。
+
+#### b. 即用查詢：一眼看到誰在慢、在等什麼
+
+```sql
+-- 你唯一需要記住的一條查詢
+SELECT
+    pid,
+    usename,
+    application_name,
+    state,
+    wait_event_type || '/' || wait_event AS waiting_on,
+    now() - query_start AS query_duration,
+    now() - xact_start AS xact_duration,
+    LEFT(query, 200) AS query_preview
+FROM pg_stat_activity
+WHERE state = 'active'
+  AND backend_type = 'client backend'
+ORDER BY query_start;
+```
+
+看懂這條結果：
+- `waiting_on = NULL` → 正在跑，沒在等（CPU bound，查 SQL 本身）
+- `waiting_on = Lock/transactionid` → 等著拿 row lock（被別的 transaction 卡住）
+- `waiting_on = Lock/relation` → 等著拿 table lock（通常有人跑 DDL）
+- `waiting_on = IO/DataFileRead` → 等磁碟讀取（shared buffer 不夠 / 索引不好）
+- `waiting_on = Client/ClientRead` → 等 application 收結果（網路慢 / app 沒在讀）
+
+#### c. 30 秒決策圖
+
+```mermaid
+flowchart TD
+    SLOW["🚨 網站慢"]
+    SLOW --> Q["跑那條 SQL<br/>看 wait_event"]
+
+    Q --> LOCK{"wait_event_type<br/>= Lock？"}
+    LOCK -->|"是"| LOCK_ACT["→ 場景 2：查 blocking chain<br/>pg_blocking_pids(pid)"]
+    LOCK -->|"否"| IO{"wait_event_type<br/>= IO？"}
+    IO -->|"是"| IO_ACT["→ 看 pg_stat_io<br/>buffer 命中率是否太低<br/>或磁碟瓶頸"]
+    IO -->|"否"| CLIENT{"wait_event_type<br/>= Client？"}
+    CLIENT -->|"是"| CLIENT_ACT["→ 查網路延遲<br/>或 app 端是否在等"]
+    CLIENT -->|"否"| CPU_ACT["→ CPU bound<br/>查 SQL 本身 + pg_stat_statements<br/>是否 plan 不優 / 參數差異"]
+
+    style SLOW fill:#ff6b6b,color:#fff
+    style LOCK_ACT fill:#e74c3c,color:#fff
+    style IO_ACT fill:#ffd43b
+    style CLIENT_ACT fill:#9775fa,color:#fff
+    style CPU_ACT fill:#74c0fc
+```
+
+---
+
+### IV. 場景 2：鎖住了 — 誰擋了誰？
+
+#### a. 原理
+
+PostgreSQL 使用 **MVCC + row-level lock**。關鍵認知：
+
+1. **Row-level lock 存在 tuple header 中（xmax 欄位）**，不是獨立的 lock table。`UPDATE` 會在舊 tuple 的 `xmax` 寫入自己的 XID，讓其他 session 知道「這行我正在改」
+2. **`pg_locks` 記錄的是「heavy-weight lock」** — 也就是 table-level lock。Row-level lock 不會出現在 `pg_locks` 中，除非等待超過一定時間（升級為 multi-xact）
+3. **SELECT 通常不加鎖**。但 `SELECT ... FOR UPDATE` 會加 `RowShareLock`。如果你的純 SELECT 也被卡住，可能是讀的那行剛好被別人 UPDATE 了（此時等待的是 `Lock/transactionid`）
+
+```mermaid
+flowchart LR
+    T1["Transaction A<br/>UPDATE users SET name='Bob'<br/>WHERE id=1<br/>（沒 COMMIT）"] --> |"持有 row lock<br/>xmax = XID_A"| ROW["Row id=1 🔒"]
+
+    T2["Transaction B<br/>UPDATE users SET age=30<br/>WHERE id=1<br/>（等待中...）"] --> |"wait_event<br/>= Lock/transactionid"| ROW
+
+    T3["Transaction C<br/>SELECT * FROM users<br/>WHERE id=1<br/>FOR UPDATE<br/>（也在等...）"] --> |"也在等同一行"| ROW
+
+    style T1 fill:#e74c3c,color:#fff
+    style T2 fill:#ffd43b
+    style T3 fill:#ffd43b
+    style ROW fill:#e74c3c,color:#fff
+```
+
+> **App Dev 視角**：最常見的鎖阻塞場景不是你寫的 SQL 有問題，而是**上一條 SQL 執行完後忘了 COMMIT**。例如：`using (var tx = conn.BeginTransaction())` 裡面跑了 UPDATE，但中間做了外部 API call，API call timeout 之後整個 method 拋 exception，`tx.Commit()` 沒跑到，`tx.Dispose()` 也沒跑（因為沒有 try-finally 或有 finally 但 Dispose 在 using 內）。結果就是一個 idle in transaction 的 session 持著 row lock 不放。
+
+#### b. 即用查詢：一行查出阻塞樹
+
+```sql
+-- PG 9.6+：一行查出誰在等誰
+SELECT
+    blocked.pid AS blocked_pid,
+    blocked.query AS blocked_query,
+    blocked.wait_event_type || '/' || blocked.wait_event AS blocked_waiting_on,
+    blocking.pid AS blocking_pid,
+    blocking.query AS blocking_query,
+    blocking.state AS blocking_state,
+    now() - blocking.xact_start AS blocking_xact_duration,
+    now() - blocking.query_start AS blocking_query_duration
+FROM pg_stat_activity blocked
+JOIN pg_stat_activity blocking
+    ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
+WHERE blocked.wait_event_type = 'Lock'
+ORDER BY blocking_xact_duration DESC;
+```
+
+#### c. 鎖等待鏈的遞迴追查
+
+`pg_blocking_pids()` 只回傳直接鎖住的 PID，但阻塞可能是多層的（A 等 B，B 等 C，C 才是 root cause）。用 recursive CTE 找出完整等待鏈：
+
+```sql
+WITH RECURSIVE lock_chain AS (
+    -- 起點：所有正在等鎖的 session
+    SELECT
+        pid,
+        pid AS blocked_by,
+        wait_event,
+        query,
+        state,
+        1 AS depth,
+        ARRAY[pid] AS path
+    FROM pg_stat_activity
+    WHERE wait_event_type = 'Lock'
+
+    UNION ALL
+
+    -- 遞迴：追 blocking PID
+    SELECT
+        lc.pid,
+        blk.pid AS blocked_by,
+        blk.wait_event,
+        blk.query,
+        blk.state,
+        lc.depth + 1,
+        lc.path || blk.pid
+    FROM lock_chain lc
+    JOIN pg_stat_activity sa ON sa.pid = lc.blocked_by
+    CROSS JOIN LATERAL unnest(pg_blocking_pids(lc.blocked_by)) AS blk(pid)
+    JOIN pg_stat_activity blk2 ON blk2.pid = blk.pid
+    WHERE NOT blk.pid = ANY(lc.path)  -- 防止循環
+)
+SELECT DISTINCT ON (pid) * FROM lock_chain
+ORDER BY pid, depth DESC;
+```
+
+```mermaid
+flowchart TD
+    subgraph Chain["鎖等待鏈"]
+        A["pid=101 在等"]
+        B["pid=102 在等"]
+        C["pid=103（ROOT）"]
+
+        A -->|"被 blocked by"| B
+        B -->|"被 blocked by"| C
+    end
+
+    C --> |"pid=103 狀態是<br/>idle in transaction<br/>xact_start = 10 min ago"| ROOT["💀 真正的元兇<br/>忘了 COMMIT"]
+
+    style C fill:#e74c3c,color:#fff
+    style ROOT fill:#e74c3c,color:#fff
+```
+
+#### d. 解法優先級
+
+| 優先級 | 行動 | 說明 |
+|--------|------|------|
+| 1 | 通知 blocking session 的 owner | 如果它是自己團隊的 app，找出為什麼忘了 COMMIT |
+| 2 | `SELECT pg_terminate_backend(pid)` | 應急：kill 掉 blocking session（注意：transaction 會 rollback） |
+| 3 | `SET idle_in_transaction_session_timeout` | 長期解法：PG 10+ 自動殺掉閒置太久的事務 |
+
+---
+
+### V. 場景 3：同一條 SQL 平時很快，突然慢了
+
+#### a. 原理：Execution Plan 為什麼會變？
+
+```mermaid
+flowchart TB
+    subgraph Normal["✅ 正常 plan（快）"]
+        N1["SELECT * FROM orders<br/>WHERE status = 'active'<br/>AND create_time > '2026-05-01'"]
+        N2["Planner 估算：active 只佔 5%<br/>→ 走 Index Scan on idx_status<br/>→ 再 filter create_time"]
+        N3["⚡ 5ms 完成"]
+    end
+
+    subgraph Bad["❌ Bad plan（慢）"]
+        B1["同一條 SQL<br/>但參數值不同（parameter sniffing）"]
+        B2["Planner 估算：這個 status 值佔 80%<br/>→ 走 Seq Scan 整表掃描"]
+        B3["🐌 3 秒完成"]
+    end
+
+    N1 --> N2 --> N3
+    B1 --> B2 --> B3
+
+    style N3 fill:#2ecc71,color:#fff
+    style B3 fill:#e74c3c,color:#fff
+```
+
+Plan 變化的兩個主因：
+
+1. **統計資訊過時**：`autoanalyze` 沒跟上寫入速度，`pg_statistic` 中的 `n_distinct` / `most_common_vals` 不準，planner 基於錯誤數據選擇了 bad plan
+2. **Parameter Sniffing**：同一條 prepared statement，第一次 plan 時基於參數 `status='active'`（高選擇率）選擇了 Index Scan；之後參數變成 `status='archived'`（低選擇率）時仍使用相同的 cached plan（generic plan），導致全表掃描
+
+#### b. 為什麼不能直接在 production 跑 EXPLAIN ANALYZE 找原因？
+
+- `EXPLAIN ANALYZE` 會**真的執行**這條查詢，等於額外加重了資料庫負擔
+- 你現在跑 `EXPLAIN ANALYZE` 看到的 plan 是**當下的 plan**，不一定是出事當時的 plan（如果 autoanalyze 在事後觸發了，統計資訊已經更新）
+- 在 production 高負載時跑 `EXPLAIN ANALYZE` 可能讓情況更糟
+
+#### c. 即用查詢：從 pg_stat_statements 找出不穩定的 SQL
+
+```sql
+-- 找出執行時間差異極大的 SQL（plan 可能不穩定）
+SELECT
+    queryid,
+    LEFT(query, 150) AS query_preview,
+    calls,
+    mean_exec_time::numeric(18,2) AS avg_ms,
+    stddev_exec_time::numeric(18,2) AS stddev_ms,
+    CASE WHEN mean_exec_time > 0
+         THEN (stddev_exec_time / mean_exec_time * 100)::numeric(18,1)
+         ELSE 0
+    END AS variability_pct,
+    min_exec_time::numeric(18,2) AS min_ms,
+    max_exec_time::numeric(18,2) AS max_ms,
+    total_plan_time::numeric(18,2) AS total_plan_ms,
+    total_exec_time::numeric(18,2) AS total_exec_ms
+FROM pg_stat_statements
+WHERE calls > 10
+  AND mean_exec_time > 1
+ORDER BY variability_pct DESC
+LIMIT 20;
+```
+
+解讀：
+- `variability_pct > 200%`（標準差是平均值的 2 倍以上）→ 這條 SQL 的效能很不穩定
+- `max_ms >> mean_ms` → 存在 bad plan 的情況
+- `total_plan_time` 很大 → planning 本身花了很多時間（可能是複雜查詢）
+
+> **為什麼同一條 queryid 執行時間會差異極大？—— `pg_stat_statements` 的 Query Normalization 機制**
 >
-> [PG 13+] 新增 `leader_pid` 欄位，標識 parallel worker 所屬的 leader process，方便追蹤 parallel query 的等待鏈。
+> `pg_stat_statements` 會對 SQL 做 **正規化（normalization）**：將 SQL 中的 literal constant（字串、數字、日期等）替換成 `$1, $2, ...` 再計算 hash，產生 `queryid`。也就是說，以下三條 SQL 會被歸類為**同一個 queryid**：
 >
-> [PG 14+] 新增 `query_id` 欄位（需啟用 `compute_query_id`），可直接將 `pg_stat_activity` 的 query 與 `pg_stat_statements` 的統計關聯。
+> ```sql
+> SELECT * FROM orders WHERE status = 'active'   AND create_time > '2026-05-01';
+> SELECT * FROM orders WHERE status = 'archived' AND create_time > '2026-05-15';
+> SELECT * FROM orders WHERE status = 'pending'  AND create_time > '2026-05-30';
+> ```
+>
+> 正規化後的 signature 都是：
+> ```
+> SELECT * FROM orders WHERE status = $1 AND create_time > $2
+> ```
+>
+> 這正是 `variability_pct`（變異係數）能抓出 unstable plan 的關鍵前提：**同一條正規化 SQL，因為參數值不同，可能觸發完全不同的 execution plan**。例如：
+>
+> - 參數 `status = 'active'` → 這個值只佔表的 2% → Planner 選 Index Scan → 5ms
+> - 參數 `status = 'archived'` → 這個值佔表的 70% → Planner 選 Seq Scan → 3s
+>
+> 兩個執行都累積到同一個 queryid 下，所以你會看到 `min_ms = 5`、`max_ms = 3000`、`stddev_ms` 暴增、`variability_pct` 高達數百%。這就是 **Parameter Sniffing** 在統計數字上的指紋。
+>
+> ```mermaid
+> flowchart LR
+>     Q1["WHERE status = 'active'<br/>（2% selectivity）"] --> NORM["正規化 → 同一個 queryid<br/>SELECT ... WHERE status = $1"]
+>     Q2["WHERE status = 'archived'<br/>（70% selectivity）"] --> NORM
+>     Q3["WHERE status = 'pending'<br/>（28% selectivity）"] --> NORM
+>
+>     NORM --> STATS["pg_stat_statements 統計"]
+>     STATS --> RESULT["min=5ms, avg=150ms, max=3000ms<br/>stddev=1200ms, variability_pct=800%<br/>⚠️ Plan 極不穩定"]
+>
+>     style RESULT fill:#e74c3c,color:#fff
+> ```
+>
+> **驗證方法**：如果你想確認是否真的是 Parameter Sniffing 導致，可以查看 `pg_stat_statements` 中該 queryid 的 `plans`（PG 14+，pg_stat_statements >= 1.9）欄位：
+> ```sql
+> SELECT queryid, plans, calls, mean_exec_time, stddev_exec_time
+> FROM pg_stat_statements
+> WHERE queryid = 12345;
+> -- 如果 plans > 1 且 stddev_exec_time 很大 → 同一條 SQL 曾經用過不同 plan
+> ```
+>
+> **注意事項**：`ORDER BY` 中的 literal 也會被正規化，但 `LIMIT` 的值不會（LIMIT 100 和 LIMIT 1 是不同 queryid）。`IN (...)` 列表中的值會被正規化。若你使用 Prepared Statement / parameterized query（如 Dapper 的 `@status`），PG 本身就使用 `$1, $2` 傳遞參數，正規化結果與 `pg_stat_statements` 一致。
+
+#### d. App Dev 視角：你該問 DBA 的 3 個資訊
+
+| 問什麼 | 為什麼 | DBA 會查的 SQL |
+|--------|--------|---------------|
+| 這張表的 autoanalyze 上次什麼時候跑的？ | 統計資訊可能過時 | `SELECT last_autoanalyze FROM pg_stat_user_tables WHERE relname = 'orders';` |
+| 出事前有大量寫入嗎？ | 大量 INSERT/UPDATE 後 statistic 會失準 | `SELECT n_tup_ins, n_tup_upd FROM pg_stat_user_tables WHERE relname = 'orders';` |
+| 這條 SQL 有幾種不同的 plan？ | Parameter sniffing 導致 plan 切換 | `EXPLAIN (ANALYZE, BUFFERS) SELECT ...`（在 staging 或低峰期執行） |
+
+---
+
+### VI. 場景 4：連線池滿了，新連線進不來
+
+#### a. 原理
+
+```mermaid
+flowchart LR
+    subgraph Pool["連線池（max_connections = 100）"]
+        direction TB
+        C1["conn 1: active ✅"]
+        C2["conn 2: idle ✅"]
+        C3["conn 3: idle in transaction 💀"]
+        C4["conn 4: idle in transaction 💀"]
+        CX["..."]
+        C100["conn 100: idle in transaction 💀"]
+    end
+
+    NEW["新連線嘗試連入"] --> |"❌ FATAL: sorry, too many clients already"| REJECT["被拒絕"]
+
+    C3 -.-> |"xact_start 是 10 分鐘前<br/>query 是空的<br/>但它還持著 lock"| REJECT
+    C4 -.-> REJECT
+    C100 -.-> REJECT
+
+    style C3 fill:#e74c3c,color:#fff
+    style C4 fill:#e74c3c,color:#fff
+    style C100 fill:#e74c3c,color:#fff
+    style REJECT fill:#ff6b6b,color:#fff
+```
+
+PostgreSQL 每個連線 = 一個 OS process（`fork()`）。連線數上限由 `max_connections` 控制（預設 100）。每個 idle connection 約佔 5-10MB memory。`idle in transaction` 更嚴重：它還持著 lock、snapshot，阻止 VACUUM 回收 dead tuple。
+
+#### b. 即用查詢：找出佔著茅坑的 session
+
+```sql
+-- 找出 idle in transaction 超過 30 秒的 session
+SELECT
+    pid,
+    usename,
+    application_name,
+    client_addr,
+    state,
+    now() - xact_start AS xact_duration,
+    now() - state_change AS idle_duration,
+    LEFT(query, 200) AS last_query,
+    wait_event_type || '/' || wait_event AS waiting_on
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+  AND now() - state_change > interval '30 seconds'
+ORDER BY xact_start;
+```
+
+#### c. 常見原因（App Dev 自己可以修的）
+
+```csharp
+// ❌ 錯誤寫法：transaction 開了但沒保證 close
+using var conn = new NpgsqlConnection(connStr);
+conn.Open();
+var tx = conn.BeginTransaction();  // ← 事務開始
+var cmd = new NpgsqlCommand("UPDATE users SET status = 'active'", conn, tx);
+cmd.ExecuteNonQuery();
+// ⚠️ 如果中間做 HTTP call 拋了 exception...
+await httpClient.PostAsync(...);  // ← 可能 timeout
+tx.Commit();  // ← 永遠跑不到這行
+// Dispose 會 ROLLBACK，但如果 exception 在外層被 catch 吃掉...
+```
+
+```csharp
+// ✅ 正確寫法：try-finally 確保 COMMIT/ROLLBACK
+using var conn = new NpgsqlConnection(connStr);
+conn.Open();
+using var tx = conn.BeginTransaction();
+try
+{
+    var cmd = new NpgsqlCommand("UPDATE users SET status = 'active'", conn, tx);
+    cmd.ExecuteNonQuery();
+    await httpClient.PostAsync(...);
+    tx.Commit();  // ← 只有全部成功才 COMMIT
+}
+catch
+{
+    tx.Rollback();  // ← 任何失敗都 ROLLBACK
+    throw;
+}
+```
+
+#### d. 解法
+
+| 方案 | 層級 | 說明 |
+|------|------|------|
+| `idle_in_transaction_session_timeout = '5min'` | PG 10+ server | 自動 terminate 超過 N 分鐘的 idle in transaction |
+| `Connection Idle Lifetime` | 連線池（pgbouncer / Npgsql） | 連線池端設定最大 idle 時間 |
+| `using` + try-finally | Application | 確保 transaction 一定被關閉 |
+
+---
+
+### VII. 場景 5：SQL 很快，但有些時候很慢 — 難抓
+
+#### a. 原理：為什麼難抓？
+
+`pg_stat_activity` 是 **snapshot**（像一張照片），不是 **time-series**（像一段影片）。你查的那一瞬間，可能正好是「不慢」的瞬間。一條 5 秒的查詢，可能前 3 秒在等鎖、後 2 秒在 I/O 讀取。如果你只在第 1 秒時查了一次，你會看到 `wait_event=Lock`；如果你在第 4 秒查，你會看到 `wait_event=IO`。
+
+```mermaid
+gantt
+    title 一條 5 秒慢查詢的 wait_event 變化
+    dateFormat ss
+    axisFormat %S 秒
+    tickInterval 1second
+
+    section 查詢執行
+    等待 Lock          :done, lock, 00, 3s
+    I/O 讀取           :done, io, after lock, 2s
+    CPU 計算           :active, cpu, after io, 1s
+
+    section 如果你只取樣一次
+    第 1 秒取樣        :milestone, m1, 01, 0s
+    第 4 秒取樣        :milestone, m2, 04, 0s
+```
+
+- 第 1 秒取樣 → 看到 `Lock/transactionid` → 以為問題是鎖
+- 第 4 秒取樣 → 看到 `IO/DataFileRead` → 以為問題是 I/O
+- **真相：兩個都是瓶頸**。如果沒有持續取樣，你永遠只看到一部分
+
+#### b. 即用查詢：每秒取樣 pg_stat_activity（簡單版）
+
+```sql
+-- 用 psql 每秒記錄一次 pg_stat_activity 到檔案中
+-- psql -c "\watch 1" 每秒自動重複執行
+
+SELECT
+    now() AS snapshot_time,
+    pid,
+    state,
+    wait_event_type || COALESCE('/' || wait_event, '') AS wait_event_full,
+    now() - query_start AS query_duration
+FROM pg_stat_activity
+WHERE pid = :target_pid  -- 你要追蹤的 PID
+\watch 1
+```
+
+事後分析取樣結果，看 `wait_event_full` 的變化模式：
+- 全部是 `Lock/...` → 全程在等鎖
+- 前端是 `Lock/...`，後端是 `IO/...` → 先等鎖釋放，再讀資料
+- 全程是空的（無 wait）→ CPU bound，查 SQL 本身
+
+#### c. App Dev 視角：在 application log 中記錄 pg_backend_pid()
+
+```csharp
+// 當查詢超過閾值時，記錄 PID 到 application log
+var sw = Stopwatch.StartNew();
+await using var cmd = new NpgsqlCommand(sql, conn);
+
+// 拿到 PG 的 backend PID
+var backendPid = conn.ProcessID;  // Npgsql 6.0+
+
+await cmd.ExecuteNonQueryAsync();
+sw.Stop();
+
+if (sw.ElapsedMilliseconds > 3000)
+{
+    _logger.LogWarning(
+        "Slow query detected: pid={Pid}, duration={Duration}ms, sql={Sql}",
+        backendPid, sw.ElapsedMilliseconds, sql);
+}
+```
+
+出事時，從 application log 拿到 PID → 去 PostgreSQL 查 `pg_stat_activity WHERE pid = xxx`（如果還活著）或去 PG log 找（如果已結束）。
+
+---
+
+### VIII. Wait Events 速查：生產環境 Top 10
+
+`wait_event` 有 200+ 種，以下是生產環境最常見的 10 種：
+
+| wait_event | 一句話原理 | 通常誰的鍋 | 下一步 |
+|-----------|-----------|-----------|--------|
+| `Lock/transactionid` | 等著拿別人 UPDATE 中的同一行 | **App**：有人忘了 COMMIT | 查 blocking chain → kill idle in tx |
+| `Lock/relation` | 等著拿整張表的鎖（DDL 或 LOCK TABLE） | **DBA**：尖峰時段跑 DDL | 查誰在跑 ALTER TABLE |
+| `Lock/tuple` | 等著拿已刪除/更新過的舊版 row | **App**：多個 session 同時 UPDATE + SELECT FOR UPDATE | 檢查是否有不必要的 FOR UPDATE |
+| `IO/DataFileRead` | 等著從磁碟讀資料頁進 shared buffer | **DBA**：buffer 太小 / 統計過時導致 plan 走錯 | 查 pg_stat_io hits vs reads |
+| `IO/WALWrite` | 等著 WAL 寫入磁碟（commit 時） | **DBA**：WAL disk 慢 / sync 設定 | 查 WAL disk IOPS |
+| `LWLock/LockManager` | 內部鎖管理器的輕量鎖爭用 | **DB**：極高並發下正常現象 | 減少 table partition 數 / 降低並發 |
+| `LWLock/WALWriteLock` | 多個 session 同時寫 WAL | **DB**：寫入量太大 | 減少 commit 頻率 / batch insert |
+| `BufferPin` | 等著 buffer page 的 pin 被釋放 | **DBA**：vacuum 正在掃這個 page | 檢查 autovacuum 是否在尖峰執行 |
+| `Client/ClientRead` | 等 client 傳送下一條 SQL（或讀取結果） | **App**：網路慢 / app 沒在讀 | 查網路 / app GC pause |
+| `CPU` | PostgreSQL 在排隊等 OS CPU | **硬體**：CPU 不夠 / **DBA**：parallel workers 太多 | 查 CPU 使用率 / 調 `max_parallel_workers` |
+
+```mermaid
+flowchart TD
+    WE["看到 wait_event"] --> LOCK["Lock/*"]
+    WE --> IO["IO/*"]
+    WE --> LW["LWLock/*"]
+    WE --> CLIENT["Client/*"]
+    WE --> CPU2["CPU"]
+
+    LOCK --> LOCK_DETAIL{"Lock/transactionid？"}
+    LOCK_DETAIL -->|"是"| LOCK_TX["→ App Dev 的鍋<br/>（忘了 COMMIT）"]
+    LOCK_DETAIL -->|"Lock/relation"| LOCK_REL["→ DBA 的鍋<br/>（尖峰跑 DDL）"]
+    LOCK_DETAIL -->|"Lock/tuple"| LOCK_TUPLE["→ App Dev 的鍋<br/>（不必要的 FOR UPDATE）"]
+
+    IO --> IO_DETAIL{"IO/DataFileRead？"}
+    IO_DETAIL -->|"是"| IO_ACT["→ shared_buffers 太小<br/>或 bad plan 導致大量讀取"]
+    IO_DETAIL -->|"IO/WALWrite"| IO_WAL["→ WAL disk 瓶頸"]
+
+    LW --> LW_ACT["→ 高並發下的內部爭用<br/>通常不是 root cause<br/>先解決 Lock 和 IO 問題再看"]
+
+    CLIENT --> CLIENT_ACT["→ App 端問題<br/>查網路 / GC pause / 沒在讀資料"]
+
+    CPU2 --> CPU_ACT["→ 硬體瓶頸或 parallel 設定不當<br/>調 max_parallel_workers"]
+
+    style LOCK_TX fill:#e74c3c,color:#fff
+    style LOCK_REL fill:#ffd43b
+    style CPU_ACT fill:#74c0fc
+    style CLIENT_ACT fill:#9775fa,color:#fff
+```
+
+---
+
+### IX. 生產環境 SOP 總結卡片
+
+```mermaid
+flowchart TD
+    subgraph Problem["問題現象"]
+        P1["網站慢"]
+        P2["特定功能 timeout"]
+        P3["連線池滿"]
+        P4["平時快，突然慢"]
+    end
+
+    subgraph Action["行動（5 分鐘內）"]
+        A1["跑場景 1 查詢<br/>看 wait_event"]
+        A2["跑場景 1 查詢<br/>看 wait_event"]
+        A3["跑場景 4 查詢<br/>看 idle in transaction"]
+        A4["跑場景 5 取樣<br/>觀察 wait_event 變化"]
+    end
+
+    subgraph Next["下一步"]
+        N1["Lock → pg_blocking_pids()<br/>IO → pg_stat_io<br/>NULL → pg_stat_statements<br/>Client → 查網路"]
+        N2["同上"]
+        N3["kill idle in tx<br/>or 設定 timeout"]
+        N4["問 DBA 統計資訊<br/>是否過時 / plan 何時變"]
+    end
+
+    subgraph Who["通知誰"]
+        W1["Lock → App Dev<br/>IO/CPU → DBA<br/>Client → Network / App"]
+        W2["同上"]
+        W3["App Dev<br/>（檢查 transaction 管理）"]
+        W4["DBA<br/>（檢查 autoanalyze）"]
+    end
+
+    P1 --> A1 --> N1 --> W1
+    P2 --> A2 --> N2 --> W2
+    P3 --> A3 --> N3 --> W3
+    P4 --> A4 --> N4 --> W4
+
+    style P1 fill:#ff6b6b,color:#fff
+    style P2 fill:#ff6b6b,color:#fff
+    style P3 fill:#ff6b6b,color:#fff
+    style P4 fill:#ff6b6b,color:#fff
+    style N1 fill:#51cf66,color:#fff
+    style N2 fill:#51cf66,color:#fff
+    style N3 fill:#51cf66,color:#fff
+    style N4 fill:#51cf66,color:#fff
+```
+
+> 補充（Senior Dev）：`pg_stat_activity` 查詢本身幾乎無鎖，頻繁查詢不會造成 lock contention。但若每秒查詢上百次會消耗 CPU，建議 app 端做 5-10 秒的快取。另外，PG 14+ 的 `query_id`（需啟用 `compute_query_id`）可以直接將 `pg_stat_activity` 中的 SQL 與 `pg_stat_statements` 的歷史統計關聯。
+>
+> 關於 Application Name 設定（.NET / Npgsql）：
+> ```
+> Host=xxx;Database=xxx;Username=xxx;Application Name=WebAPI-Instance01
+> ```
+> 這樣在 `pg_stat_activity.application_name` 就能追蹤是哪個 instance 發出的查詢。
 
 ---
 
