@@ -1103,31 +1103,342 @@ public async Task CheckBloat(string tableName)
 
 ```mermaid
 flowchart TD
-    A["高併發場景性能優化"] --> B["連線管理"]
+    A["高併發場景性能優化"]
+
+    A --> B["連線管理"]
     A --> C["查詢優化"]
     A --> D["鎖定策略"]
     A --> E["索引選擇"]
 
-    B --> B1["Connection Pool (pgbouncer)"]
-    B --> B2["Prepared Statement"]
-    B --> B3["定期重連避免 cache 膨脹"]
+    subgraph B_GRP[" "]
+        direction TB
+        B1["Connection Pool (pgbouncer)"]
+        B2["Prepared Statement"]
+        B3["定期重連避免 cache 膨脹"]
+        B --> B1 --> B2 --> B3
+    end
 
-    C --> C1["count(*) → SELECT 1 LIMIT 1"]
-    C --> C2["EXISTS > IN"]
-    C --> C3["RETURNING 減少 roundtrip"]
-    C --> C4["避免長交易 (MVCC bloat)"]
+    subgraph C_GRP[" "]
+        direction TB
+        C1["count(*) → SELECT 1 LIMIT 1"]
+        C2["EXISTS > IN"]
+        C3["RETURNING 減少 roundtrip"]
+        C4["避免長交易 (MVCC bloat)"]
+        C --> C1 --> C2 --> C3 --> C4
+    end
 
-    D --> D1["Advisory Lock 秒殺"]
-    D --> D2["SKIP LOCKED 跳過已鎖行"]
-    D --> D3["READ COMMITTED 足夠"]
-    
-    E --> E1["B-tree: 等值/範圍查詢"]
-    E --> E2["GIN: 全文/模糊/陣列"]
-    E --> E3["GIST: 空間/KNN/範圍"]
-    E --> E4["BRIN: 時序大表"]
+    subgraph D_GRP[" "]
+        direction TB
+        D1["Advisory Lock 秒殺"]
+        D2["SKIP LOCKED 跳過已鎖行"]
+        D3["READ COMMITTED 足夠"]
+        D --> D1 --> D2 --> D3
+    end
+
+    subgraph E_GRP[" "]
+        direction TB
+        E1["B-tree: 等值/範圍查詢"]
+        E2["GIN: 全文/模糊/陣列"]
+        E3["GIST: 空間/KNN/範圍"]
+        E4["BRIN: 時序大表"]
+        E --> E1 --> E2 --> E3 --> E4
+    end
 ```
 
-### I. 強制規範
+### I. Prepared Statement：三個 PG 核心使用場景
+
+PostgreSQL 收到一條 SQL 後需經過四步：**解析（Parse）→ 重寫（Rewrite）→ 規劃（Plan）→ 執行（Execute）**。前三步合稱「硬解析」，每條 SQL 都要走一遍的話，高併發場景下 CPU 會被 parse 吃滿。
+
+Prepared Statement 把 SQL 骨架先 parse + plan 好（一次性的開銷），後續只傳參數值就直接跳到 Execute。`$1` 是佔位符，每次只換值、不換 SQL 結構。
+
+三個典型的 PG 使用場景：
+
+**場景 1：OLTP 高頻點查（Web API 後端）**
+
+```sql
+-- 每次 Request 只換 id，SQL 骨架不變
+-- ❌ 沒用 prepared：1000 QPS = 每秒硬解析 1000 次
+-- ✅ 用 prepared：硬解析 1 次，其餘 999 次只做 Execute
+PREPARE get_user (int) AS SELECT * FROM users WHERE id = $1;
+EXECUTE get_user(1);
+EXECUTE get_user(2);
+```
+
+```csharp
+// Dapper 預設自動做 prepared statement
+// Npgsql 內部會 cache prepared statement，同一條 SQL 只 prepare 一次
+var user = await conn.QuerySingleAsync<User>(
+    "SELECT * FROM users WHERE id = @Id",
+    new { Id = request.UserId });
+```
+
+**場景 2：大量 INSERT 批次寫入**
+
+```sql
+-- 10,000 筆 log，每筆只換值
+PREPARE insert_log (int, text, timestamptz) AS
+    INSERT INTO event_logs (user_id, action, created_at) VALUES ($1, $2, $3);
+EXECUTE insert_log(1, 'login', now());
+EXECUTE insert_log(2, 'logout', now());
+```
+
+```csharp
+// COPY 比 INSERT 快 10-50x，適合萬筆以上的批次
+await using var writer = await conn.BeginBinaryImportAsync(
+    "COPY event_logs (user_id, action, created_at) FROM STDIN (FORMAT BINARY)");
+foreach (var log in logs)
+    await writer.WriteRowAsync(log.UserId, log.Action, log.CreatedAt);
+await writer.CompleteAsync();
+```
+
+**場景 3：PL/pgSQL Function 內建的自動 Prepare**
+
+Function 內的 SQL 會被 PG **自動**當成 prepared statement。第一次 call 時 parse + plan，同一個 session 內後續呼叫直接 execute。
+
+```sql
+CREATE OR REPLACE FUNCTION get_order_total(order_id int) RETURNS numeric AS $$
+    SELECT SUM(amount) FROM order_items WHERE order_id = $1;
+$$ LANGUAGE sql;
+-- 第一次：parse + plan + execute；後續呼叫：只 execute（plan 已 cache）
+```
+
+> plan cache 是 **per-session** 的。這就是為什麼 `MinPoolSize` 重要——保持熱連線就能保持 plan cache，新連線的第一次呼叫仍需 prepare。
+
+### II. 為什麼 Client 端做 Cache？對 DB Server 的影響
+
+**先釐清一個關鍵點：Dapper 根本不做 Parse。**
+
+整條鏈路是：
+
+```
+Dapper（物件映射，把 C# 參數塞進 SQL、把回傳 rows 變成物件）
+  → Npgsql（.NET driver，負責講 PostgreSQL wire protocol）
+    → PostgreSQL server（真正做 Parse / Plan / Execute）
+```
+
+Dapper 只是一個 micro-ORM。決定「要不要 prepare、走哪種 protocol」的是 Npgsql；真正做 Parse 的是 server。
+
+**SQL 是文字，執行引擎不能直接跑文字。**
+
+你送過去的 `SELECT * FROM users WHERE id = 1` 對 server 而言只是一串 bytes。執行引擎能跑的不是文字，而是一棵**執行計畫樹（plan tree）**——「先掃哪個 index、用 hash join 還是 nested loop」這種一步步的操作節點。
+
+從文字到可執行的東西，中間必經三步：
+
+```
+Parse   → 語法檢查、語意檢查（這張表存在嗎？欄位型別對嗎？）
+Rewrite → 展開 view、套用 rule
+Plan    → 根據統計資訊算成本，挑出最佳執行計畫
+```
+
+「直接 execute」這個動作在物理上不存在——在 parse + plan 之前，根本沒有「東西」可以被 execute。
+
+**兩種 Protocol：Simple Query vs Extended Query**
+
+PostgreSQL 的 wire protocol 有兩條路：
+
+```mermaid
+flowchart LR
+    subgraph SQ["Simple Query Protocol"]
+        direction LR
+        A["Client 送一整串 SQL 文字"] --> B["Server 一口氣<br/>Parse + Plan + Execute"] --> C["回傳結果"]
+    end
+
+    subgraph EQ["Extended Query Protocol"]
+        direction LR
+        P["Parse<br/>語法檢查 → 產生 prepared statement"]
+        B2["Bind<br/>拿到參數值，做 planning + estimation"]
+        E["Execute<br/>執行計畫"]
+        P --> B2 --> E
+        B2a["下次只走 Bind + Execute<br/>不重 Parse"] -.-> B2
+    end
+```
+
+| Protocol | 行為 | roundtrip | cache plan？ |
+|----------|------|-----------|-------------|
+| Simple Query | client 丟整串文字，server 內部 parse+plan+execute 一次做完 | 1 | 不 cache |
+| Extended Query | Parse / Bind / Execute 拆成三個獨立 message | 2（第一次）/ 1（後續） | 可 cache，可重用 |
+
+Dapper 預設情況下，Npgsql 走的是 **Extended Protocol**。但除非你開啟 `Max Auto Prepare` 或手動呼叫 `Prepare()`，Npgsql 不會把 prepared statement 留著重用——所以每次呼叫，server 端其實還是重新 parse 一遍。只是拆成了三個 message 而已。
+
+**那 Npgsql 做 client-side cache 的價值是什麼？**
+
+當 `Max Auto Prepare > 0` 時，Npgsql 在客戶端記住「這條 SQL 在這個 physical connection 上已經 prepare 過了」。當 connection 從 pool 被重複使用時，Npgsql 知道不需再發一次 Parse message——直接 Bind + Execute。
+
+```csharp
+var builder = new NpgsqlConnectionStringBuilder
+{
+    MaxAutoPrepare = 20,       // 每個 physical connection 最多自動 prepare 20 條 SQL
+    AutoPrepareMinUsages = 5   // 同一條 SQL 被呼叫 5 次後才自動 prepare
+};
+```
+
+Npgsql 不會把每條 SQL 都 prepare——因為 prepare 本身也有開銷（server 端要分配 plan cache 記憶體）。只有被多次重複執行的 SQL 才值得。`AutoPrepareMinUsages = 5` 正好跟 PG 內部的 custom → generic plan 切換邏輯對齊。
+
+```mermaid
+sequenceDiagram
+    participant Np as Npgsql（client 端）
+    participant PG as PostgreSQL（server 端）
+
+    Note over Np,PG: 前 5 次：每次 Bind 都重新 estimation（custom plan）
+
+    rect rgb(255, 248, 230)
+        Np->>PG: Parse("SELECT * FROM users WHERE id = $1")
+        PG-->>Np: OK
+        Np->>PG: Bind($1 = 1) + Execute
+        Note right of PG: custom plan：拿值 1 重新 estimation
+        PG-->>Np: result
+    end
+
+    Note over Np,PG: ...重複 4 次，每次 Bind 值不同，各自 estimation...
+
+    Note over Np,PG: 第 6 次起：比較 custom avg cost vs generic cost
+    Note over PG: 如果 generic plan 沒比較差<br/>→ 切換 generic plan<br/>→ 後續跳過 estimation
+
+    Np->>PG: Bind($1 = 99) + Execute
+    Note right of PG: generic plan：不重 estimation<br/>直接拿 cache 的 plan 執行
+    PG-->>Np: result
+
+    Np->>PG: close connection
+    Note right of PG: ❌ plan cache 隨 session 銷毀
+```
+
+PG 不是「第一次 Bind+Execute 就 cache 住計畫」，而是先跑 5 次 custom plan（每次帶實際參數值重新規劃），第 6 次起比較 custom plan 的平均成本 vs generic plan 的成本。如果 generic 沒比較差，才切換成 generic plan，之後就跳過規劃步驟。這是為了避免太早鎖死一個爛計畫——跟 SQL Server 的 parameter sniffing 問題形成鮮明對比。
+
+| 層面 | 沒 Cache（每次重 Parse） | 有 Cache（重用 prepared plan） |
+|------|--------------------------|-------------------------------|
+| **應用延遲** | 每條 SQL 多一次 Parse message roundtrip | 省掉 Parse，只發 Bind+Execute |
+| **DB Server CPU** | Parse + Plan 佔 CPU，高 QPS 下放大 | 前 5 次 custom plan 後續不重 estimation，CPU 下降 |
+| **DB Server 記憶體** | 無常駐開銷 | 每條 prepared SQL 佔用 session private memory |
+
+**總結一句話**：Npgsql 的 client-side cache 解決的是「connection pool 重用連線時，不必每次重建 prepared statement」的問題。對 DB server 的好處是**少做 Parse + estimation → CPU 下降**，而不是讓 SQL 本身跑更快。
+
+### III. 深入實例：Named Statement `_p1` 的誕生到複用
+
+先糾正一個關鍵誤解：**plan 從來不在 client 手上**。執行計畫是 server 端記憶體裡的東西，Npgsql / Dapper 看不到也拿不到。Client 能送的永遠只有 SQL 文字、一個 prepared statement 的「名字」（handle）、以及參數值。
+
+名字就像寄物櫃號碼牌——東西（parse 好的 statement / plan）一直放在 server 的櫃子裡，client 只是出示號碼牌說「拿那個出來，參數是這些」。
+
+**兩個「5」是巧合，分屬不同層、互不相干：**
+
+| | `AutoPrepareMinUsages = 5` | generic plan 門檻 = 5 |
+|---|---|---|
+| 在哪 | **client 端**（Npgsql） | **server 端**（PostgreSQL） |
+| 管什麼 | 同一段 SQL 文字用滿 5 次，Npgsql 才自動發 `Parse` 建立 named prepared statement | 一個 prepared statement 被 execute 滿 5 次後，server 才考慮從 custom plan 切到 generic plan |
+| 計數對象 | SQL 文字出現次數 | prepared statement 的執行次數 |
+
+兩個 5 純屬巧合，沒有任何因果關係。你可以把 `AutoPrepareMinUsages` 改成 3，server 那邊的 5 完全不受影響。
+
+**完整時間線：跑 7 次同一條 SQL**
+
+```csharp
+// Max Auto Prepare = 20, Auto Prepare Min Usages = 5
+for (int i = 1; i <= 7; i++)
+{
+    var user = conn.QuerySingle<User>(
+        "SELECT id, name FROM users WHERE id = @id",
+        new { id = i });
+}
+```
+
+**第 1～4 次：還沒到門檻，走 unnamed statement**
+
+Npgsql 每次都送完整 SQL，statement 名字是空字串（`""` = unnamed statement）。特性是下一個 `Parse` 一來就被覆蓋，留不住、無法重用。server 每次都得重新 parse。
+
+```
+Parse   (name="",  query="SELECT id, name FROM users WHERE id = $1")
+Bind    (stmt="",  params=[1])
+Execute
+```
+
+Npgsql 內部同時在數：這段 SQL 文字出現了幾次。
+
+**第 5 次：達門檻，Npgsql 替它正式命名**
+
+計數到 5，Npgsql 決定把它升級成 named prepared statement。先發一個帶名字的 `Parse`：
+
+```
+Parse   (name="_p1",  query="SELECT id, name FROM users WHERE id = $1")
+```
+
+**這一刻 `_p1` 才在 server 端誕生**——server parse 完，把這個 prepared statement 存進該 connection 的 session 記憶體。然後照常 Bind + Execute：
+
+```
+Bind    (stmt="_p1", params=[5])
+Execute
+```
+
+同時 Npgsql 在 client 端記下對應關係：「這段 SQL 文字 → 已 prepare，名字 `_p1`」。
+
+**第 6、7 次：複用，不再送 SQL 文字**
+
+Npgsql 查自己的字典，發現這段 SQL 已經對應到 `_p1`，**完全不送 `Parse`、也不送 SQL 字串**：
+
+```
+Bind    (stmt="_p1", params=[6])
+Execute
+```
+
+```
+Bind    (stmt="_p1", params=[7])
+Execute
+```
+
+Server 收到 Bind 時，靠 `_p1` 這個名字去 session 記憶體撈出早就 parse 好的 statement，**跳過 Parse**。
+
+**接著輪到 server 端的 custom → generic：** 這個 prepared statement 的第 1～5 次 execute 還是會帶實際參數重新規劃（custom plan），第 6 次 execute 起 server 才可能切換到 generic plan，連 Plan 也跳過。注意這裡的「第 6 次 execute」是 statement 的執行次數，不是 SQL 文字的出現次數——它可能剛好對應 Npgsql 端的第 6 次，也可能更晚（取決於前面幾次的 `Bind` 實際值）。
+
+**所以整條時間線實際上是兩個獨立優化先後疊加：**
+
+```
+Npgsql 端：第 1~4 次送 SQL → 第 5 次發 Parse 建立 _p1 → 第 6 次起只送名字 + 參數（跳過 Parse）
+Server 端：_p1 前 5 次 execute 用 custom plan → 第 6 次起比較成本 → 可能切換 generic plan（跳過 Plan）
+```
+
+「跳過 Parse」和「跳過 Plan」是**兩個不同階段、由不同的計數器分別觸發**的優化，全都發生在 server 端。Client 只是負責「不要再重送 SQL 文字」。
+
+因為 `_p1` 綁在**這條 connection 的 session** 上，連線一關（或從 pool 拿到另一條物理連線），prepared statement 就不在了。所以 Npgsql 的 auto-prepare 狀態是**跟著連線池裡每一條物理連線各自維護**的。
+
+### IV. 補充：Parameter Sniffing 與 PG 的對應
+
+**Parameter Sniffing** 是 SQL Server 的術語——第一個參數值「聞」出來的 plan 對後續參數可能很糟糕。PG 對應的概念就是上面的 custom plan vs generic plan 機制。
+
+```mermaid
+flowchart TD
+    A["同一條 prepared SQL 重複執行"] --> B["前 5 次"]
+    A --> C["第 6 次起"]
+
+    B --> B1["Custom Plan"]
+    B1 --> B2["每次 Bind 都重新做 estimation<br/>根據實際參數值決定 Index Scan 或 Seq Scan"]
+    B2 --> B3["參數值不同 → plan 可以不同 ✅"]
+
+    C --> C1["Generic Plan"]
+    C1 --> C2["不再看參數值<br/>用一個通用 plan 應付所有參數"]
+    C2 --> C3["參數值不同 → plan 都一樣 ⚠"]
+```
+
+核心矛盾：同一條 SQL、不同參數值，最優 plan 可能天差地別。
+
+```sql
+-- id = 1：1000 萬行中只有 1 行 → Index Scan 最優
+SELECT * FROM orders WHERE id = 1;
+
+-- id = 9999999：1000 萬行中 999 萬行匹配 → Seq Scan 最優
+SELECT * FROM orders WHERE id = 9999999;
+```
+
+| 特性 | SQL Server | PostgreSQL |
+|------|-----------|-----------|
+| 第一次執行 | 根據參數值產生 plan，**立即 cache** | 根據參數值產生 plan（custom） |
+| plan cache | 後續全用同一個 | **第 6 次才**比較成本、決定切換 generic |
+| 出問題 | 第一個值極端 → 後續全爛 | 前 5 次各自 estimation，不會有問題 |
+| 解法 | `OPTION (RECOMPILE)` | `SET plan_cache_mode = force_custom_plan` |
+
+```sql
+-- 強制每次都重新 estimation
+SET plan_cache_mode = force_custom_plan;
+```
+
+### V. 強制規範
 
 | # | 規則 | SQL |
 |---|------|-----|
@@ -1176,7 +1487,7 @@ CREATE INDEX idx ON tbl USING gist(col);
 SELECT * FROM tbl ORDER BY col <-> '(0,100)';
 ```
 
-### II. App Dev 實戰：Connection Pool + Retry + 鎖定
+### VI. App Dev 實戰：Connection Pool + Retry + 鎖定
 
 **Connection Pool 設定**：Npgsql 內建 Pool，不需外部依賴。
 
@@ -1193,7 +1504,60 @@ builder.Services.AddSingleton(dataSource);
 // Timeout = 10           — 等待從 pool 拿連線的秒數
 ```
 
-**Retry Pattern（Polly）**：處理 transient failure 的標準做法。
+**Retry Pattern（Polly）**：
+
+資料庫連線和查詢**不可能保證 100% 成功**——DBA 重啟、主備切換、網路瞬斷、連線池滿、死鎖被當祭品，這些事情一定會發生。關鍵不是避免它們，而是你的程式能不能自動恢復。
+
+Retry 只能用在 **transient failure**（暫時性錯誤）上。永久性錯誤（如 constraint violation、syntax error）retry 一百次也會失敗，直接報錯就好。
+
+```mermaid
+flowchart TD
+    A["收到 PostgresException"] --> B{"錯誤類型？"}
+    B -->|"57P01: admin_shutdown<br/>57P02: crash_shutdown<br/>57P03: cannot_connect_now"| C["✅ Retry<br/>PG 正在關或還在啟動<br/>等幾秒就會好"]
+    B -->|"53300: too_many_connections<br/>08001: unable_to_connect"| D["✅ Retry<br/>連線池滿或網路瞬斷<br/>等一下就有連線釋放"]
+    B -->|"40001: serialization_failure"| E["✅ Retry（重跑整個 TX）<br/>Serializable 衝突<br/>重跑一次通常就過"]
+    B -->|"23505: unique_violation<br/>23503: fk_violation"| F["❌ 不 Retry<br/>資料衝突，retry 永遠失敗"]
+    B -->|"23502: not_null_violation<br/>42601: syntax_error"| G["❌ 不 Retry<br/>程式碼 bug，修好再跑"]
+```
+
+**觸發 Retry 的具體場景**：
+
+| Error Code | 場景 | 為什麼 Retry 有用 |
+|-----------|------|-----------------|
+| `57P01 admin_shutdown` | DBA 執行了 `pg_terminate_backend` 或 shutdown | PG 正在重啟，等幾秒後新連線就能通了 |
+| `57P02 crash_shutdown` | PG process crash 後正在 recovery | 等 PG 完成 crash recovery 就好 |
+| `57P03 cannot_connect_now` | PG 正在 startup 階段（剛剛被啟動） | startup 通常只需幾秒 |
+| `53300 too_many_connections` | 其他 application 瞬間吃滿 max_connections | 等一下就有 connection 釋放；或連其他 host（multi-host） |
+| `40001 serialization_failure` | Serializable 隔離級別下，兩個 TX 衝突 | PG 隨機挑一個當祭品，重跑通常就過 |
+| `08001 / 08006` | 網路瞬斷、TCP timeout | 可能是負載平衡器或 NAT 短暫斷線 |
+| `NpgsqlException.IsTransient` | Npgsql 自行判斷為可重試的錯誤 | Npgsql 內部封裝了常見 transient case |
+
+**絕對不能 Retry 的場景**：
+
+| Error Code | 原因 |
+|-----------|------|
+| `23505 unique_violation` | 重複插入，retry 100 次還是重複 |
+| `23503 fk_violation` | 外鍵不存在，retry 不會讓它突然出現 |
+| `23502 not_null_violation` | 漏了 NOT NULL 欄位，修 code 才能解 |
+| `42601 syntax_error` | SQL 寫錯了，不是環境問題 |
+| `40002 transaction_integrity_constraint_violation` | TX 狀態已損壞 |
+
+**Retry 的核心陷阱：Idempotency（冪等性）**
+
+```csharp
+// ❌ 危險：INSERT 不是冪等的，retry 可能產生重複資料
+await conn.ExecuteAsync("INSERT INTO orders (user_id, amount) VALUES (@Uid, @Amt)", param);
+
+// ✅ 解法 1：先查是否存在，再決定 INSERT 或 UPDATE（UPSERT）
+await conn.ExecuteAsync(
+    @"INSERT INTO orders (user_id, amount) VALUES (@Uid, @Amt)
+      ON CONFLICT (idempotency_key) DO NOTHING", param);
+
+// ✅ 解法 2：整個 transaction 重跑（包含業務邏輯的判斷）
+// retry 應該重跑整個 unit of work，不只是重送 SQL
+```
+
+**完整 Retry Policy（含 Jitter，防雪崩）**：
 
 ```csharp
 using Polly;
@@ -1202,17 +1566,141 @@ public static IAsyncPolicy GetRetryPolicy() => Policy
     .Handle<PostgresException>(ex =>
         ex.SqlState == PostgresErrorCodes.AdminShutdown ||
         ex.SqlState == PostgresErrorCodes.CrashShutdown ||
+        ex.SqlState == PostgresErrorCodes.CannotConnectNow ||
         ex.SqlState == PostgresErrorCodes.TooManyConnections ||
         ex.SqlState == PostgresErrorCodes.SerializationFailure)
     .Or<NpgsqlException>(ex => ex.IsTransient)
-    .WaitAndRetryAsync(3,
-        retryAttempt => TimeSpan.FromMilliseconds(Math.Pow(2, retryAttempt) * 100),
+    .WaitAndRetryAsync(
+        retryCount: 3,
+        sleepDurationProvider: retryAttempt =>
+            // exponential backoff + jitter：防所有 client 同時重試
+            TimeSpan.FromMilliseconds(
+                Math.Pow(2, retryAttempt) * 100   // 100, 200, 400ms
+                + Random.Shared.Next(0, 50)),       // 加 0~50ms 隨機抖動
         onRetry: (ex, ts, count, _) =>
             _logger.LogWarning("Retry {Count}/3 after {Delay}ms: {Error}",
                 count, ts.TotalMilliseconds, ex.Message));
 ```
 
-**Advisory Lock（秒殺）**的完整 C# 實作：
+`Math.Pow(2, retry) * 100` 產生 100ms → 200ms → 400ms 指數退避。`Random` 加隨機抖動避免所有 client 剛好在同一毫秒醒來再打一次（thundering herd）。
+
+**與 Dapper + NpgsqlDataSource 的完整整合**：
+
+```csharp
+// ========================================
+// Step 1：DI 註冊（Program.cs）
+// ========================================
+var builder = WebApplication.CreateBuilder(args);
+
+// Npgsql DataSource（整個 app lifetime 只建一個）
+builder.Services.AddNpgsqlDataSource(builder.Configuration.GetConnectionString("Default"));
+
+// Polly Retry Policy（全域註冊，所有 Repository 共用）
+builder.Services.AddSingleton(GetRetryPolicy());
+
+// ========================================
+// Step 2：Repository 層 — 讀取（Retry 包在最外層）
+// ========================================
+public class OrderRepository
+{
+    private readonly NpgsqlDataSource _dataSource;
+    private readonly IAsyncPolicy _retryPolicy;
+
+    public OrderRepository(NpgsqlDataSource dataSource, [FromKeyedServices("db-retry")] IAsyncPolicy retryPolicy)
+    {
+        _dataSource = dataSource;
+        _retryPolicy = retryPolicy;
+    }
+
+    // ✅ 讀取：retry 包在最外層。DataSource 內部管理連線池，
+    // 每次 ExecuteAsync 會自動從池中取一條（可能是不同物理連線），
+    // 前次失敗的連線會被自動丟棄
+    public async Task<Order?> GetById(int id) =>
+        await _retryPolicy.ExecuteAsync(async () =>
+        {
+            await using var conn = await _dataSource.OpenConnectionAsync();
+            return await conn.QuerySingleOrDefaultAsync<Order>(
+                "SELECT * FROM orders WHERE id = @Id", new { Id = id });
+        });
+
+    // ✅ 寫入：同樣 retry 在最外層，每次重試都走完整流程
+    public async Task Insert(Order order) =>
+        await _retryPolicy.ExecuteAsync(async () =>
+        {
+            await using var conn = await _dataSource.OpenConnectionAsync();
+            await conn.ExecuteAsync(
+                "INSERT INTO orders (user_id, amount) VALUES (@Uid, @Amt)",
+                new { Uid = order.UserId, Amt = order.Amount });
+        });
+}
+
+// ========================================
+// Step 3：Service 層 — Transaction（Retry 重跑整個 TX）
+// ========================================
+public class TransferService
+{
+    private readonly NpgsqlDataSource _dataSource;
+    private readonly IAsyncPolicy _retryPolicy;
+
+    // ✅ Transaction 的 retry：重跑整個 TX，不是只重送最後一條 SQL
+    public async Task Transfer(int fromId, int toId, decimal amount) =>
+        await _retryPolicy.ExecuteAsync(async () =>
+        {
+            await using var conn = await _dataSource.OpenConnectionAsync();
+            using var tx = await conn.BeginTransactionAsync();
+            try
+            {
+                var ids = new[] { fromId, toId }.OrderBy(id => id).ToArray();
+                foreach (var id in ids)
+                    await conn.ExecuteAsync(
+                        "SELECT 1 FROM accounts WHERE id = @Id FOR UPDATE",
+                        new { Id = id }, tx);
+
+                await conn.ExecuteAsync(
+                    "UPDATE accounts SET balance = balance - @Amt WHERE id = @Fid",
+                    new { Fid = fromId, Amt = amount }, tx);
+                await conn.ExecuteAsync(
+                    "UPDATE accounts SET balance = balance + @Amt WHERE id = @Tid",
+                    new { Tid = toId, Amt = amount }, tx);
+
+                await tx.CommitAsync();
+            }
+            catch
+            {
+                await tx.RollbackAsync();
+                throw; // 拋給 Polly，它判斷是 transient 就 retry 整個 tx
+            }
+        });
+}
+```
+
+**關鍵：Retry 應該包在哪一層？**
+
+```mermaid
+flowchart TD
+    A["收到 Request"] --> B["Service 層"]
+    B --> C["Polly Retry 包在這裡"]
+    C --> D["Repository 層"]
+    D --> E["NpgsqlDataSource.OpenConnection()"]
+    E --> F["Dapper 執行 SQL"]
+
+    C -.->|"transient error 時"| C
+    F -.->|"transient error"| C
+
+    subgraph "每次 retry 都是完整流程"
+        C2["Retry 1"] --> D2["打開新連線<br/>DataSource 自動換一條<br/>physical connection"]
+        D2 --> F2["重新執行 SQL"]
+        F2 -.->|"又失敗"| C3["Retry 2"]
+        C3 --> D3["再打開新連線..."]
+    end
+```
+
+Retry 永遠應該包在 **unit of work 的最外層**（通常是 Service 層），不是只包單條 SQL。原因：
+- 如果是 transaction，retry 必須重跑整個 TX（包含 BEGIN → 邏輯 → COMMIT），不能只重送 `COMMIT`
+- 前次失敗的 physical connection 狀態可能不乾淨，DataSource 會自動丟掉它，下次 `OpenConnectionAsync()` 拿到的是一條全新的
+- `40001 serialization_failure` 發生在 `COMMIT` 時，如果 retry 只包 `COMMIT`，前面的 `UPDATE` 沒重跑 → 資料不一致
+
+**Advisory Lock（秒殺）** 的完整 C# 實作：
 
 ```csharp
 public async Task<PurchaseResult> TryPurchase(int productId, int userId)
@@ -1289,7 +1777,7 @@ public async Task DetectLongTx()
 }
 ```
 
-### III. 推薦規範
+### VII. 推薦規範
 
 | # | 規則 |
 |---|------|
@@ -1333,7 +1821,77 @@ public async Task DetectLongTx()
 | 52 | B-tree：避免 UUID 等高離散值作 index key（過多 page split）；調整 `fillfactor` |
 | 53 | BRIN：依數據相關性設 `pages_per_range`；用 `ANALYZE tbl; SELECT reltuples/relpages` 評估 |
 
-### IV. 精選 SQL 範例
+#### a. 推薦規範詳解：用 ID 排序防止 Deadlock
+
+規則 #34「同一 user 的數據在單一 thread 處理」解決的是一半的問題。另一半是：**多筆資料更新時，必須按固定順序鎖定 row**。
+
+Deadlock 的本質是兩個 transaction 互相等待對方釋放鎖：
+
+```mermaid
+sequenceDiagram
+    participant T1 as Transaction 1
+    participant PG as PostgreSQL
+    participant T2 as Transaction 2
+
+    T1->>PG: UPDATE accounts SET balance -= 100 WHERE id = 1
+    Note right of PG: T1 鎖住 row 1
+
+    T2->>PG: UPDATE accounts SET balance -= 100 WHERE id = 2
+    Note right of PG: T2 鎖住 row 2
+
+    T1->>PG: UPDATE accounts SET balance += 100 WHERE id = 2
+    Note right of PG: T1 等 row 2（被 T2 鎖住）
+
+    T2->>PG: UPDATE accounts SET balance += 100 WHERE id = 1
+    Note right of PG: T2 等 row 1（被 T1 鎖住）<br/>→ Deadlock！PG 強制終止其中一個
+```
+
+解法極簡單：**永遠按 ID 升序鎖定**。
+
+```sql
+-- ❌ 轉帳 1→2 和 2→1 同時發生，鎖定順序相反 → deadlock
+-- T1: UPDATE WHERE id = 1; UPDATE WHERE id = 2;  （先鎖 1 再鎖 2）
+-- T2: UPDATE WHERE id = 2; UPDATE WHERE id = 1;  （先鎖 2 再鎖 1）
+
+-- ✅ 固定順序：永遠先鎖小 ID，再鎖大 ID
+-- T1: UPDATE WHERE id = 1; UPDATE WHERE id = 2;  （1 < 2，先鎖 1）
+-- T2: UPDATE WHERE id = 1; UPDATE WHERE id = 2;  （1 < 2，先鎖 1）
+-- → T1 鎖住 1 後，T2 等 1；T1 鎖住 2 完成後釋放，T2 繼續 → 不 deadlock
+```
+
+```csharp
+public async Task Transfer(int fromId, int toId, decimal amount)
+{
+    // ✅ 按 ID 升序保證全域一致的鎖定順序
+    var ids = new[] { fromId, toId }.OrderBy(id => id).ToArray();
+
+    using var tx = await conn.BeginTransactionAsync();
+    try
+    {
+        // 先鎖小 ID，再鎖大 ID（兩個 transaction 的鎖定順序永遠一致）
+        foreach (var id in ids)
+            await conn.ExecuteAsync(
+                "SELECT 1 FROM accounts WHERE id = @Id FOR UPDATE",
+                new { Id = id }, tx);
+
+        await conn.ExecuteAsync(
+            "UPDATE accounts SET balance = balance - @Amt WHERE id = @Fid", new { Fid = fromId, Amt = amount }, tx);
+        await conn.ExecuteAsync(
+            "UPDATE accounts SET balance = balance + @Amt WHERE id = @Tid", new { Tid = toId, Amt = amount }, tx);
+
+        await tx.CommitAsync();
+    }
+    catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.DeadlockDetected)
+    {
+        await tx.RollbackAsync();
+        throw; // 上層 retry
+    }
+}
+```
+
+核心原則：只要所有 transaction 對同一組資源的鎖定順序一致（例如都按 ID 升序），就**不可能形成環狀等待**。這是純應用層的保證，不需要任何 DB 端設定。
+
+### VIII. 精選 SQL 範例
 
 ```sql
 -- #17 快速估算分頁數
@@ -1534,7 +2092,7 @@ ANALYZE tbl;
 SELECT reltuples / relpages FROM tbl;
 ```
 
-### V. #37 快速隨機取記錄
+### IX. #37 快速隨機取記錄
 
 ```sql
 -- 方法一：random ID sampling
@@ -1567,7 +2125,7 @@ END;
 $$ LANGUAGE plpgsql;
 ```
 
-### VI. #49-50 JOIN Order & Subquery Control
+### X. #49-50 JOIN Order & Subquery Control
 
 ```sql
 -- 固定 explicit JOIN order
@@ -1591,87 +2149,7 @@ SET from_collapse_limit = 1;
 
 ---
 
-## 6. 阿里雲 RDS 規範（全【推薦】）
-
-
-阿里雲 RDS for PostgreSQL 是託管資料庫服務。使用雲端資料庫時，有一些與自建資料庫不同的考量：
-
-**為什麼要冷熱分離？** 當資料庫超過 2TB 時，全放在 SSD 上成本很高。冷熱分離的意思是：經常訪問的「熱資料」放在高效能儲存（SSD），不常訪問的「冷資料」移到物件儲存（OSS，類似 AWS S3），節省大量成本。阿里雲提供了 OSS_EXT 外部表 plugin 來實現這一點。
-
-**為什麼應用和資料庫必須在同一個區域（region）？** 跨區域的網路延遲通常在 10-100ms，而同一區域內可能在 1ms 以內。對於需要多次資料庫查詢的應用，跨區域延遲會成倍放大。簡單說——資料庫離你的應用伺服器越近越好。
-
-**pg_hint_plan 是做什麼的？** 在極少數情況下，PostgreSQL 的查詢優化器會選擇不是最優的執行計劃（例如因為資料分佈不均導致統計偏差）。`pg_hint_plan` 讓你可以手動指定查詢應該使用哪種掃描方式（順序掃描、索引掃描等），等於告訴資料庫「相信我，照我說的做」。
-
-```mermaid
-flowchart LR
-    A["應用伺服器"] -->|"同 Region (<1ms)"| B["RDS PG (熱資料 SSD)"]
-    B -->|"OSS_EXT 外部表"| C["OSS (冷資料)"]
-    
-    D["跨 Region 應用"] -->|"❌ 跨 Region (10-100ms)"| B
-    
-    subgraph "告警配置"
-        E["CPU > 80%"] --> F["發送告警"]
-        G["儲存 > 85%"] --> F
-        H["連線數 > 80%"] --> F
-    end
-    
-    subgraph "安全配置"
-        I["白名單 (IP 限制)"]
-        J["關閉公網訪問"]
-        K["專用網路 (VPC)"]
-    end
-```
-
-| # | 規則 |
-|---|------|
-| 1 | DB > 2TB → 冷熱分離：用 OSS_EXT external table plugin 存冷數據 |
-| 2 | 高 RT 場景 → SLB 或 PROXY passthrough 模式連接 |
-| 3 | RDS region 必須與 application region 一致（禁止跨 region） |
-| 4 | 配置多個告警接收人，設適當告警門檻 |
-| 5 | 設適當白名單保障訪問安全 |
-| 6 | 關閉公網訪問；若必須開，必須設白名單 |
-| 7 | 數據傾斜導致 bind-variable plan skew → `pg_hint_plan` extension pin 執行計劃 |
-
-```sql
--- #7 pg_hint_plan
-CREATE EXTENSION pg_hint_plan;
-ALTER ROLE ALL SET session_preload_libraries = 'pg_hint_plan';
-
-/*+ SeqScan(test) */
-EXPLAIN SELECT * FROM test WHERE id = 1;
--- → Seq Scan on test
-
-/*+ BitmapScan(test) */
-EXPLAIN SELECT * FROM test WHERE id = 1;
--- → Bitmap Heap Scan on test
---    → Bitmap Index Scan on test_pkey
-```
-
----
-
-## 7. PG 14-17 能力摘要
-
-以 PG 14+ 為基準，值得 App Dev 關注的新功能：
-
-```mermaid
-timeline
-    title PostgreSQL 版本演進（PG 14+）
-    PG 14 : CYCLE/SEARCH CTE<br>GIN pending list 優化<br>REINDEX TABLESPACE
-    PG 15 : MERGE statement<br>SQL/JSON path<br>ICU collation
-    PG 16 : pg_stat_io<br>Parallel VACUUM<br>REINDEX on partitioned tables
-    PG 17 : EXPLAIN (MEMORY)<br>Incremental CREATE INDEX<br>GIN parallel build
-```
-
-| 版本 | 對 App Dev 直接有用的新功能 |
-|------|---------------------------|
-| PG 14 | `SEARCH` / `CYCLE` clause 讓 recursive CTE 更直覺；`GENERATED BY DEFAULT AS IDENTITY` 成熟可用 |
-| PG 15 | `MERGE` statement 一條 SQL 搞定 upsert 邏輯；`jsonb` 原生支援 SQL/JSON path |
-| PG 16 | `pg_stat_io` 讓 I/O 瓶頸可觀測；`REINDEX` 支援 partitioned tables 逐子表重建 |
-| PG 17 | `EXPLAIN (MEMORY)` 顯示查詢用多少記憶體；incremental `CREATE INDEX` 中斷可續建；GIN index 支援 parallel build |
-
----
-
-## 8. 章末總結：Developer 落地檢查清單
+## 6. 章末總結：Developer 落地檢查清單
 
 每當改動 DB 相關程式碼時，快速過一遍：
 
