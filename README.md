@@ -9,24 +9,25 @@
 
 | 章節 | 檔案 | 主題 |
 |------|------|------|
-| **資料型別** | [`datatype/PostgreSQL_Datatype.md`](datatype/PostgreSQL_Datatype.md) | Float vs Numeric 效能對比（360x）、SIMD 向量化、`AT TIME ZONE` 語法解析與型別轉換陷阱 |
-| **JSON/JSONB** | [`json/PostgreSQL_JSON.md`](json/PostgreSQL_JSON.md) | JSONB Value Types、Type I/O 機制、陣列提取與 GIN Index、JSONPath / SQL/JSON / json_table（PG 12→17） |
-| **全文檢索** | [`fulltext/PostgreSQL_Fulltext.md`](fulltext/PostgreSQL_Fulltext.md) | zhparser 中文分詞、Whole-Row FTS（Generated Column）、record_out + SCWS 逗號問題與解法 |
-| **擴充功能** | [`extensions/PostgreSQL_Extensions.md`](extensions/PostgreSQL_Extensions.md) | 十大 Extension 全解析：FDW 跨庫連線、pg_partman 自動分區、Citus 12 分散式、PgBouncer 連接池、pg_stat_statements 查詢統計、auto_explain 計畫記錄、pg_repack 在線重組、pg_cron 定時任務、pg_stat_kcache IO 統計、hypopg 假設索引 |
-| **Vacuum / Bloat** | [`vacuum/PostgreSQL_Vacuum.md`](vacuum/PostgreSQL_Vacuum.md) | Bloat 8 大成因與測試驗證、預防措施、VACUUM FULL vs pg_repack vs pg_squeeze 三方案對比 |
-| **系統底層** | [`system/PostgreSQL_System.md`](system/PostgreSQL_System.md) | Column Order 與 Byte Alignment 全鏈路效能、Bit 位運算標籤系統、Linux Page Fault 與 huge_pages / NUMA |
-| **鎖（Lock）** | [`lock/PostgreSQL_Lock.md`](lock/PostgreSQL_Lock.md) | 隱式鎖、Lock Wait 追蹤、秒殺 Advisory Lock、高並發更新、Lock Flooding、max_locks_per_transaction、OLTP advisory lock、無間隙 ID 生成 |
-| **其他進階** | [`others/PostgreSQL_Others.md`](others/PostgreSQL_Others.md) | PG 17 開發規範、Trigger Audit（DML+DDL）、JOIN 冗餘 Early DISTINCT、pgcrypto 加密、千億級 pg_trgm Regex、12306 搶票架構設計 |
-| **查詢深度解析** | [`PostgreSQL_Query.md`](PostgreSQL_Query.md) | 查詢生命週期、CBO 與 pg_hint_plan、GROUP BY 策略、IN/ANY/VALUES、分頁與計數、Recursive CTE 優化、死循環防禦 |
-| **監控與追溯** | [`PostgreSQL_Monitoring.md`](PostgreSQL_Monitoring.md) | 慢查詢追溯體系、`pg_stat_activity` / `auto_explain` / `pg_stat_io`、`track_commit_timestamp` |
-| **索引全解析** | [`PostgreSQL_Index.md`](PostgreSQL_Index.md) | 掃描類型全解析（Seq/Index/Bitmap/Parallel/Index-Only）、Bitmap Heap Scan 詳解、BRIN/Bloom/GIN/GiST/SP-GiST/RUM、Covering Index |
-| **分頁查詢** | [`PostgreSQL_pagination.md`](PostgreSQL_pagination.md) | OFFSET 效能退化、CURSOR 方案、Keyset Pagination、分頁優化策略 |
+| **Transaction 隔離級別** | [`transaction/transaction.md`](transaction/transaction.md) | MVCC Snapshot 深度解析、Read Committed/Repeatable Read/Serializable 底層原理（SSI/SIREAD）、Write Skew 重現、VACUUM 影響、.NET Dapper/Polly Retry 實戰 |
+| **索引全解析** | [`index.md`](index.md) | 六種掃描類型全解析（Seq/Index/Bitmap/Parallel/Index-Only）、Bitmap Heap Scan 詳解、BRIN/Bloom/GIN/GiST/SP-GiST/RUM、Covering Index、索引失效 20 場景 |
+| **查詢深度解析** | [`query.md`](query.md) | 查詢生命週期、CBO 與 pg_hint_plan、GROUP BY 策略、IN/ANY/VALUES、分頁與計數、Recursive CTE 優化、死循環防禦 |
+| **鎖（Lock）** | [`lock.md`](lock.md) | 隱式鎖、Lock Wait 追蹤、秒殺 Advisory Lock、高並發更新、Lock Flooding、max_locks_per_transaction、OLTP advisory lock、無間隙 ID 生成 |
+| **監控與追溯** | [`monitoring.md`](monitoring.md) | pg_stat_activity 生產實戰（5 場景 + 決策圖）、wait_event Top 10、auto_explain、pg_stat_io、track_commit_timestamp |
+| **Vacuum / Bloat** | [`vacuum/vacuum.md`](vacuum/vacuum.md) | MVCC 可見性判斷、Bloat 8 大成因與測試驗證、預防措施、VACUUM FULL vs pg_repack vs pg_squeeze 三方案對比 |
+| **資料型別** | [`datatype.md`](datatype.md) | Float vs Numeric 效能對比（360x）、SIMD 向量化、`AT TIME ZONE` 語法解析與型別轉換陷阱 |
+| **JSON/JSONB** | [`json/json.md`](json/json.md) | JSONB Value Types、Type I/O 機制、陣列提取與 GIN Index、JSONPath / SQL/JSON / json_table（PG 12→17） |
+| **全文檢索** | [`fulltext/fulltext.md`](fulltext/fulltext.md) | zhparser 中文分詞、Whole-Row FTS（Generated Column）、record_out + SCWS 逗號問題與解法 |
+| **系統底層** | [`system.md`](system.md) | Column Order 與 Byte Alignment 全鏈路效能、Bit 位運算標籤系統、Linux Page Fault 與 huge_pages / NUMA |
+| **擴充功能** | [`extensions/extensions.md`](extensions/extensions.md) | 十大 Extension 全解析：FDW 跨庫連線、pg_partman 自動分區、Citus 12 分散式、PgBouncer 連接池、pg_stat_statements 查詢統計、auto_explain 計畫記錄、pg_repack 在線重組、pg_cron 定時任務、pg_stat_kcache IO 統計、hypopg 假設索引 |
+| **分頁查詢** | [`pagination.md`](pagination.md) | OFFSET 效能退化、CURSOR 方案、Keyset Pagination、分頁優化策略 |
+| **其他進階** | [`others/others.md`](others/others.md) | PG 17 開發規範、Trigger Audit（DML+DDL）、JOIN 冗餘 Early DISTINCT、pgcrypto 加密、千億級 pg_trgm Regex、12306 搶票架構設計 |
 
 ---
 
 ## 各章節快速導覽
 
-### 資料型別（datatype）
+### 資料型別（Datatype）
 - **一、Float vs Numeric**：Benchmark（四則/開根號/Pi 計算）、硬體加速 vs 軟體模擬的根本差異、SIMD 向量化優勢、選型建議、版本演進
 - **二、AT TIME ZONE**：EXTRACT epoch 的時區陷阱、`gram.y` 語法規則、`timestamptz_part()` vs `timestamp_part()` 的 overload 選擇、三種 Case 逐步分解
 
@@ -55,12 +56,12 @@
 - **一、Vacuum 原理與防止 Bloat**：8 大 Bloat 成因（Long Transaction 為核心）、6 組測試驗證（XID/游標/長查詢/隔離級別/批量更新/naptime）、10 項預防措施、`OldestXmin` 原始碼分析
 - **二、收縮膨脹表**：VACUUM FULL vs pg_repack vs pg_squeeze 三方案對比（鎖定時長/Delta 捕捉/效能影響/成熟度）、現代最佳實踐、`REINDEX CONCURRENTLY`（PG 12+）
 
-### 系統底層（system）
+### 系統底層（System）
 - **一、Column Order & Byte Alignment**：ADD COLUMN 永遠在末尾、Simple View 虛擬重排、Byte Alignment 對 Row Size 的影響（padding 可佔 41%）、全鏈路效能鏈式反應
 - **二、Bit 位運算標籤系統**：5000 萬用戶/200 標籤實測、`bitand()` 無法用 Index 的瓶頸、替代方案（intarray + RD-Tree、roaringbitmap）、生產環境建議
 - **三、Linux Page Fault**：MMU 與虛擬記憶體、Major/Minor/Invalid 三種 Page Fault、大 shared_buffers 啟動低潮案例（minor fault 風暴）、huge_pages / pg_prewarm / NUMA 現代化解方
 
-### 鎖（lock）
+### 鎖（Lock）
 - **一、Lock 機制全景**：8 級 Lock Mode 衝突矩陣、Lock Queue 排隊機制（pending lock 可堵死後續請求）、Object-Level Lock 在 Transaction 結束才釋放、idle in transaction 偵測與預防
 - **二、Advisory Lock 應用場景**：秒殺（231K TPS）、高並發全表更新（18x 加速）、OLTP 排隊控制、無間隙 ID 生成與 Lock Flooding 防禦、`max_locks_per_transaction` 配置
 
@@ -82,15 +83,23 @@
 - **七、Recursive CTE 死循環防禦**：CYCLE 語法（PG 14+）、Production 防禦體系
 
 ### 監控與追溯（Monitoring）
-- **一、慢查詢追溯體系**：pg_stat_activity 即時監測 → OS/DB 層級數據採集 → auto_explain / log_lock_waits 自動記錄 → 交叉分析還原案發經過
+- **一、慢查詢追溯體系**：pg_stat_activity 生產實戰（5 場景 + 30 秒決策圖 + 鎖阻塞/Plan 不穩定/連線池滿/間歇性慢查詢）、wait_event Top 10、Snapshot vs Time-Series、應用層 backend_pid 記錄
 - **二、track_commit_timestamp**：SLRU 儲存結構、logical replication / snapshot too old / CDC 應用場景、效能影響與 Production 取捨
+
+### Transaction 隔離級別（transaction）
+- **一、隔離級別的底層：MVCC 與 Snapshot**：Snapshot 結構（xmin/xmax/xip[]）深度回顧、`GetTransactionSnapshot()` 內部機制、RC vs RR 的 Snapshot 獲取時序對比（stateDiagram）、PG 為何用 Snapshot 而非 Lock
+- **二～五、四種隔離級別完整解析**：Read Uncommitted（PG 中等於 RC 的 MVCC 根本原因）、Read Committed（每個 Statement 新 Snapshot / 幻讀重現 / 生產場景選擇表）、Repeatable Read（gantt 時序圖 / PG 額外防止 Phantom Read 的 snapshot 邊界原理 / Write Skew 完整重現 + Mermaid)、Serializable（SSI 原理 / SIREAD lock page-level 限制 / wr/ww/rw 三種依賴 / serialization failure 觸發流程 / 效能 overhead 量化）
+- **六、隔離級別對 VACUUM 的影響**：OldestXmin 計算、RR transaction 如何阻止 dead tuple 回收（Mermaid 災難鏈）、找出卡住 VACUUM 的 session、`old_snapshot_threshold` / `idle_in_transaction_session_timeout` 解法
+- **生產環境場景**：轉帳 Phantom（FOR UPDATE / RR / Serializable 解法矩陣）、Write Skew 案例（值班醫生 SQL 重現）、隔離級別選擇決策圖（Mermaid flowchart + 速查對照表）
+- **.NET 實戰**：Npgsql IsolationLevel enum 完整對照、Dapper 正確/錯誤寫法對比（FOR UPDATE + transaction 傳遞）、Polly Retry Pattern（`SqlState 40001` serialization failure）
 
 ### 索引全解析（Index）
 - **一、六種掃描類型全解析**：Seq Scan / Index Scan / Bitmap Heap Scan / Index-Only Scan / Parallel Scan / TID Scan 的 Planner 選擇邏輯與成本模型
-- **二、Index 核心機制**：B-Tree / Hash 內部結構、Covering Index（INCLUDE）、Partial Index、Expression Index
-- **三、BRIN Index**：Block Range Index 原理、適用場景（時序/ append-only）、與 B-Tree 的效能對比
+- **二、Index 核心機制**：B-Tree / Hash 內部結構、Covering Index（INCLUDE）、Leaf Page 圖解、Recheck Cond 詳解
+- **三、BRIN Index**：Block Range Index 原理（540x 小於 B-tree）、適用場景（時序/append-only）
 - **四、Bloom Index**：單一索引支撐任意 Column 組合查詢、簽名長度調校
-- **五～七、模糊查詢索引全景**：GIN / GiST / SP-GiST / RUM 四種索引的內部機制、全文檢索排序、GIN+LIMIT 慢的原因與 RUM 解法
+- **五～七、模糊查詢索引全景**：GIN / GiST / SP-GiST / RUM 內部機制、全文檢索排序、GIN+LIMIT 慢的原因與 RUM 解法
+- **八、索引失效 20 場景**：每個場景附 EXPLAIN ANALYZE 輸出對比與可行解法
 
 ### 分頁查詢（Pagination）
 - **一、OFFSET 基本原理**：OFFSET 不是「跳過」而是「計算後丟棄」、VOLATILE function 的放大效應、SQL 邏輯執行順序
@@ -109,6 +118,7 @@
 
 - 每份 md 為該主題的完整學習手冊，由淺到深排列
 - `images/` 目錄存放相關圖片
+- `AGENTS.md` 為本專案的協作規範（標題層級、Mermaid 風格、提交規範等）
 - 專業名詞使用英文（TID、Recheck Cond、OldestXmin 等）
 - 版本標注：`> 更新於 2026-05-17，補充 PG X~X 新增能力`
 
