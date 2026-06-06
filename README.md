@@ -19,7 +19,7 @@
 | **JSON/JSONB** | [`json/json.md`](json/json.md) | JSONB Value Types、Type I/O 機制、陣列提取與 GIN Index、JSONPath / SQL/JSON / json_table（PG 12→17） |
 | **全文檢索** | [`fulltext/fulltext.md`](fulltext/fulltext.md) | zhparser 中文分詞、Whole-Row FTS（Generated Column）、record_out + SCWS 逗號問題與解法 |
 | **系統底層** | [`system.md`](system.md) | Column Order 與 Byte Alignment 全鏈路效能、Bit 位運算標籤系統、Linux Page Fault 與 huge_pages / NUMA |
-| **擴充功能** | [`extensions/extensions.md`](extensions/extensions.md) | 十大 Extension 全解析：FDW 跨庫連線、pg_partman 自動分區、Citus 12 分散式、PgBouncer 連接池、pg_stat_statements 查詢統計、auto_explain 計畫記錄、pg_repack 在線重組、pg_cron 定時任務、pg_stat_kcache IO 統計、hypopg 假設索引 |
+| **擴充功能** | [`extensions/extensions.md`](extensions/extensions.md) | 兩大分類 15 個 Extension：Non-Contrib（FDW / pg_partman / Citus 12 / PgBouncer / pg_repack / pg_cron / pg_stat_kcache / hypopg）+ Contrib 內建（pg_stat_statements / auto_explain / pgcrypto / pg_trgm / pg_prewarm / pg_buffercache / btree_gin+btree_gist） |
 | **分頁查詢** | [`pagination.md`](pagination.md) | OFFSET 效能退化、CURSOR 方案、Keyset Pagination、分頁優化策略 |
 | **其他進階** | [`others/others.md`](others/others.md) | PG 17 開發規範、Trigger Audit（DML+DDL）、JOIN 冗餘 Early DISTINCT、pgcrypto 加密、千億級 pg_trgm Regex、12306 搶票架構設計 |
 
@@ -41,16 +41,23 @@
 - **三、record_out + SCWS 逗號問題**：`record_out` 序列化格式、SCWS 將逗號解析為 auxiliary token 導致截斷、`replace(, → ' ')` 解法、分詞效能基準（4.44 萬字/s）
 
 ### 擴充功能（extensions）
-- **一、IMPORT FOREIGN SCHEMA**：`LIMIT TO` / `EXCEPT` 過濾、View/Materialized View/Foreign Table 一併導入、PG 14-17 演進（postgres_fdw 2.0、async_append、MERGE pushdown、parallel_foreign_scan）
-- **二、pg_partman**：PG 10-17 原生分區演進、自動分區創建/清理、Retention Policy、Background Worker 驅動的 partition lifecycle、按天/月/年分區管理
-- **三、Citus 12**：分散式 SQL 引擎、Hash/Range Sharding、Co-Located Join、Schema-Based Sharding、非阻塞 Rebalancing、Query from Any Node
-- **四、PgBouncer**：Transaction vs Session vs Statement Pooling、生產級 HAProxy 拓撲、PgBouncer 1.22+ prepared statement 追蹤
-- **五、pg_stat_statements**：查詢歸一化原理、queryid 計算、Top-N 慢查詢/JIT/WAL 分析、PG 16 新增 JIT 計數器
-- **六、auto_explain**：自動記錄執行計劃、log_analyze/log_buffers/log_triggers/log_nested_statements、生產調校策略
-- **七、pg_repack**：四階段在線重組原理、vs VACUUM FULL / pg_squeeze 對比、配合 pg_cron 定時執行
-- **八、pg_cron**：PG 內建排程、定時 VACUUM / 分區維護 / 物化視圖刷新、與 pg_partman 協同
-- **九、pg_stat_kcache**：getrusage() 實體 IO 統計、CPU 耗時分析、寫入放大檢測、與 pg_stat_statements 聯表診斷
-- **十、hypopg**：假設索引 zero-cost 試錯、分區表索引測試、結合 pg_stat_statements Top-N 慢查詢最佳實踐
+- **# 一、Non-Contrib Extensions（需額外安裝）**
+  - **IMPORT FOREIGN SCHEMA**：`LIMIT TO` / `EXCEPT` 過濾、View/Materialized View 一併導入、PG 14-17 演進（postgres_fdw 2.0、async_append、MERGE pushdown、parallel_foreign_scan）
+  - **pg_partman**：PG 10-17 原生分區演進、自動分區創建/清理、Retention Policy、Background Worker 驅動 partition lifecycle
+  - **Citus 12**：分散式 SQL 引擎、Hash/Range Sharding、Co-Located Join、Schema-Based Sharding、非阻塞 Rebalancing
+  - **PgBouncer**：Transaction vs Session vs Statement Pooling、生產級 HAProxy 拓撲
+  - **pg_repack**：四階段在線重組原理、vs VACUUM FULL / pg_squeeze 對比、配合 pg_cron 定時執行
+  - **pg_cron**：PG 內建排程、定時 VACUUM / 分區維護 / 物化視圖刷新
+  - **pg_stat_kcache**：getrusage() 實體 IO 統計、CPU 耗時分析、寫入放大檢測
+  - **hypopg**：假設索引 zero-cost 試錯、分區表索引測試
+- **# 二、Contrib Extensions（PG 內建，CREATE EXTENSION 即可）**
+  - **pg_stat_statements**：查詢歸一化原理、queryid 計算、Top-N 慢查詢/JIT/WAL 分析、PG 16 JIT 計數器
+  - **auto_explain**：自動記錄執行計劃、log_analyze/log_buffers/log_triggers/log_nested_statements、生產調校策略
+  - **pgcrypto**：digest/hmac 數據校驗、crypt+gen_salt(bf) 密碼儲存、PGP 對稱/公鑰加密、C# Npgsql 實戰
+  - **pg_trgm**：Trigram 原理、GIN/GiST 加速 LIKE、similarity() / word_similarity()、與 pg_bigm 對比
+  - **pg_prewarm**：手動緩存預熱 + autoprewarm BGW（PG 11+）自動恢復、重啟冷啟動優化
+  - **pg_buffercache**：緩存內容即時診斷、usagecount 時鐘演算法、pg_buffercache_summary()（PG 17）
+  - **btree_gin / btree_gist**：GIN 多欄位複合類型索引、GiST EXCLUSION CONSTRAINT 擴展
 
 ### Vacuum / Bloat（vacuum）
 - **一、Vacuum 原理與防止 Bloat**：8 大 Bloat 成因（Long Transaction 為核心）、6 組測試驗證（XID/游標/長查詢/隔離級別/批量更新/naptime）、10 項預防措施、`OldestXmin` 原始碼分析
@@ -69,9 +76,7 @@
 - **一、PG 17 開發規範**：命名/設計/Query/管理/穩定性五大類 50+ 條規則，標記 4 條已過時規則
 - **二、Trigger Audit**：DML 審計（hstore + Row Trigger 記錄欄位級變更）+ DDL 審計（Event Trigger + hstore）
 - **三、JOIN 冗餘膨脹 Early DISTINCT**：笛卡爾乘積膨脹的根因、每層 JOIN 後立即去重的解法、重現實驗與 CTE 簡化寫法
-- **四、pgcrypto 加密**：密碼儲存（crypt+gen_salt）、PGP 對稱/公鑰加密、三種方案選擇矩陣
-- **五、千億級 Regex 模糊查詢**：1,008 億行 pg_trgm + GIN 效能實測、Trigram 原理、四種查詢模式（Prefix/Suffix/中間/Regex）、pg_bigm 替代方案
-- **六、12306 搶票架構**：varbit 座位區段銷售狀態、Array+GIN 車次查詢、SKIP LOCKED 避免 Lock 衝突、pgrouting 路徑規劃、10 大法寶
+- **四、12306 搶票架構**：varbit 座位區段銷售狀態、Array+GIN 車次查詢、SKIP LOCKED 避免 Lock 衝突、pgrouting 路徑規劃、10 大法寶
 
 ### 查詢深度解析（Query）
 - **一、查詢生命週期**：Client Request → Parser → Analyzer → Planner → Executor 六階段逐層拆解、Process-per-Connection 架構設計、三層 Tree 轉換（Parse/Plan/Executor）
