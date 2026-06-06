@@ -2,13 +2,11 @@
 
 > **閱讀順序：由淺入深，逐步構建 PostgreSQL 生產級技術棧**
 
-本書按 PostgreSQL Extension 的安裝方式與應用層次編排兩大分類、共十五個 Extension：
+本書按 PostgreSQL Extension 的安裝方式與應用層次編排兩大分類、共十三個 Extension：
 
-**# 一、Non-Contrib Extensions（需額外安裝）** — 8 個，需透過 apt install、源碼編譯或第三方工具安裝：
+**# 一、Non-Contrib Extensions（需額外安裝）** — 6 個，需透過 apt install、源碼編譯或第三方工具安裝：
 
-- **IMPORT FOREIGN SCHEMA / postgres_fdw**：跨庫查詢基礎，FDW 架構、schema 導入、parallel foreign scan / async append / MERGE pushdown（PG 14-17 演進）。
 - **pg_partman**：原生宣告式分區自動化管理，自動分區創建、retention policy 定時清理、Background Worker 驅動 partition lifecycle。
-- **Citus 12**：分散式 SQL 引擎，hash/range sharding、co-located join、schema-based sharding、非阻塞 rebalancing。
 - **PgBouncer**：連接池，Transaction/Session/Statement Pooling，生產級 HAProxy 拓撲。
 - **pg_repack**：四階段在線表重組，vs VACUUM FULL / pg_squeeze 三方案對比。
 - **pg_cron**：PG 內建排程作業，定時 VACUUM、分區維護、物化視圖刷新。
@@ -25,7 +23,7 @@
 - **pg_buffercache**：緩存內容即時診斷，usagecount 時鐘演算法、pg_buffercache_summary()（PG 17）。
 - **btree_gin / btree_gist**：GIN 多欄位複合索引擴展、GiST EXCLUSION CONSTRAINT。
 
-> 更新於 2026-06-06，全面升級至 PG 16+ 生態，兩大分類共 15 個 Extension。所有範例使用 PG 16 語法與路徑。
+> 更新於 2026-06-06，全面升級至 PG 16+ 生態，兩大分類共 13 個 Extension。所有範例使用 PG 16 語法與路徑。
 
 ---
 
@@ -35,795 +33,7 @@
 
 ---
 
-## 1. IMPORT FOREIGN SCHEMA — 一鍵創建 Foreign Table
-
-### I. 核心語法與背景
-
-在 PostgreSQL 的生態中，Foreign Data Wrapper（FDW）讓你可以像操作本地資料表一樣查詢遠端資料庫的內容。然而，早期的 FDW 使用上有一個不小的痛點：你必須手動寫 `CREATE FOREIGN TABLE` 逐一對應遠端的每個欄位，當遠端表結構複雜或數量眾多時，這項工作既繁瑣又容易出錯。
-
-`IMPORT FOREIGN SCHEMA` 正是為了解決這個問題而生的 —— 它是一條 SQL 語句，能自動查詢遠端資料庫的 `information_schema.columns`，並在本地生成對應的 `CREATE FOREIGN TABLE` DDL，瞬間完成大量 Foreign Table 的創建。
-
-```sql
-IMPORT FOREIGN SCHEMA remote_schema_name
-    [ { LIMIT TO | EXCEPT } ( table_name [, ...] ) ]
-  FROM SERVER server_name
-  INTO local_schema_name
-  [ OPTIONS ( option 'value' [, ... ] ) ]
-```
-
-核心運作機制如下圖所示：
-
-```mermaid
-flowchart TD
-    A["IMPORT FOREIGN SCHEMA 執行"] --> B["查詢遠端 information_schema.columns"]
-    B --> C["獲取 table_name, column_name, data_type, is_nullable 等資訊"]
-    C --> D{"是否指定 LIMIT TO / EXCEPT?"}
-    D -->|"LIMIT TO"| E["僅保留指定表的欄位清單"]
-    D -->|"EXCEPT"| F["排除指定表，保留其餘"]
-    D -->|"無過濾"| G["保留所有表"]
-    E --> H["對每個表生成 CREATE FOREIGN TABLE DDL"]
-    F --> H
-    G --> H
-    H --> I["在 local_schema 中執行 DDL"]
-    I --> J["完成！Foreign Table 可立即查詢"]
-```
-
-> **初學者導讀**：你可以把 `IMPORT FOREIGN SCHEMA` 想像成「從遠端資料庫下載一份完整的表結構藍圖到本地」。之後你在本地對這些 Foreign Table 下 `SELECT`，PostgreSQL 會自動將查詢轉發到遠端執行並取回結果。你不需要關心網路細節，就像操作本地表一樣。
-
-### II. 完整操作示範（PG 16 範例）
-
-以下示範以兩台執行 PostgreSQL 16 的伺服器為例：Remote PG（遠端）與 Local PG（本地）。
-
-#### a. 遠端 PostgreSQL 準備
-
-在遠端伺服器上，我們需要一個可供連線的 database 與 schema，以及一些測試資料。
-
-```sql
--- 遠端：建立測試用 database 與 schema
-CREATE DATABASE remote_db;
-\c remote_db
-CREATE SCHEMA remote_app;
-CREATE ROLE fdw_user WITH LOGIN PASSWORD 'secure_pass';
-GRANT USAGE ON SCHEMA remote_app TO fdw_user;
-GRANT SELECT ON ALL TABLES IN SCHEMA remote_app TO fdw_user;
-ALTER DEFAULT PRIVILEGES IN SCHEMA remote_app GRANT SELECT ON TABLES TO fdw_user;
-
--- 遠端：建立測試表
-SET search_path TO remote_app;
-
-CREATE TABLE users (
-    user_id    SERIAL PRIMARY KEY,
-    username   VARCHAR(50) NOT NULL,
-    email      VARCHAR(255),
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE orders (
-    order_id   SERIAL PRIMARY KEY,
-    user_id    INT REFERENCES users(user_id),
-    amount     NUMERIC(10, 2) NOT NULL,
-    placed_at  TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE audit_log (
-    log_id     SERIAL PRIMARY KEY,
-    table_name VARCHAR(100),
-    action     VARCHAR(20),
-    log_time   TIMESTAMPTZ DEFAULT now()
-);
-
-INSERT INTO users (username, email) VALUES
-    ('alice', 'alice@example.com'),
-    ('bob',   'bob@example.com');
-
-INSERT INTO orders (user_id, amount) VALUES
-    (1, 100.50),
-    (1, 200.00),
-    (2, 50.75);
-```
-
-遠端 `pg_hba.conf`（路徑：`/etc/postgresql/16/main/pg_hba.conf`）需要允許本地連線：
-
-```ini
-## 允許來自本地子網的連線
-host    remote_db    fdw_user    192.168.1.0/24    scram-sha-256
-```
-
-修改後重新載入設定：
-
-```bash
-sudo pg_ctlcluster 16 main reload
-```
-
-> **補充（Senior Dev）**：生產環境中建議使用 `scram-sha-256` 而非 `md5`。若遠端與本地在同一台機器上測試，可將 IP 設為 `127.0.0.1/32`。
-
-#### b. 本地 PostgreSQL 操作
-
-```sql
--- 1. 建立擴展
-CREATE EXTENSION postgres_fdw;
-
--- 2. 建立遠端伺服器定義
-CREATE SERVER remote_pg_server
-    FOREIGN DATA WRAPPER postgres_fdw
-    OPTIONS (
-        host '192.168.1.100',
-        port '5432',
-        dbname 'remote_db'
-    );
-
--- 3. 建立使用者映射（將本地角色對應到遠端登入憑證）
-CREATE USER MAPPING FOR CURRENT_USER
-    SERVER remote_pg_server
-    OPTIONS (
-        user 'fdw_user',
-        password 'secure_pass'
-    );
-
--- 4. 建立本地 Schema（用於存放 Foreign Table）
-CREATE SCHEMA fdw_tables;
-
--- 5. 一鍵導入遠端 Schema 全部資料表
-IMPORT FOREIGN SCHEMA remote_app
-    FROM SERVER remote_pg_server
-    INTO fdw_tables;
-
--- 6. 驗證結果
-\det+ fdw_tables.*
-\d fdw_tables.users
-```
-
-#### c. 驗證：Foreign Table 結構與資料
-
-```sql
--- 查看 Foreign Table 的欄位定義
-SELECT
-    table_name,
-    column_name,
-    data_type,
-    is_nullable
-FROM information_schema.columns
-WHERE table_schema = 'fdw_tables'
-ORDER BY table_name, ordinal_position;
-```
-
-預期輸出：
-
-| table_name | column_name | data_type             | is_nullable |
-|------------|-------------|-----------------------|-------------|
-| audit_log  | log_id      | integer               | NO          |
-| audit_log  | table_name  | character varying     | YES         |
-| audit_log  | action      | character varying     | YES         |
-| audit_log  | log_time    | timestamp with time zone | YES      |
-| orders     | order_id    | integer               | NO          |
-| orders     | user_id     | integer               | YES         |
-| orders     | amount      | numeric               | NO          |
-| orders     | placed_at   | timestamp with time zone | YES      |
-| users      | user_id     | integer               | NO          |
-| users      | username    | character varying     | NO          |
-| users      | email       | character varying     | YES         |
-| users      | created_at  | timestamp with time zone | YES      |
-
-驗證查詢：
-
-```sql
--- 跨庫查詢！本地直接 JOIN 遠端資料
-SELECT u.username, o.amount, o.placed_at
-FROM fdw_tables.users u
-JOIN fdw_tables.orders o ON u.user_id = o.user_id;
-```
-
-```
- username | amount |         placed_at
-----------+--------+----------------------------
- alice    | 100.50 | 2024-01-15 10:30:00+00
- alice    | 200.00 | 2024-01-15 11:00:00+00
- bob      |  50.75 | 2024-01-15 12:00:00+00
-```
-
-#### d. 整體架構
-
-```mermaid
-graph TD
-    subgraph "Local PG Instance"
-        L1["fdw_tables.users<br/>(Foreign Table)"]
-        L2["fdw_tables.orders<br/>(Foreign Table)"]
-        L3["fdw_tables.audit_log<br/>(Foreign Table)"]
-        S["postgres_fdw Extension"]
-        SRV["remote_pg_server<br/>(Server Definition)"]
-        MAP["USER MAPPING<br/>local_user → fdw_user"]
-    end
-
-    subgraph "Remote PG Instance"
-        R1["remote_app.users<br/>(Physical Table)"]
-        R2["remote_app.orders<br/>(Physical Table)"]
-        R3["remote_app.audit_log<br/>(Physical Table)"]
-        IC["information_schema.columns"]
-    end
-
-    L1 -.->|"SELECT 時即時轉發"| S
-    L2 -.->|"SELECT 時即時轉發"| S
-    L3 -.->|"SELECT 時即時轉發"| S
-    S --> SRV
-    SRV --> MAP
-    MAP -->|"連線認證"| R1
-    MAP -->|"連線認證"| R2
-    MAP -->|"連線認證"| R3
-    IC -.->|"IMPORT 時讀取結構"| L1
-    IC -.->|"IMPORT 時讀取結構"| L2
-    IC -.->|"IMPORT 時讀取結構"| L3
-```
-
-> **初學者導讀**：請注意，Foreign Table **不儲存任何資料**。它就是一個「指向遠端表的指標」。每次你查詢 Foreign Table，PostgreSQL 都會即時連線到遠端、執行 SQL、取回結果。這就和 DBLINK 的理念類似，但更加透明。
-
-### III. LIMIT TO 與 EXCEPT 過濾
-
-當遠端 Schema 中包含大量資料表，但你只需要導入其中幾張時，可以使用過濾子句。`LIMIT TO` 和 `EXCEPT` 互斥，不可同時指定。
-
-```sql
--- 只導入 users 和 orders 兩張表
-IMPORT FOREIGN SCHEMA remote_app
-    LIMIT TO (users, orders)
-    FROM SERVER remote_pg_server
-    INTO fdw_tables;
-
--- 導入除 audit_log 以外的全部表
-IMPORT FOREIGN SCHEMA remote_app
-    EXCEPT (audit_log)
-    FROM SERVER remote_pg_server
-    INTO fdw_tables;
-```
-
-```mermaid
-flowchart LR
-    subgraph "遠端 remote_app 所有表"
-        A["users ✅"]
-        B["orders ✅"]
-        C["audit_log ✅"]
-        D["products ✅"]
-        E["inventory ✅"]
-    end
-
-    subgraph "LIMIT TO (users, orders)"
-        A2["users"]
-        B2["orders"]
-    end
-
-    subgraph "EXCEPT (audit_log)"
-        A3["users"]
-        B3["orders"]
-        D3["products"]
-        E3["inventory"]
-    end
-
-    A --> A2
-    B --> B2
-    A --> A3
-    B --> B3
-    C -.->|"❌ 排除"| A3
-    D --> D3
-    E --> E3
-```
-
-> **初學者導讀**：`LIMIT TO` = 「只拿這些」，`EXCEPT` = 「除了這些，其他都拿」。實務上，當遠端 Schema 表很多但你只關心幾張核心表時，`LIMIT TO` 最常用。當你幾乎全部都要、只想跳過幾張無關的日誌或暫存表時，用 `EXCEPT`。
-
-### IV. 注意事項 — View、Materialized View、Foreign Table 也會被導入
-
-`IMPORT FOREIGN SCHEMA` 在執行時，會查詢遠端 `information_schema.columns`。這個系統 View 並不區別底層是實體表（`relkind = 'r'`）、View（`relkind = 'v'`）、Materialized View（`relkind = 'm'`）還是 Foreign Table（`relkind = 'f'`） —— 只要它有欄位定義，就會被導入。
-
-| relkind | 類型 | 會被導入？ | 注意事項 |
-|---------|------|-----------|---------|
-| `r` | 普通表 (Table) | ✅ 是 | 正常導入，使用最頻繁 |
-| `v` | 視圖 (View) | ✅ 是 | 導入後可查詢遠端 View，邏輯透明 |
-| `m` | 實體化視圖 (Materialized View) | ✅ 是 | 導入後可查詢，但無法觸發遠端 REFRESH |
-| `f` | 外來表 (Foreign Table) | ✅ 是 | **串聯 FDW**：導入後本地再指向遠端的另一個 FDW |
-| `p` | 分區表 (Partitioned Table) | ✅ 是 | 分區定義本身被導入，子分區各別導入 |
-
-> **補充（Senior Dev）**：串聯 FDW（Foreign → Foreign）會形成多層轉發鏈。假設 Server A → Server B → Server C，則查詢 A 的 Foreign Table 時，最終會抵達 C。每一層都會增加延遲，且 SQL Pushdown 能力在每一層都可能受損。除非有明確的架構原因（例如跨網段金庫），否則不建議超過兩層。
-
-#### a. 如何排除特定 relkind
-
-`IMPORT FOREIGN SCHEMA` 本身無法按 relkind 過濾。如果你只想導入實體表，可以在導入後手動刪除不需要的 Foreign Table，或使用以下查詢輔助分析：
-
-```sql
--- 在遠端查看 remote_app 中各類型的物件
-SELECT
-    c.relname AS name,
-    c.relkind,
-    CASE c.relkind
-        WHEN 'r' THEN 'Table'
-        WHEN 'v' THEN 'View'
-        WHEN 'm' THEN 'Materialized View'
-        WHEN 'f' THEN 'Foreign Table'
-        WHEN 'p' THEN 'Partitioned Table'
-    END AS type
-FROM pg_class c
-JOIN pg_namespace n ON c.relnamespace = n.oid
-WHERE n.nspname = 'remote_app'
-  AND c.relkind IN ('r', 'v', 'm', 'f', 'p')
-ORDER BY c.relkind, c.relname;
-```
-
-### V. 限制與適用範圍（總結）
-
-#### a. 會被導入的定義
-
-| 定義 | 狀態 |
-|------|------|
-| 欄位名稱與型別 | ✅ 完整導入 |
-| NOT NULL 約束 | ✅ 導入 |
-| DEFAULT 值 | ❌ 不會導入（遠端 DEFAULT 在遠端執行時套用） |
-| PRIMARY KEY | ❌ 不會導入 |
-| FOREIGN KEY | ❌ 不會導入 |
-| CHECK 約束 | ❌ 不會導入 |
-| UNIQUE 約束 | ❌ 不會導入 |
-| 索引 | ❌ 不會導入（遠端查詢使用遠端的索引） |
-| 觸發器 (Trigger) | ❌ 不會導入（在遠端觸發） |
-
-> **初學者導讀**：這是「代理查詢」模式，不是「同步複製」。約束條件在遠端維護，索引在遠端生效。本地只是一個「查詢入口」，並不擁有這些元數據。
-
-#### b. 潛在風險
-
-| 風險 | 說明 | 緩解方式 |
-|------|------|---------|
-| 網路延遲 | 每個查詢都需往返遠端伺服器，延遲取決於網路品質 | 減少頻繁的小查詢，合併成批次查詢；考慮 Materialized View 緩存 |
-| 連線耗盡 | 高並發查詢 Foreign Table 時可能耗盡遠端連線池 | 配置 `max_connections`、使用 PgBouncer 連線池、設定 `fetch_size` |
-| SQL Pushdown 限制 | 並非所有 SQL 都能下推到遠端執行；複雜查詢可能將大量資料拉回本地處理 | 使用 `EXPLAIN VERBOSE` 檢查 Remote SQL；必要時在遠端建立 View 簡化查詢 |
-| 交易隔離 | 遠端交易預設為 `READ COMMITTED`；兩階段提交（2PC）需手動配置 | 對一致性要求高的場景，避免跨庫交易 |
-| 憑證洩漏 | `pg_user_mapping` 中密碼以明文儲存 | 使用 `peer` / `cert` 認證，或將密碼放入 `~/.pgpass` |
-
-### VI. postgres_fdw 功能總覽（PG 16 基準）
-
-| Feature | Available Since | PG 16 Status | Description |
-|---------|----------------|--------------|-------------|
-| async_append | PG 14 | ✅ Supported | 多 Foreign Table UNION ALL 時並行向多遠端發查詢 |
-| batch_size INSERT | PG 14 | ✅ Supported | 多行 INSERT 批次打包，減少網路往返 |
-| parallel_commit | PG 14 | ✅ Supported | 跨多遠端交易提交時平行執行 COMMIT PREPARED |
-| import_default / import_not_null | PG 14 | ✅ Supported | IMPORT FOREIGN SCHEMA 時選擇導入預設值與 NOT NULL 約束 |
-| MERGE pushdown | PG 15 | ✅ Supported | MERGE INTO 語句完整下推遠端執行 |
-| FULL JOIN pushdown | PG 16 | ✅ New | Foreign Table 間 FULL JOIN 完整下推 |
-| RIGHT JOIN pushdown | PG 16 | ✅ New | RIGHT JOIN 下推支援補齊 |
-| parallel_abort | PG 16 | ✅ New | 交易中止時平行執行 ROLLBACK PREPARED，對稱於 parallel_commit |
-| ANALYZE performance | PG 17 | ✅ New | 優化遠端取樣邏輯，大型表 ANALYZE 顯著加速 |
-
-#### a. 遠端掃描：async_append（PG 14）
-
-```sql
--- 多 Foreign Table UNION ALL 時，PG 14+ 可同時向多台遠端發出查詢
-SELECT * FROM fdw_shard1.orders
-UNION ALL
-SELECT * FROM fdw_shard2.orders
-UNION ALL
-SELECT * FROM fdw_shard3.orders;
-```
-
-#### b. 遠端寫入：batch_size（PG 14）+ MERGE pushdown（PG 15）
-
-```sql
--- 設定 Foreign Table 寫入批次大小
-ALTER FOREIGN TABLE fdw_tables.orders OPTIONS (ADD batch_size '100');
-
--- 多行 INSERT 自動打包成單次遠端呼叫
-INSERT INTO fdw_tables.orders (product, qty) VALUES
-    ('Widget A', 10), ('Widget B', 20), ('Widget C', 30);
-```
-
-```sql
--- PG 15+ MERGE 語句完整下推遠端
-MERGE INTO fdw_tables.users u
-USING (VALUES ('alice', 'alice_new@example.com')) AS v(username, email)
-ON u.username = v.username
-WHEN MATCHED THEN UPDATE SET email = v.email
-WHEN NOT MATCHED THEN INSERT (username, email) VALUES (v.username, v.email);
-```
-
-#### c. IMPORT 選項：import_default / import_not_null（PG 14）
-
-```sql
-IMPORT FOREIGN SCHEMA remote_app
-    FROM SERVER remote_pg_server
-    INTO fdw_tables
-    OPTIONS (import_default 'true', import_not_null 'true');
-```
-
-#### d. JOIN pushdown：FULL JOIN / RIGHT JOIN（PG 16）
-
-```sql
--- PG 16 起 FULL JOIN 可完整下推
-EXPLAIN VERBOSE
-SELECT COALESCE(u.username, 'N/A'), COALESCE(o.order_id, -1)
-FROM fdw_tables.users u
-FULL JOIN fdw_tables.orders o ON u.user_id = o.user_id;
--- Remote SQL: SELECT ... FROM remote_app.users r1
---             FULL JOIN remote_app.orders r2 ON (r1.user_id = r2.user_id)
-```
-
-#### e. 交易生命週期：parallel_commit / parallel_abort（PG 14 / 16）+ ANALYZE（PG 17）
-
-```sql
--- 無需手動設定：本地交易 COMMIT 時平行向多遠端執行 COMMIT PREPARED（PG 14）
--- 本地交易 ROLLBACK 時平行向多遠端執行 ROLLBACK PREPARED（PG 16）
-```
-
-```sql
--- PG 17 優化遠端取樣邏輯，大型 Foreign Table ANALYZE 更快
-ANALYZE fdw_tables.users;
-```
-
-```mermaid
-timeline
-    title postgres_fdw 功能演進（PG 14 → 17）
-    PG 14 : async_append 並行掃描
-          : batch_size 批次 INSERT
-          : parallel_commit
-          : import_default / not_null
-    PG 15 : MERGE pushdown
-    PG 16 : FULL / RIGHT JOIN pushdown
-          : parallel_abort
-    PG 17 : ANALYZE 效能提升
-```
-### VII. 效能與監控
-
-#### a. EXPLAIN VERBOSE 查看 Remote SQL
-
-這是 FDW 效能調校最重要的工具。透過 `EXPLAIN VERBOSE`，你可以看到 postgres_fdw 實際發送給遠端伺服器的 SQL 內容：
-
-```sql
-EXPLAIN (VERBOSE, ANALYZE)
-SELECT u.username, COUNT(*) AS order_count, SUM(o.amount) AS total
-FROM fdw_tables.users u
-JOIN fdw_tables.orders o ON u.user_id = o.user_id
-WHERE o.amount > 50
-GROUP BY u.username;
-```
-
-```
-HashAggregate  (cost=... rows=... width=...) (actual time=...)
-  Group Key: u.username
-  ->  Foreign Scan  (cost=... rows=... width=...) (actual time=...)
-        Output: u.username, o.amount
-        Relations: (fdw_tables.users u) INNER JOIN (fdw_tables.orders o)
-        Remote SQL: SELECT r1.username, r2.amount
-                    FROM (remote_app.users r1
-                    INNER JOIN remote_app.orders r2
-                      ON (((r1.user_id = r2.user_id)) AND (r2.amount > (50)::numeric)))
-```
-
-> **初學者導讀**：`Remote SQL` 這一行就是黃金資訊！它告訴你哪些操作被下推到了遠端、哪些留在本地。理想狀況下，過濾條件和聚合都要出現在 Remote SQL 中。如果 Remote SQL 是 `SELECT * FROM table`（無任何 WHERE），那表示大量不需要的資料都被拉回了本地，效能會非常差。
-
-#### b. fetch_size 調校
-
-`fetch_size` 控制 postgres_fdw 每次從遠端遊標（cursor）提取的行數。這個值直接影響查詢的吞吐量與延遲。
-
-| fetch_size | 行為 | 適用場景 |
-|------------|------|---------|
-| 0（預設） | 不建立遊標；一次性讀取全部結果集 | 小型查詢（< 1 萬行） |
-| 100 | 每次提取 100 行，適合快速回傳首批結果 | Web UI 分頁、逐步渲染 |
-| 1000 | 每次提取 1000 行，平衡吞吐量與延遲 | 中大型查詢的通用預設 |
-| 10000 | 每次提取 10000 行，最大化吞吐量 | 批量 ETL、匯出作業 |
-| > 100000 | 極大批次；注意遠端記憶體消耗 | 資料遷移 |
-
-```sql
--- 在 Foreign Table 層級設定
-ALTER FOREIGN TABLE fdw_tables.orders OPTIONS (ADD fetch_size '1000');
-
--- 在 Foreign Server 層級設定（所有該 Server 下的表都會繼承）
-ALTER SERVER remote_pg_server OPTIONS (ADD fetch_size '1000');
-```
-
-```mermaid
-flowchart TD
-    A["SELECT * FROM fdw_tables.orders<br/>WHERE amount > 50"]
-    A --> B{"fetch_size 設定?"}
-
-    B -->|"fetch_size = 0"| C["遠端執行 SELECT<br/>一次性將所有結果傳回"]
-    C --> D["✅ 最簡單<br/>❌ 大結果集可能 OOM<br/>❌ 首批結果需等全部完成"]
-
-    B -->|"fetch_size = 1000"| E["遠端宣告 CURSOR<br/>批次 FETCH 1000 行"]
-    E --> F["本地 FETCH 1000 行"]
-    F --> G{"還有更多?"}
-    G -->|"是"| E
-    G -->|"否"| H["✅ 關閉遠端 CURSOR<br/>✅ 記憶體可控<br/>✅ 首批資料更快"]
-
-    B -->|"fetch_size = 100"| I["遠端宣告 CURSOR<br/>批次 FETCH 100 行"]
-    I --> J["本地 FETCH 100 行"]
-    J --> K{"還有更多?"}
-    K -->|"是"| I
-    K -->|"否"| L["✅ 最快看到首批資料<br/>❌ 網路往返次數多"]
-```
-
-> **補充（Senior Dev）**：使用 `fetch_size > 0` 時，postgres_fdw 會利用遠端 CURSOR。這意味著遠端交易會持續到本地端讀完所有結果為止。如果本地端中途崩潰或長時間閒置，遠端的 CURSOR 會佔用資源。建議為遠端設定 `idle_in_transaction_session_timeout`。
-
-#### c. use_remote_estimate
-
-本地 PostgreSQL 的查詢規劃器（planner）需要統計資訊來估算查詢的成本（cost）。對於 Foreign Table，預設情況下 planner 使用內建的低成本假設（`rows = 1000`，`cost = 10`），這經常導致不準確的執行計畫。
-
-`use_remote_estimate = true` 告訴 postgres_fdw：規劃查詢時，先向遠端伺服器查詢 `pg_stats` 等統計資訊，以獲得更精確的 row estimate。
-
-```sql
--- 在 Foreign Server 層級（或 Foreign Table 層級）啟用
-ALTER SERVER remote_pg_server OPTIONS (ADD use_remote_estimate 'true');
-
--- 驗證：查看 planner 是否使用了遠端統計
-EXPLAIN SELECT * FROM fdw_tables.orders WHERE amount > 100;
-```
-
-```
-Foreign Scan on orders  (cost=100.00..150.00 rows=500 width=40)
-  Filter: (amount > '100'::numeric)
-  -- 注意：rows=500 來自遠端 pg_stats，而非預設的 1000
-```
-
-取捨：
-
-| 面向 | use_remote_estimate = false | use_remote_estimate = true |
-|------|-----------------------------|----------------------------|
-| 規劃速度 | 快（不使用遠端查詢） | 慢（每次規劃都需查詢遠端） |
-| 行數估算 | 不準確（預設 1000 行） | 準確（使用遠端 pg_stats） |
-| 適用場景 | 表小、查詢簡單 | 大表、複雜 JOIN |
-| 遠端資源 | 不影響 | 輕微增加（每次規劃額外一兩個查詢） |
-
-#### d. Parallel Foreign Scan（PG 14+）
-
-PG 14 引入 `async_append` 後，你可以在特定條件下實現並行掃描多個 Foreign Table。
-
-啟用條件與步驟：
-
-```sql
--- 1. 確保 Foreign Table 有統計資訊
-ANALYZE fdw_tables.users;
-ANALYZE fdw_tables.orders;
-
--- 2. 啟用遠端估算（讓 planner 有足夠資訊選擇並行路徑）
-ALTER SERVER remote_pg_server OPTIONS (ADD use_remote_estimate 'true');
-
--- 3. 設定本地並行參數
-SET max_parallel_workers_per_gather = 4;
-SET parallel_tuple_cost = 0.01;
-SET parallel_setup_cost = 100;
-
--- 4. 驗證：UNION ALL 查詢是否能觸發 async_append
-EXPLAIN (VERBOSE)
-SELECT * FROM fdw_tables.users
-UNION ALL
-SELECT * FROM fdw_tables.orders_archive;  -- 假設這指向不同伺服器或不同分區
-```
-
-```
-Append
-  ->  Async Foreign Scan on users
-        Remote SQL: SELECT ...
-  ->  Async Foreign Scan on orders_archive
-        Remote SQL: SELECT ...
-```
-
-> **初學者導讀**：`async_append` 和 PG 內建的 `parallel query`（多 worker 掃描同一個表）是不同的概念。`async_append` 是並行掃描**多個不同的 Foreign Table**（可能分佈在不同伺服器上），而 `parallel query` 是多個 worker 並行掃描**同一張表**的不同分頁。兩者在 PG 14+ 可以組合使用。
-
-### VIII. App Dev 最佳實踐
-
-#### a. 何時用 FDW？技術選型決策樹
-
-```mermaid
-flowchart TD
-    A["需要跨資料庫存取資料"] --> B{"是否需要即時資料？"}
-    B -->|"是，必須即時"| C{"兩個 DB 是否同為 PostgreSQL？"}
-    B -->|"否，延遲可接受"| D["考慮 ETL / CDC<br/>(Debezium, Airbyte, pg_dump)"]
-
-    C -->|"是"| E{"是否需要寫入遠端？"}
-    C -->|"否"| F["考慮其他 FDW<br/>(mysql_fdw, tds_fdw, file_fdw)"]
-
-    E -->|"是<br/>(讀寫)"| G{"寫入頻率與交易一致性要求？"}
-    E -->|"否<br/>(唯讀)"| H["✅ postgres_fdw<br/>Foreign Table 唯讀查詢"]
-
-    G -->|"高頻 / 強一致性"| I["⚠️ 審慎使用 FDW<br/>考慮使用 2PC<br/>或應用層 Saga 模式"]
-    G -->|"中低頻 / 最終一致"| J["✅ postgres_fdw<br/>配合 batch_size 批次寫入"]
-
-    H --> K{"查詢模式？"}
-    K -->|"複雜 JOIN / 聚合"| L["⚠️ 測試 SQL Pushdown<br/>必要時在遠端建立 View"]
-    K -->|"簡單 CRUD"| M["✅ 直接使用"]
-
-    D --> N{"資料量大且持續增長？"}
-    N -->|"是"| O["CDC + Kafka + 串流處理"]
-    N -->|"否"| P["定時 pg_dump + pg_restore"]
-
-    I --> Q["或考慮：<br/>- Citus 分佈式<br/>- 應用層雙寫<br/>- 微服務拆分"]
-```
-
-#### b. 跨版本相容矩陣表
-
-| 本地 PG | 遠端 PG | postgres_fdw 行為 | 建議 |
-|---------|---------|------------------|------|
-| 17 | 17 | 完整功能，全 Pushdown 支援 | ✅ 最佳組合 |
-| 17 | 16 | 完整功能（PG 17 特性自動降級） | ✅ 相容 |
-| 17 | 15 | MERGE pushdown 可用；FULL JOIN pushdown 降級 | ✅ 相容 |
-| 17 | 14 | 基本查詢可用；無 MERGE / FULL JOIN pushdown | ⚠️ 審慎 |
-| 17 | 13 | 基本查詢可用；無 async_append / batch_size | ⚠️ 不建議 |
-| 17 | 12 | 基本查詢可用 | ⚠️ 不建議 |
-| 16 | 16 | FULL JOIN 可用 | ✅ |
-| 16 | 15 | MERGE pushdown 可用；FULL JOIN 降級 | ✅ |
-| 16 | 14 | 基本查詢可用 | ⚠️ 審慎 |
-| 15 | 14 | 基本查詢可用 | ⚠️ 審慎 |
-| 14 | 14 | async_append / batch_size / parallel_commit 可用 | ✅ |
-
-> **補充（Senior Dev）**：postgres_fdw 保證向前相容（新本地可連舊遠端），但**不保證向後相容**（舊本地連新遠端可能遇到不認識的協議參數）。實務上，建議本地 PG 版本 **≥** 遠端 PG 版本。
-
-#### c. 連接數管理（配合 PgBouncer）
-
-FDW 會從本地 PG 程序向遠端伺服器發起連線。高並發場景下，遠端可能被大量連線淹沒。
-
-#### d. 問題場景
-
-```
-每個本地 backend process → 可能持有 1 個遠端連線
-max_connections = 100 → 最多 100 個本地連線 → 最多 100 個遠端連線
-```
-
-#### e. 配置範例
-
-在遠端 PostgreSQL 前方放置 PgBouncer，使用 Transaction Pooling 模式：
-
-```ini
-## /etc/pgbouncer/pgbouncer.ini
-[databases]
-remote_db = host=127.0.0.1 port=5432 dbname=remote_db
-
-[pgbouncer]
-listen_addr = 0.0.0.0
-listen_port = 6432
-auth_type = scram-sha-256
-auth_file = /etc/pgbouncer/userlist.txt
-pool_mode = transaction
-max_client_conn = 500
-default_pool_size = 25
-reserve_pool_size = 10
-reserve_pool_timeout = 5
-```
-
-遠端 `userlist.txt`：
-
-```ini
-"fdw_user" "secure_pass"
-```
-
-本地 Foreign Server 指向 PgBouncer 埠：
-
-```sql
-CREATE SERVER remote_pg_server
-    FOREIGN DATA WRAPPER postgres_fdw
-    OPTIONS (
-        host '192.168.1.100',
-        port '6432',  -- PgBouncer port
-        dbname 'remote_db'
-    );
-```
-
-#### f. 遠端連線參數調校
-
-```sql
--- 限制單一 Foreign Server 的連線數（PG 16+）
-ALTER SERVER remote_pg_server OPTIONS (ADD max_connections '10');
-
--- 設定遠端連線閒置超時
-ALTER SERVER remote_pg_server OPTIONS (ADD idle_session_timeout '300000');  -- 5 分鐘
-```
-
-#### g. 安全最佳實踐
-
-#### h. _user_mapping 的密碼風險
-
-`CREATE USER MAPPING` 的 `password` 選項會將密碼以**明文**儲存在 `pg_user_mapping` 系統目錄中：
-
-```sql
--- 任何人只要有權限查詢 pg_user_mapping，就能看到密碼
-SELECT * FROM pg_user_mapping;
-```
-
-這是一個嚴重的安全隱患。以下是幾種替代方案：
-
-```mermaid
-flowchart TD
-    A["如何避免明文密碼在 pg_user_mapping？"]
-    A --> B["方案 1：peer 認證"]
-    A --> C["方案 2：cert 憑證認證"]
-    A --> D["方案 3：~/.pgpass 檔案"]
-    A --> E["方案 4：password_required=false"]
-
-    B --> B1["本地 PG 以 OS 用戶身份連線<br/>遠端 pg_hba.conf: local all all peer"]
-    B1 --> B2["✅ 無密碼<br/>❌ 僅限 local socket 連線<br/>❌ 跨機器不適用"]
-
-    C --> C1["使用 SSL 客戶端憑證<br/>遠端 pg_hba.conf: hostssl all all 0.0.0.0/0 cert"]
-    C1 --> C2["✅ 最安全<br/>✅ 跨機器可用<br/>❌ 需維護 CA 與憑證"]
-
-    D --> D1["將密碼寫入 ~/.pgpass<br/>postgres_fdw 自動讀取"]
-    D1 --> D2["✅ 簡單易用<br/>⚠️ 密碼仍以明文存於檔案系統<br/>⚠️ 需確保檔案權限 0600"]
-
-    E --> E1["CREATE USER MAPPING<br/>不指定 password<br/>依賴 pg_hba.conf 的 trust/peer/cert"]
-    E1 --> E2["✅ 無密碼儲存<br/>❌ 需遠端配置特定認證方式"]
-```
-
-#### i. 方案實作對比
-
-**方案 1：peer 認證**
-
-遠端 `pg_hba.conf`：
-
-```ini
-local   remote_db   fdw_user   peer
-```
-
-本地：
-
-```sql
-CREATE USER MAPPING FOR CURRENT_USER
-    SERVER remote_pg_server
-    OPTIONS (user 'fdw_user');  -- 不指定 password
-```
-
-**方案 2：cert 憑證認證**
-
-遠端 `pg_hba.conf`：
-
-```ini
-hostssl remote_db   fdw_user   192.168.1.0/24   cert
-```
-
-遠端 `postgresql.conf`：
-
-```ini
-ssl = on
-ssl_ca_file = '/etc/postgresql/16/main/ca.crt'
-```
-
-本地 Foreign Server 設定：
-
-```sql
-CREATE SERVER remote_pg_server
-    FOREIGN DATA WRAPPER postgres_fdw
-    OPTIONS (
-        host '192.168.1.100',
-        port '5432',
-        dbname 'remote_db',
-        sslmode 'verify-ca',
-        sslrootcert '/etc/postgresql/16/main/ca.crt',
-        sslcert    '/etc/postgresql/16/main/client.crt',
-        sslkey     '/etc/postgresql/16/main/client.key'
-    );
-
-CREATE USER MAPPING FOR CURRENT_USER
-    SERVER remote_pg_server
-    OPTIONS (user 'fdw_user');  -- 不指定 password，由 cert 認證
-```
-
-**方案 3：~/.pgpass**
-
-```bash
-## 在執行 PostgreSQL 服務的 OS 用戶的 home 目錄下
-## ~postgres/.pgpass
-echo "192.168.1.100:5432:remote_db:fdw_user:secure_pass" > ~/.pgpass
-chmod 0600 ~/.pgpass
-```
-
-```sql
--- 不指定 password，postgres_fdw 自動從 .pgpass 讀取
-CREATE USER MAPPING FOR CURRENT_USER
-    SERVER remote_pg_server
-    OPTIONS (user 'fdw_user');
-```
-
-> **初學者導讀**：`~/.pgpass` 是最簡單的替代方案，但請務必設定檔案權限為 `0600`（僅擁有者可讀寫）。在生產環境中，強烈建議使用 cert 憑證認證，這是零密碼儲存的最安全方案。
-
-#### j. 最小權限原則
-
-遠端資料庫使用者應僅被授予必要的權限：
-
-```sql
--- 遠端：最小權限
-GRANT USAGE ON SCHEMA remote_app TO fdw_user;
-GRANT SELECT ON users, orders TO fdw_user;       -- 唯讀
--- GRANT INSERT, UPDATE, DELETE ON orders TO fdw_user;  -- 若需寫入
-REVOKE ALL ON DATABASE remote_db FROM PUBLIC;    -- 收緊公共權限
-```
-## 2. pg_partman — 原生分區自動化管理
+## 1. pg_partman — 原生分區自動化管理
 
 > **章節導讀**：PostgreSQL 自 10 版引入宣告式分區（Declarative Partitioning）後，歷經多個大版本打磨，原生分區能力已十分成熟。然而原生分區僅提供 DDL 手動管理（`CREATE/ATTACH/DETACH PARTITION`），缺乏自動化的分區生命週期管理——建立未來分區、清理過期分區、狀態監控等，這些正是 pg_partman 的核心價值。
 
@@ -1622,961 +832,7 @@ SELECT partman.create_parent(
 > 4. 評估是否可將該欄位作為 HASH 分區鍵
 >
 > 這是宣告式分區的結構性限制，與 pg_partman 無關。
-## 3. Citus 12 — 分散式 SQL 引擎
-
-Citus 12 是 PostgreSQL 生態系中最成熟的原生分散式 SQL 引擎，它以 Extension 形式嵌入 PG 16，將標準 PostgreSQL 轉變為水平可擴展的分散式資料庫集群。本章涵蓋 Citus 12 架構、安裝配置、核心操作、分散式查詢策略、Rebalancing、高可用與 App Dev 最佳實踐。
-
-> **初學者導讀**
-> 你可以把 Citus 想像成「PostgreSQL 的分身術」——它把一個巨大的資料表自動拆成許多小碎片（Shard），分散到多台伺服器上並行處理。對應用程式來說，你仍然寫標準的 `SELECT * FROM orders WHERE ...`，Citus 在背後幫你把查詢分發到多台機器、合併結果再回傳。這讓你可以在不改變 SQL 的前提下，把資料庫從單機擴展到集群。
-
----
-
-### I. Citus 架構與演進
-
-#### a. 從 pg_shard 到 Citus 12
-
-Citus 的前身 `pg_shard` 於 2015 年問世，是 PostgreSQL 生態中第一個真正意義上的分散式 Sharding Extension（僅支援 Hash Sharding + 基本的 `INSERT`/`SELECT`）。2016 年 Citus 公司開源了重新設計的 Citus 6，自此進入高速演進：
-
-| 版本 | 年份 | 里程碑 |
-|------|------|--------|
-| pg_shard | 2015 | 首次實現 PG Hash Sharding |
-| Citus 6 | 2016 | 開源：Distributed Tables、Reference Tables、Co-Location |
-| Citus 11 | 2022 | Query from Any Node（任意節點皆可接受查詢）、非阻塞 Rebalancing |
-| Citus 12 | 2024 | **Schema-Based Sharding**：以 Schema 為 Sharding 單位，完美適配 SaaS 多租戶場景 |
-
-> **補充（Senior Dev）**
-> pg_shard 使用 Foreign Data Wrapper（FDW）機制實現跨節點查詢，但其 `Custom Scan` API 受限於 PG 9.x 的 Executor Hook。Citus 6 重寫後使用 `Planner Hook` + `Executor Hook` 深度整合，直接介入 Query Planning 和 Execution 階段，這也是為什麼 Citus 能實現 Co-Located JOIN（零網路傳輸）和 Distributed Subquery Pushdown 的根本原因。如果你從 pg_shard 遷移，需注意 pg_shard 的 `pgs_distribution_metadata` 表結構與 Citus 的 `pg_dist_*` 家族完全不同，且 pg_shard 不支援 Reference Tables 和 Co-Location。
-
-#### b. Citus 12 on PG 16 核心能力
-
-Citus 12 運行在 PG 16 之上，提供四種 Table Type：
-
-**1. Distributed Tables（分佈式表）**
-最核心的表類型——將巨量資料按分佈鍵（Distribution Column）切分為多個 Shard，每個 Shard 都是一個獨立的 PostgreSQL Table，儲存在不同 Worker 節點上。
-
-```sql
--- 建表時宣告為分佈式表
-CREATE TABLE orders (
-    id          bigserial,
-    customer_id bigint NOT NULL,
-    amount      numeric(12,2),
-    created_at  timestamptz DEFAULT now(),
-    PRIMARY KEY (id, customer_id)
-);
-
--- 指定分佈鍵為 customer_id，切分為 32 個 Shard
-SELECT create_distributed_table('orders', 'customer_id', shard_count := 32);
-```
-
-**2. Reference Tables（參考表）**
-小型、經常與 Distributed Tables JOIN 的維度表（如 `products`、`categories`、`countries`），以 Full Replication 方式廣播到所有 Worker。查詢時每個 Worker 都有完整副本，避免跨節點資料傳輸。
-
-```sql
-CREATE TABLE products (
-    product_id   bigint PRIMARY KEY,
-    name         text NOT NULL,
-    category_id  int NOT NULL,
-    price        numeric(10,2)
-);
-
--- 將 products 宣告為 Reference Table
-SELECT create_reference_table('products');
-```
-
-**3. Local Tables（本地表）**
-完全不做分散的普通 PostgreSQL 表，僅存在於 Coordinator 上。用於儲存集群級元數據或不需要分散的小型配置表。
-
-**4. Schema-Based Sharding（Citus 12 新增）**
-以整個 Schema 為 Sharding 單位——同一 Schema 內所有表自動歸屬同一 Tenant，無需逐表呼叫 `create_distributed_table()`。這是 Citus 12 對 SaaS 多租戶場景的關鍵回應。
-
-```sql
--- 將整個 schema 宣告為分散式 schema
-SELECT citus_schema_distribute('tenant_001');
-
--- 此後在 tenant_001 內建的任何表，自動成為 Distributed Table
-SET search_path TO tenant_001;
-CREATE TABLE invoices (id bigserial, amount numeric, ...);
--- 無需再呼叫 create_distributed_table()
-```
-
-**5. Query from Any Node（Citus 11+）**
-從 Citus 11 開始，任意節點（Coordinator 或 Worker）都可以作為查詢入口，不再強制所有流量經過 Coordinator。這消除了 Coordinator 成為單點瓶頸的風險。
-
-**6. MERGE 支援（PG 16）**
-PG 16 原生的 `MERGE` 語句在 Citus 12 中直接可用於 Distributed Tables：
-
-```sql
-MERGE INTO orders AS t
-USING order_updates AS s ON t.id = s.id AND t.customer_id = s.customer_id
-WHEN MATCHED THEN UPDATE SET amount = s.amount
-WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.customer_id, s.amount);
-```
-
-#### c. Coordinator + Worker 架構
-
-Citus 採用經典的 Shared-Nothing 架構：每個節點擁有獨立的 CPU、記憶體和存儲，節點間透過網路通訊。
-
-```mermaid
-graph TB
-    subgraph "應用層"
-        APP["應用程式<br/>libpq / PgBouncer"]
-    end
-
-    subgraph "Citus 集群"
-        COORD["Coordinator<br/>PG 16 + Citus 12<br/>192.168.1.10"]
-        W1["Worker 1<br/>PG 16 + Citus 12<br/>192.168.1.11"]
-        W2["Worker 2<br/>PG 16 + Citus 12<br/>192.168.1.12"]
-        W3["Worker 3<br/>PG 16 + Citus 12<br/>192.168.1.13"]
-        W4["Worker 4<br/>PG 16 + Citus 12<br/>192.168.1.14"]
-    end
-
-    subgraph "Worker 1 HA"
-        SR1["Streaming Replica<br/>192.168.1.21"]
-    end
-    subgraph "Worker 2 HA"
-        SR2["Streaming Replica<br/>192.168.1.22"]
-    end
-    subgraph "Worker 3 HA"
-        SR3["Streaming Replica<br/>192.168.1.23"]
-    end
-    subgraph "Worker 4 HA"
-        SR4["Streaming Replica<br/>192.168.1.24"]
-    end
-
-    APP -->|"SQL 查詢<br/>Query from Any Node"| COORD
-    APP -.->|"亦可直連 Worker"| W1
-    COORD -->|"分發查詢 / 合併結果"| W1
-    COORD -->|"分發查詢 / 合併結果"| W2
-    COORD -->|"分發查詢 / 合併結果"| W3
-    COORD -->|"分發查詢 / 合併結果"| W4
-    W1 -.->|"WAL Streaming"| SR1
-    W2 -.->|"WAL Streaming"| SR2
-    W3 -.->|"WAL Streaming"| SR3
-    W4 -.->|"WAL Streaming"| SR4
-
-    COORD_META["pg_dist_node<br/>pg_dist_shard<br/>pg_dist_placement<br/>pg_dist_colocation"]
-    COORD --- COORD_META
-
-    style COORD fill:#4a90d9,color:white
-    style W1 fill:#5cb85c,color:white
-    style W2 fill:#5cb85c,color:white
-    style W3 fill:#5cb85c,color:white
-    style W4 fill:#5cb85c,color:white
-    style SR1 fill:#f0ad4e,color:black
-    style SR2 fill:#f0ad4e,color:black
-    style SR3 fill:#f0ad4e,color:black
-    style SR4 fill:#f0ad4e,color:black
-```
-
-Citus 內部 Metadata 表（儲存於 Coordinator）：
-
-| Metadata 表 | 用途 |
-|-------------|------|
-| `pg_dist_node` | 集群節點資訊（hostname、port、nodeid、groupid） |
-| `pg_dist_shard` | Shard 元數據（shardid、分佈鍵範圍、所屬表） |
-| `pg_dist_placement` | Shard 具體位置（shardid 對應到哪個 Worker） |
-| `pg_dist_colocation` | Co-Location Group 資訊 |
-| `pg_dist_partition` | 分散式表的 Partition 資訊（分佈方式、分佈鍵） |
-
----
-
-### II. 安裝與集群配置（PG 16）
-
-#### a. 安裝 Citus 12
-
-```bash
-## Debian / Ubuntu (使用 Citus 官方 apt repository)
-curl https://install.citusdata.com/community/deb.sh | sudo bash
-sudo apt install postgresql-16-citus-12
-
-## RHEL / Rocky / AlmaLinux
-sudo dnf install -y citus12_16
-```
-
-#### b. Coordinator 配置
-
-```ini
--- postgresql.conf（Coordinator）
-shared_preload_libraries = 'citus'
-
-## 每個連接的最大記憶體（Citus Planner 使用）
-citus.max_worker_nodes_tracked = 2048
-
-## 預設 Shard 數量（新 create_distributed_table 使用）
-citus.shard_count = 32
-
-## 每個 Shard 的副本數（1 = 無副本，2 = 1 主 + 1 備）
-citus.shard_replication_factor = 1
-
-## 啟用 Schema-Based Sharding（Citus 12）
-citus.enable_schema_based_sharding = on
-
-## 每個分散式查詢可使用的最大 CPU 核心數
-citus.max_cached_conns_per_worker = 2
-```
-
-重啟 PostgreSQL：
-
-```bash
-sudo systemctl restart postgresql@16-main
-```
-
-建立 Extension：
-
-```sql
-CREATE EXTENSION citus;
-```
-
-#### c. 新增 Worker 節點
-
-```sql
--- 將 Worker 加入集群
-SELECT citus_add_node('192.168.1.11', 5432);
-SELECT citus_add_node('192.168.1.12', 5432);
-SELECT citus_add_node('192.168.1.13', 5432);
-SELECT citus_add_node('192.168.1.14', 5432);
-
--- 查看集群節點
-SELECT nodeid, groupid, nodename, nodeport, noderole, isactive
-FROM pg_dist_node;
---  nodeid | groupid |   nodename    | nodeport | noderole  | isactive
--- --------+---------+---------------+----------+-----------+----------
---       1 |       0 | 192.168.1.10  |     5432 | primary   | t
---       2 |       1 | 192.168.1.11  |     5432 | primary   | t
---       3 |       2 | 192.168.1.12  |     5432 | primary   | t
---       4 |       3 | 192.168.1.13  |     5432 | primary   | t
---       5 |       4 | 192.168.1.14  |     5432 | primary   | t
-```
-
-每個 Worker 節點也必須安裝 Citus Extension：
-
-```sql
--- 在每個 Worker 上執行
-CREATE EXTENSION citus;
-```
-
-> **初學者導讀**
-> `citus_add_node()` 會自動在 Coordinator 的 `pg_dist_node` 表中記錄 Worker 資訊，同時在 Worker 上建立 Coordinator 的 Metadata 同步通道。`groupid` 是 Citus 內部的節點分組編號，同一個 Group 內的節點共享同一份 Shard 數據（透過 Streaming Replication 實現 HA）。
-
----
-
-### III. 核心操作
-
-#### a. 建立分佈式表 (`create_distributed_table`)
-
-Citus 支援兩種 Shard 分佈策略：
-
-| 策略 | 語法 | 適用場景 |
-|------|------|---------|
-| **Hash Distribution** | `create_distributed_table('tbl', 'col')` | 數據均勻分佈、點查詢（`WHERE key = X`） |
-| **Range Distribution** | `create_distributed_table('tbl', 'col', shard_count := N)` + 手動 `citus_shard_move()` 或排程 | 按時間/ID 範圍分段、範圍查詢（`WHERE key BETWEEN A AND B`） |
-
-**Hash Distribution 示例：**
-
-```sql
-CREATE TABLE events (
-    event_id   bigint PRIMARY KEY,
-    user_id    bigint NOT NULL,
-    event_type text NOT NULL,
-    payload    jsonb,
-    created_at timestamptz DEFAULT now()
-);
-
--- 按 user_id Hash：同一使用者的所有事件落在同一 Shard
-SELECT create_distributed_table('events', 'user_id', shard_count := 64);
-```
-
-**分佈鍵選擇原則：**
-
-```mermaid
-flowchart TD
-    Q1{"主查詢模式<br/>是否按單一 KEY<br/>點查/小範圍查？"}
-    Q1 -->|"是"| A["該 KEY 即為<br/>最佳分佈鍵"]
-    Q1 -->|"否"| Q2{"是否有明確的<br/>JOIN 維度？"}
-    Q2 -->|"是"| B["選擇 JOIN KEY<br/>作為分佈鍵<br/>實現 Co-Located JOIN"]
-    Q2 -->|"否"| Q3{"數據量大於<br/>100M rows？"}
-    Q3 -->|"是"| C["考慮複合分佈鍵<br/>或 Schema-Based<br/>Sharding（Citus 12）"]
-    Q3 -->|"否"| D["選擇 Cardinality 最高<br/>且均勻分佈的欄位<br/>（如 user_id）"]
-```
-
-> **補充（Senior Dev）**
-> 分佈鍵的 CARDINALITY 直接影響數據傾斜（Data Skew）。如果選擇 `country_code`（只有 ~200 個值）作為 Hash Key，數據將極度不均——部分 Shard 可能承載 90% 數據。可以使用以下查詢驗證分佈鍵的均勻性：
-> ```sql
-> SELECT count(DISTINCT country_code), count(*) / count(DISTINCT country_code) AS avg_per_value
-> FROM orders;
-> ```
-> 理想情況下 `avg_per_value` 不應超過總行數的 10%。對於確實需要按低 Cardinality 欄位查詢的場景，考慮使用 **Reference Table + Filter** 而非作為分佈鍵。
-
-#### b. Reference Tables (`create_reference_table`)
-
-將小型維度表廣播到所有 Worker，每個 Worker 持有完整副本：
-
-```sql
-CREATE TABLE categories (
-    category_id   int PRIMARY KEY,
-    category_name text NOT NULL,
-    parent_id     int
-);
-
--- 宣告為 Reference Table：資料自動複製到所有 Worker
-SELECT create_reference_table('categories');
-
--- 插入資料：Citus 自動廣播到所有 Worker
-INSERT INTO categories VALUES (1, 'Electronics', NULL), (2, 'Books', NULL);
-```
-
-Reference Table 的特性：
-- 每個 Worker 持有相同的完整副本
-- 與 Distributed Table JOIN 時，每個 Worker 可在本地完成 JOIN（無網路傳輸）
-- 適合行數 < 100K、更新頻率低的小型維度表
-- 寫入操作需廣播到所有 Worker（寫入延遲 = max(所有 Worker 寫入時間)）
-
-#### c. Co-Location (`colocate_with`)
-
-當兩個 Distributed Table 使用**相同的分佈鍵**時，Citus 將它們放在同一 Co-Location Group，確保相同分佈鍵值的行存放在**同一個 Worker 的同一個 Shard** 中。
-
-```sql
--- orders 和 order_items 使用相同的分佈鍵 customer_id
-CREATE TABLE orders (
-    order_id    bigint,
-    customer_id bigint NOT NULL,
-    amount      numeric(12,2),
-    PRIMARY KEY (order_id, customer_id)
-);
-
-CREATE TABLE order_items (
-    item_id     bigint,
-    order_id    bigint NOT NULL,
-    customer_id bigint NOT NULL,
-    product_id  bigint NOT NULL,
-    quantity    int,
-    PRIMARY KEY (item_id, customer_id)
-);
-
--- 兩個表使用相同的分佈鍵，並放入同一 Co-Location Group
-SELECT create_distributed_table('orders',      'customer_id', colocate_with := 'none');
-SELECT create_distributed_table('order_items', 'customer_id', colocate_with := 'orders');
-```
-
-Co-Location 的核心優勢：
-
-```mermaid
-sequenceDiagram
-    participant C as Coordinator
-    participant W1 as "Worker 1<br/>Shard 1001 (orders)<br/>Shard 2001 (order_items)"
-    participant W2 as "Worker 2<br/>Shard 1002 (orders)<br/>Shard 2002 (order_items)"
-
-    Note over C: SELECT * FROM orders o<br/>JOIN order_items oi<br/>ON o.order_id = oi.order_id<br/>AND o.customer_id = oi.customer_id
-
-    C->>W1: 查詢 customer_id ∈ [min1, max1]<br/>的 orders + order_items
-    C->>W2: 查詢 customer_id ∈ [min2, max2]<br/>的 orders + order_items
-
-    Note over W1: 本地 JOIN：零網路傳輸
-    Note over W2: 本地 JOIN：零網路傳輸
-
-    W1-->>C: 返回結果集
-    W2-->>C: 返回結果集
-    Note over C: 合併結果 → 回傳客戶端
-```
-
-> **初學者導讀**
-> Co-Location 是 Citus 效能的「超級加速器」——想像 `orders` 和 `order_items` 的 JOIN，如果兩個表沒有 Co-Located，查詢時需要把其中一個表的全部資料在網路上搬來搬去（Repartition Join）；但 Co-Located 後，`customer_id = 42` 的訂單和明細**本來就在同一台機器上**，JOIN 完全本地完成，就像單機 PostgreSQL 一樣快。
-
-#### d. Schema-Based Sharding（Citus 12）
-
-Citus 12 引入的 Schema-Based Sharding 徹底改變了 SaaS 多租戶架構的建置方式。傳統上每個租戶需要逐表呼叫 `create_distributed_table()`，而 Citus 12 允許**以整個 Schema 為 Sharding 單位**。
-
-```sql
--- 為租戶 "tenant_001" 建立獨立 Schema 並宣告為分散式
-CREATE SCHEMA tenant_001;
-SELECT citus_schema_distribute('tenant_001');
-
--- 切換到租戶 Context（應用層通常由 Middleware 處理）
-SET search_path TO tenant_001;
-
--- 從現在起，在 tenant_001 內建的表自動成為 Distributed Table
-CREATE TABLE invoices (
-    id        bigserial PRIMARY KEY,
-    amount    numeric(12,2),
-    issued_at timestamptz DEFAULT now()
-);
-
-CREATE TABLE payments (
-    id          bigserial PRIMARY KEY,
-    invoice_id  bigint REFERENCES invoices(id),
-    paid_amount numeric(12,2),
-    paid_at     timestamptz
-);
--- invoices 和 payments 自動 Co-Located（同一個 Schema = 同一 Shard）
-```
-
-**三種 Table Type 對比：**
-
-```mermaid
-graph LR
-    subgraph "Coordinator"
-        LT["Local Tables<br/>(config, metadata)<br/>僅存於 Coordinator"]
-    end
-
-    subgraph "Worker 1"
-        W1_DT["Distributed<br/>Shard 102001<br/>(customer_id 1-1000)"]
-        W1_RT["Reference Table<br/>categories<br/>(完整副本)"]
-        W1_SBS["Schema: tenant_001<br/>invoices + payments<br/>(Co-Located)"]
-    end
-
-    subgraph "Worker 2"
-        W2_DT["Distributed<br/>Shard 102002<br/>(customer_id 1001-2000)"]
-        W2_RT["Reference Table<br/>categories<br/>(完整副本)"]
-    end
-
-    subgraph "Worker 3"
-        W3_DT["Distributed<br/>Shard 102003<br/>(customer_id 2001-3000)"]
-        W3_RT["Reference Table<br/>categories<br/>(完整副本)"]
-        W3_SBS["Schema: tenant_002<br/>invoices + payments<br/>(Co-Located)"]
-    end
-
-    LT -.->|"無複製"| W1_DT
-    style LT fill:#e8d44d,color:black
-    style W1_DT fill:#5cb85c,color:white
-    style W2_DT fill:#5cb85c,color:white
-    style W3_DT fill:#5cb85c,color:white
-    style W1_RT fill:#4a90d9,color:white
-    style W2_RT fill:#4a90d9,color:white
-    style W3_RT fill:#4a90d9,color:white
-    style W1_SBS fill:#d9534f,color:white
-    style W3_SBS fill:#d9534f,color:white
-```
-
-> **補充（Senior Dev）**
-> Schema-Based Sharding 內部實作是在 `citus_schema_distribute()` 被呼叫時，自動為該 Schema 建立一個 Co-Location Group，並將 Schema 內所有表的 `pg_dist_partition.colocationid` 指向該 Group。這意味著同一 Tenant 內的所有表自動享有 Co-Located JOIN 優勢。但要注意：跨 Schema 的 JOIN（即跨租戶查詢）**不會**受益於 Co-Location，且需要 Repartition Join（效能差）。強烈建議在應用層面徹底隔離租戶查詢，確保每次查詢 `search_path` 僅包含單一租戶 Schema。
-
----
-
-### IV. 分佈式查詢與 JOIN 策略
-
-Citus 的 Query Planner 根據涉及表的類型與分佈鍵，自動選擇三種 JOIN 策略：
-
-```mermaid
-flowchart TD
-    Q["分散式查詢<br/>包含 JOIN"]
-    Q --> Q1{"兩表是否<br/>Co-Located？"}
-    Q1 -->|"是"| J1["Co-Located Join<br/>每個 Worker 本地 JOIN<br/>零網路傳輸"]
-    Q1 -->|"否"| Q2{"其中一表是<br/>Reference Table？"}
-    Q2 -->|"是"| J2["Reference Table Join<br/>將 Distributed Table 側的<br/>查詢分發到各 Worker<br/>各 Worker 本地與 Ref Table JOIN"]
-    Q2 -->|"否"| J3["Repartition Join<br/>跨 Worker 重新分佈數據<br/>最昂貴的 JOIN 策略"]
-
-    style J1 fill:#5cb85c,color:white
-    style J2 fill:#4a90d9,color:white
-    style J3 fill:#d9534f,color:white
-```
-
-#### a. Co-Located Join（零網路傳輸）
-
-兩個使用相同分佈鍵的 Distributed Table 在同一 Worker 上進行本地 JOIN，完全無需網路傳輸。
-
-```sql
--- orders 和 order_items 都按 customer_id 分佈
-EXPLAIN (VERBOSE, COSTS OFF)
-SELECT o.order_id, oi.product_id, oi.quantity
-FROM orders o
-JOIN order_items oi ON o.order_id = oi.order_id AND o.customer_id = oi.customer_id;
-```
-
-預期 EXPLAIN 輸出：
-```
-Custom Scan (Citus Adaptive)
-  Task Count: 32
-  Tasks Shown: One of 32 tasks
-  ->  Task
-        Node: host=192.168.1.11 port=5432 dbname=postgres
-        ->  Hash Join  (actual rows=... loops=1)
-              Hash Cond: (o.order_id = oi.order_id)
-              ->  Seq Scan on orders_102001 o  (...)
-              ->  Hash  (...)
-                    ->  Seq Scan on order_items_202001 oi  (...)
-```
-
-> **初學者導讀**
-> 當你看到 EXPLAIN 中同時出現 `orders` 和 `order_items` 的 Shard 在同一 Task 內執行時，代表這是 Co-Located Join——兩個表的數據在同一 Worker 上，JOIN 就像單機 PostgreSQL 一樣高效。
-
-#### b. Reference Table Join（Broadcast + Local JOIN）
-
-當 Distributed Table 與 Reference Table JOIN 時，Citus 將 Distributed Table 側的查詢分發到各 Worker，各 Worker 在本地與完整的 Reference Table 副本進行 JOIN。
-
-```sql
--- events 是 Distributed Table（按 user_id），categories 是 Reference Table
-SELECT e.event_type, c.category_name
-FROM events e
-JOIN categories c ON e.category_id = c.category_id
-WHERE e.user_id = 42;
-```
-
-Citus 執行流程：
-1. Coordinator 收到查詢
-2. Planner 確定 `user_id = 42` 落在 Shard 102007（Worker 2）
-3. 將查詢（包含 `JOIN categories`）發送到 Worker 2
-4. Worker 2 本地執行 JOIN（`categories` 已有完整副本）
-5. 結果回傳 Coordinator
-
-#### c. Repartition Join（跨 Worker 重新分佈）
-
-當兩個 Distributed Table 使用**不同的分佈鍵**且都不是 Reference Table 時，Citus 必須將其中一側的數據在 Worker 之間重新分佈（Repartition），這是最昂貴的 JOIN 策略。
-
-```sql
--- users 按 user_id 分佈，orders 按 customer_id 分佈
--- 即使用戶和訂單邏輯相關，分佈鍵不一致導致 Repartition Join
-EXPLAIN (COSTS OFF)
-SELECT u.name, o.amount
-FROM users u
-JOIN orders o ON u.user_id = o.customer_id;
-```
-
-預期 EXPLAIN 輸出：
-```
-Custom Scan (Citus Adaptive)
-  Task Count: 32
-  ->  Task
-        ->  Hash Join
-              ->  Seq Scan on users_102001 u  (Worker 1)
-              ->  Hash
-                    ->  Custom Scan (Citus Adaptive)   <-- Repartition
-                          Task Count: 32
-                          ->  Task
-                                ->  Seq Scan on orders_202005 o (Worker 3)
-```
-
-> **補充（Senior Dev）**
-> Repartition Join 的嚴重性：假設 `users` 有 1M 行分佈在 32 個 Worker，`orders` 有 10M 行分佈在 32 個 Worker。Repartition Join 需要將兩側的數據都在 Worker 之間重新 Hash 分發——這意味著每個 Worker 可能需要接收來自其他 31 個 Worker 的數據。網路傳輸量接近 `SUM(shard_size) * (1 - 1/worker_count)`。這就是為什麼 Co-Location 設計在 Citus 中如此重要——一個好的分佈鍵選擇可以完全消除這種開銷。
-
----
-
-### V. EXPLAIN 解讀分佈式計畫
-
-Citus 的 `EXPLAIN` 輸出與單機 PG 有顯著不同：它顯示分佈式查詢計畫，包括 Task Count、Shard Count 以及每個 Task 發送到 Worker 的具體 SQL。
-
-#### a. 基本 EXPLAIN 解讀
-
-```sql
-EXPLAIN (VERBOSE, COSTS ON)
-SELECT customer_id, count(*), sum(amount)
-FROM orders
-WHERE created_at >= '2026-01-01'
-GROUP BY customer_id
-ORDER BY sum(amount) DESC
-LIMIT 10;
-```
-
-預期輸出（簡化）：
-```
-Custom Scan (Citus Adaptive)  (cost=0.00..0.00 rows=0 width=0)
-  Output: remote_scan.customer_id, remote_scan.count, remote_scan.sum
-  Task Count: 32
-  Tasks Shown: One of 32 tasks
-  ->  Task
-        Node: host=192.168.1.11 port=5432 dbname=postgres
-        ->  Limit  (cost=...)
-              ->  Sort  (cost=...)
-                    Sort Key: (sum(orders.amount)) DESC
-                    ->  HashAggregate
-                          Group Key: orders.customer_id
-                          ->  Seq Scan on orders_102001 orders
-                                Filter: (created_at >= '2026-01-01 00:00:00+00'::timestamp with time zone)
-```
-
-關鍵解讀指標：
-
-| 輸出欄位 | 含義 |
-|---------|------|
-| `Task Count: 32` | 該查詢總共產生 32 個 Task（對應 32 個 Shard） |
-| `Tasks Shown: One of 32 tasks` | EXPLAIN 僅顯示其中一個 Task 的執行計畫（其餘結構相同） |
-| `Node: host=...` | 該 Task 將在哪個 Worker 上執行 |
-| `Seq Scan on orders_102001` | Shard ID = 102001 的具體查詢計畫 |
-
-#### b. 複雜查詢的 EXPLAIN 解讀
-
-```sql
-EXPLAIN (VERBOSE, COSTS ON)
-SELECT c.category_name, sum(o.amount) AS total
-FROM orders o
-JOIN order_items oi ON o.order_id = oi.order_id AND o.customer_id = oi.customer_id
-JOIN categories c ON oi.category_id = c.category_id
-WHERE o.created_at >= '2026-01-01'
-GROUP BY c.category_name;
-```
-
-預期輸出（跨 Worker 聚合）：
-```
-Custom Scan (Citus Adaptive)
-  Output: intermediate_column_1, intermediate_column_2
-  Task Count: 32
-  ->  Task
-        Node: host=192.168.1.12 port=5432 dbname=postgres
-        ->  HashAggregate
-              Group Key: c.category_name
-              ->  Hash Join
-                    ->  Hash Join
-                          ->  Seq Scan on orders_102002 o
-                          ->  Hash
-                                ->  Seq Scan on order_items_202002 oi
-                    ->  Hash
-                          ->  Seq Scan on categories_99001 c  -- Reference Table 本地副本
-```
-
-觀察重點：
-1. `order_items_202002` 與 `orders_102002` 在同一 Task 內 → Co-Located JOIN（Shard ID 編號尾數匹配）
-2. `categories_99001` 出現在每個 Task → Reference Table 被廣播（每個 Worker 都有副本）
-3. 最上層的 `Custom Scan (Citus Adaptive)` 包含 Coordinator 側的合併邏輯（`HashAggregate` on Coordinator 合併各 Worker 的 Partial Aggregates）
-
-> **初學者導讀**
-> 閱讀 Citus EXPLAIN 的訣竅：「從外到內，從上到下」——最外層 `Custom Scan (Citus Adaptive)` 告訴你 Coordinator 如何合併結果；內層 `Task` 告訴你每個 Worker 做什麼；`Node` 告訴你 Task 在哪個 Worker 執行；`Seq Scan` 上的表名（如 `orders_102001`）告訴你具體掃描了哪個 Shard。
-
----
-
-### VI. Rebalancing（非阻塞 Shard 遷移）
-
-當集群擴容（新增 Worker）或縮容（移除 Worker）時，Citus 12 提供**非阻塞**的 Shard Rebalancing，允許在不停機的情況下重新分配 Shard。
-
-#### a. `citus_rebalance_start()` — 零停機擴容
-
-```sql
--- 情境：從 4 個 Worker 擴展到 8 個 Worker
--- Step 1：新增 Worker 節點
-SELECT citus_add_node('192.168.1.15', 5432);
-SELECT citus_add_node('192.168.1.16', 5432);
-SELECT citus_add_node('192.168.1.17', 5432);
-SELECT citus_add_node('192.168.1.18', 5432);
-
--- Step 2：啟動 Rebalancing（預設使用 Non-Blocking 策略）
-SELECT citus_rebalance_start();
-
--- Step 3（可選）：指定特定 Table 進行 Rebalancing
-SELECT citus_rebalance_start(table_name := 'orders'::regclass);
-```
-
-Rebalancing 內部機制：
-
-```mermaid
-sequenceDiagram
-    participant Coord as Coordinator
-    participant W1 as "Worker 1<br/>(來源)"
-    participant W5 as "Worker 5<br/>(目標，新節點)"
-
-    Coord->>Coord: 計算 Rebalancing Plan<br/>（決定哪些 Shard 需要移動）
-
-    Note over Coord: 開始移動 Shard 102005<br/>從 Worker 1 → Worker 5
-
-    Coord->>W1: 標記 Shard 102005 為 READ-ONLY
-    Coord->>W5: 建立空 Shard 102005
-
-    loop Logical Replication
-        W1->>W5: 同步現有數據<br/>（使用 COPY protocol）
-        W1->>W5: 持續同步增量 WAL
-    end
-
-    Coord->>W1: Flush 所有進行中事務
-    Coord->>W1: 切換 Shard 102005 為 INACTIVE
-    Coord->>W5: 啟動 Shard 102005 為 ACTIVE
-    Coord->>Coord: 更新 pg_dist_placement
-
-    Note over Coord: Shard 遷移完成<br/>寫入流量重新路由到 Worker 5
-```
-
-> **補充（Senior Dev）**
-> Citus 12 的 Non-Blocking Rebalancing 使用 PostgreSQL Logical Replication 協議進行數據同步：首先使用 `COPY` 做初始全量同步，然後透過 Logical Decoding 追蹤增量變更。整個過程中**來源 Shard 保持可讀可寫**，直到最後切換的瞬間（通常 < 100ms）才短暫暫停寫入。你可以使用 `citus.shard_replication_factor` 在遷移期間保留冗餘副本以進一步降低風險。
-
-#### b. `citus_rebalance_status()` — 監控進度
-
-```sql
--- 查看當前 Rebalancing 進度
-SELECT * FROM citus_rebalance_status();
-
--- 預期輸出：
---  shardid | source_node | target_node | status   | bytes_moved | bytes_total
--- ---------+-------------+-------------+----------+-------------+------------
---   102001 |           2 |           5 | running  |    52428800 |   104857600
---   102005 |           1 |           6 | pending  |           0 |    209715200
---   102009 |           3 |           7 | done     |    10485760 |    10485760
-```
-
-#### c. `citus_drain_node()` — 安全移除 Worker
-
-在移除 Worker 之前，需先將其上的所有 Shard 遷移到其他節點：
-
-```sql
--- 將 Worker 5 (192.168.1.15:5432) 上的所有 Shard 安全遷出
-SELECT citus_drain_node('192.168.1.15', 5432);
-
--- 遷出完成後，檢查是否還有 Shard 在該節點
-SELECT count(*) FROM pg_dist_placement
-WHERE groupid = (SELECT groupid FROM pg_dist_node WHERE nodename = '192.168.1.15');
-
--- 確認無 Shard 後，移除節點
-SELECT citus_remove_node('192.168.1.15', 5432);
-```
-
-> **初學者導讀**
-> `citus_drain_node()` 本質上是對該節點的所有 Shard 逐一呼叫 `citus_move_shard_placement()`。這是一個**安全**的操作——Citus 確保每個 Shard 在目標節點完全可用後，才從來源節點移除。但如果目標集群剩餘空間不足，操作會中止並報錯，絕不會遺失數據。
-
----
-
-### VII. 高可用配置
-
-Citus 集群的高可用策略分為兩個層級：Coordinator HA 和 Worker HA。
-
-#### a. Worker 層級 HA — Streaming Replication
-
-每個 Worker 節點配置一個（或多個）Streaming Replica：
-
-```ini
--- Worker Primary postgresql.conf
-wal_level = replica
-max_wal_senders = 10
-wal_keep_size = '4GB'
-
--- Worker Replica postgresql.conf
-hot_standby = on
-```
-
-```sql
--- 將 Replica 加入 Citus Metadata（作為 Secondary）
--- pg_dist_node 中 groupid 相同的節點被視為同一 Group
-SELECT citus_add_node('192.168.1.21', 5432, groupid := 1, noderole := 'secondary');
-SELECT citus_add_node('192.168.1.22', 5432, groupid := 2, noderole := 'secondary');
-```
-
-#### b. Coordinator HA
-
-Coordinator 本身也是 PG 16 節點，可配置 Streaming Replica。此外，從 Citus 11 開始，**任何節點都可以接受查詢**，這意味著：
-
-- 當 Coordinator 故障時，您可以將應用程式指向任何 Worker 進行讀取查詢
-- 寫入操作仍需 Coordinate（涉及 2PC），但可透過 **虛擬 IP 切換** 或 **Patroni/Stolon** 實現自動 Failover
-
-#### c. `citus.ha` 配置
-
-```ini
--- postgresql.conf
-## Citus 自動檢測 Worker Replica 並在 Primary 故障時切換
-citus.node_conninfo = 'sslmode=require'
-citus.use_secondary_nodes = 'always'    -- 'never' | 'always' | 'read-only'
-
-## 當 Primary 不可用時，多長時間後切換到 Secondary
-citus.remote_copy_flush_threshold = '1MB'
-```
-
-```sql
--- 查看集群中 Primary 和 Secondary 的狀態
-SELECT nodename, nodeport, groupid, noderole, isactive, shouldhaveshards
-FROM pg_dist_node
-ORDER BY groupid, noderole;
-```
-
-> **補充（Senior Dev）**
-> Citus 本身**不是**一個自動 Failover 工具——它依賴 PostgreSQL 原生 Streaming Replication 提供數據冗餘，但 Failover 決策需要外部工具（如 Patroni、Stolon、Pgpool-II）。在生產環境中的推薦組合是：
-> - **Worker HA**：Patroni（每 Worker 一組 etcd + Patroni + vip-manager）
-> - **Coordinator HA**：同上，加上 PgBouncer 作為連接入口
-> - **自動節點切換**：自訂腳本監聽 `pg_dist_node` 並在 Failover 後透過 `citus_update_node()` 更新 Metadata
-
----
-
-### VIII. App Dev 最佳實踐
-
-#### a. 分佈鍵策略 — 避免數據傾斜
-
-```sql
--- 驗證分佈鍵的均勻性
-SELECT width_bucket(customer_id, min_id, max_id, 32) AS bucket,
-       count(*) AS rows_per_bucket,
-       pg_size_pretty(sum(pg_total_relation_size('orders'::regclass)) / 32) AS est_size
-FROM orders,
-     (SELECT min(customer_id) AS min_id, max(customer_id) AS max_id FROM orders) AS bounds
-GROUP BY bucket
-ORDER BY bucket;
-
--- 檢查每個 Shard 的實際大小
-SELECT shardid, shard_size
-FROM citus_shard_sizes()
-WHERE table_name = 'orders'::regclass
-ORDER BY shard_size DESC;
-```
-
-**選擇分佈鍵的黃金法則：**
-
-1. **必須出現在所有 JOIN 的 ON 子句中**（實現 Co-Location）
-2. **必須出現在 `create_distributed_table` 的 PRIMARY KEY 中**
-3. **Cardinality 高於 Shard Count 的 100 倍以上**
-4. **在 WHERE 查詢中頻繁使用**
-
-#### b. INSERT..SELECT 效能考量
-
-當 `INSERT..SELECT` 的來源和目標表使用相同的分佈鍵時，Citus 可以在各 Worker 上本地執行，無需跨節點資料傳輸：
-
-```sql
--- 高效：兩個表按相同鍵分佈，資料在本地 Worker 間流動
-INSERT INTO order_archive
-SELECT * FROM orders WHERE created_at < '2025-01-01';
-
--- 低效：分佈鍵不同，觸發 Repartition
-INSERT INTO analytics_events (user_id, event_type)
-SELECT o.customer_id, 'PURCHASE'
-FROM orders o
-WHERE o.created_at >= '2026-01-01';
--- 若 orders 按 order_id 分佈，analytics_events 按 user_id 分佈，會觸發跨 Worker 資料搬移
-```
-
-> **初學者導讀**
-> 大規模 `INSERT..SELECT` 在 Citus 中可能非常慢，原因是每個 INSERT 行都進入一個分散式事務。優化策略： (1) 確保源表和目標表 Co-Located；(2) 使用 `citus.local_table_join_policy = 'prefer_local'` 強制本地執行；(3) 分批插入（每批 1000-5000 行）。
-
-#### c. 避免跨 Shard 事務（2PC 開銷）
-
-```sql
--- BAD：跨 Shard 事務
-BEGIN;
-INSERT INTO orders VALUES (1, 42, 99.99);          -- customer_id=42 → Shard A
-INSERT INTO orders VALUES (2, 9999, 199.99);       -- customer_id=9999 → Shard B
-COMMIT;  -- 觸發 2PC（Two-Phase Commit），效能大幅下降
-
--- GOOD：同 Shard 事務（或依賴應用層確保）
--- 方案 A：應用層按 customer_id 分組，同一批只處理同一 customer_id
--- 方案 B：使用 Schema-Based Sharding（Citus 12），同一 Tenant 內所有操作為本地事務
-BEGIN;
-INSERT INTO tenant_001.invoices VALUES (1, 500.00);
-INSERT INTO tenant_001.payments VALUES (1, 1, 500.00, now());
-COMMIT;  -- 本地事務，無 2PC 開銷
-```
-
-```mermaid
-flowchart TD
-    TX["應用層事務"]
-    TX --> Q{"是否跨 Shard？"}
-    Q -->|"是"| TPC["Two-Phase Commit<br/>◆ Coordinator 發送 PREPARE<br/>◆ 所有 Worker 回應 READY<br/>◆ Coordinator 發送 COMMIT<br/>◆ 2 次網路往返，效能代價高"]
-    Q -->|"否<br/>(同 Shard / 同 Tenant Schema)"| LOCAL["本地事務<br/>◆ 單次 COMMIT<br/>◆ 零額外網路開銷<br/>◆ 等同單機 PG 效能"]
-    style TPC fill:#d9534f,color:white
-    style LOCAL fill:#5cb85c,color:white
-```
-
-#### d. 連接管理 — PgBouncer 雙層架構
-
-```mermaid
-graph TB
-    subgraph "應用層"
-        A1["App Server 1"]
-        A2["App Server 2"]
-        A3["App Server N"]
-    end
-
-    subgraph "Layer 1: PgBouncer (Transaction Pooling)"
-        PB1["PgBouncer<br/>192.168.1.100:6432"]
-    end
-
-    subgraph "Layer 2: PgBouncer per Worker (Session Pooling)"
-        COORD_PB["PgBouncer<br/>Coordinator<br/>:6432"]
-        W1_PB["PgBouncer<br/>Worker 1<br/>:6432"]
-        W2_PB["PgBouncer<br/>Worker 2<br/>:6432"]
-        WN_PB["PgBouncer<br/>Worker N<br/>:6432"]
-    end
-
-    subgraph "PostgreSQL"
-        COORD_DB["Coordinator<br/>PG 16"]
-        W1_DB["Worker 1<br/>PG 16"]
-        W2_DB["Worker 2<br/>PG 16"]
-        WN_DB["Worker N<br/>PG 16"]
-    end
-
-    A1 --> PB1
-    A2 --> PB1
-    A3 --> PB1
-    PB1 --> COORD_PB
-    PB1 -.->|"必要時直連 Worker"| W1_PB
-    COORD_PB --> COORD_DB
-    W1_PB --> W1_DB
-    W2_PB --> W2_DB
-    WN_PB --> WN_DB
-```
-
-配置示例：
-
-```ini
-; Layer 1 PgBouncer（Transaction Pooling）
-[databases]
-citus_cluster = host=192.168.1.10 port=5432 dbname=postgres
-
-[pgbouncer]
-pool_mode = transaction
-max_client_conn = 5000
-default_pool_size = 50
-
-; Layer 2 PgBouncer per Worker（Session Pooling）
-[databases]
-* = host=/var/run/postgresql port=5432
-
-[pgbouncer]
-pool_mode = session        ; Citus 內部連接需要 Session 模式
-max_client_conn = 500
-default_pool_size = 100
-reserve_pool_size = 10
-```
-
-> **補充（Senior Dev）**
-> Citus 內部節點間使用持久化的 Session 連接——Coordinator 到每個 Worker 維護一個連接池（由 `citus.max_cached_conns_per_worker` 控制，預設 1）。因此 **Layer 2 PgBouncer 必須使用 Session Pooling**，否則 Citus 的內部連接可能會被 PgBouncer 意外中斷。Layer 1（面向應用層）則應使用 Transaction Pooling，因為應用層的連接通常是短暫的、無狀態的。
-
-#### e. 監控 — `citus_stat_statements`
-
-Citus 提供 `citus_stat_statements` 視圖，記錄每個分散式查詢在各 Worker 上的執行統計，比 `pg_stat_statements` 更適合分散式環境。
-
-```sql
--- 啟用 Citus 級別查詢統計
-SET citus.stat_statements_track = 'all';
--- 'all' 記錄所有查詢 | 'none' 關閉 | 預設為 'top'
-
--- 查看最耗時的分散式查詢
-SELECT queryid,
-       calls,
-       total_exec_time,
-       mean_exec_time,
-       rows,
-       query
-FROM citus_stat_statements
-ORDER BY total_exec_time DESC
-LIMIT 10;
-
--- 重置統計
-SELECT citus_stat_statements_reset();
-```
-
-日常健康檢查 SQL 集合：
-
-```sql
--- 1. 檢查集群節點健康狀態
-SELECT nodename, nodeport, groupid, noderole, isactive, shouldhaveshards
-FROM pg_dist_node
-ORDER BY groupid;
-
--- 2. 檢查 Shard 分佈（是否有不活躍的 Placement）
-SELECT shardid, shardstate, shardlength, nodename, nodeport
-FROM pg_dist_shard
-JOIN pg_dist_placement USING (shardid)
-JOIN pg_dist_node ON pg_dist_placement.groupid = pg_dist_node.groupid
-WHERE shardstate != 1;  -- 1 = ACTIVE
-
--- 3. 檢查各表 Shard 大小分佈
-SELECT logicalrelid::regclass AS table_name,
-       shard_count,
-       pg_size_pretty(total_size) AS total_size
-FROM citus_tables;
-
--- 4. 檢查 Reference Table 同步狀態
-SELECT logicalrelid::regclass,
-       count(DISTINCT groupid) AS replica_count
-FROM pg_dist_shard
-JOIN pg_dist_placement USING (shardid)
-JOIN pg_dist_partition USING (logicalrelid)
-WHERE partmethod = 'n'  -- 'n' = none (Reference Table)
-GROUP BY logicalrelid;
-```
-
-> **初學者導讀**
-> 分散式系統的日常監控重點：(1) `pg_dist_node.isactive = true` 確保所有節點在線；(2) `pg_dist_placement.shardstate = 1` 確保所有 Shard 為 ACTIVE 狀態；(3) `citus_shard_sizes()` 檢查各 Shard 大小是否均勻（差距 > 5x 代表有數據傾斜）；(4) Coordinator 的 `pg_stat_activity` 檢查是否有長時間執行的分散式查詢。
-## 4. PgBouncer — 連接池
+## 2. PgBouncer — 連接池
 
 ### I. PostgreSQL 連接模型的問題
 
@@ -3405,7 +1661,7 @@ stats_period = 60
 admin_users = pgbouncer_admin
 stats_users = pgbouncer_stats
 ```
-## 5. pg_repack — 在線表重組
+## 3. pg_repack — 在線表重組
 
 > **初學者導讀**  
 > `pg_repack` 是一個 PostgreSQL 第三方擴展（extension），能在**不阻塞讀寫**的前提下對表進行全面重組（reorganization），回收膨脹空間（bloat）、將空間歸還給作業系統，甚至可選地對資料進行實體排序（CLUSTER 效果）。與原生的 `VACUUM FULL` 不同——後者會用 `AccessExclusiveLock` 鎖住整張表，導致業務中斷——`pg_repack` 只在最後一步進行**毫秒級**的 filenode 交換，對線上業務幾乎無影響。
@@ -3955,7 +2211,7 @@ ORDER BY age(datfrozenxid) DESC;
 | 中斷處理 | 若 repack 中斷，pg_repack 會自動清理臨時表（leave_cleanup） |
 | 事件觸發器 | `DDL_command_end` 事件觸發器不會被 pg_repack 的內部操作觸發 |
 | 邏輯複製 | 目標表作為邏輯複製的發布端時，repack 期間增量變更仍正常解碼 |
-## 6. pg_cron — PG 內建排程作業
+## 4. pg_cron — PG 內建排程作業
 
 > **初學者導讀**
 > `pg_cron` 是一款 PostgreSQL extension，能讓你在資料庫**內部**執行定時任務（scheduled job）。不同於 Linux `crontab` 或 CI/CD pipeline 中的排程，pg_cron 的任務跑在 PostgreSQL 本身的 Background Worker 程序中，你和 DBA 可以用熟悉的 SQL 語法定義、管理、監控所有定期作業——從定時 VACUUM、分割區維護、Materialized View 刷新，到資料清理和 GDPR 合規任務，全部在一個地方搞定。
@@ -4928,7 +3184,7 @@ graph TD
 | `0 1 1 1 *` | 每年 1 月 1 日凌晨 1:00 | 年度任務 |
 | `0 9 * * 1-5` | 工作日（週一至五）早上 9:00 | 上班時間通知 |
 | `*/30 * * * * *` | 每 30 秒（6 段式） | 秒級監控 |
-## 7. pg_stat_kcache — 查詢 CPU 與實體 IO 統計
+## 5. pg_stat_kcache — 查詢 CPU 與實體 IO 統計
 
 ### I. 核心價值
 
@@ -5608,7 +3864,7 @@ graph LR
 | 不包含 Parallel Worker | Parallel query worker process 的 CPU/IO 不計入 leader | 自行查看 worker PID 的 /proc/[pid]/io |
 | 不計入 BgWriter/Checkpointer | 背景程序的寫入不計入 | 用 `pg_stat_bgwriter` 分開查看 |
 | `pg_stat_kcache_reset()` | 重置後全部歸零，無時間維度保留 | 自行建立快照機制（見 6.3） |
-## 8. hypopg — 假設性索引分析
+## 6. hypopg — 假設性索引分析
 
 > **初學者導讀**
 > 想像你是一位建築師，客戶問：「如果我們在 3 樓和 5 樓之間加裝一台電梯，每天能節省多少時間？」你不會真的立刻施工——你會先用建築模型模擬人流，估算改善效果。`hypopg` 做的事情就類似：它讓你「假裝」建立了一個索引，然後用 `EXPLAIN` 觀察 PostgreSQL 的查詢計劃器如何利用這個索引，估算能省多少 I/O 開銷。整個過程中，PostgreSQL 不會寫入任何磁碟、不會消耗任何儲存空間、不會影響任何正在執行的查詢。它是一個純記憶體中的「沙盒環境」，讓你在零成本的情況下驗證索引策略。
@@ -8109,6 +6365,19 @@ SELECT digest('hello world', 'sha256');
 
 > **補充（Senior Dev）**：`digest()` 的底層實作呼叫 OpenSSL 的 `EVP_Digest*` API。PG 16 使用 OpenSSL 3.x 後，`md5` 在 FIPS 模式下會被禁用（若系統啟用 FIPS 合規）。新專案一律使用 `sha256` 或 `sha512`。
 
+#### c. digest() text vs bytea 陷阱
+
+`digest()` 有兩個 overload：`digest(text, text)` 和 `digest(bytea, text)`。傳入 `'\xffffff'`（字串）和 `'\xffffff'::bytea`（二進位）會呼叫不同函數，產生完全不同的雜湊值：
+
+```sql
+SELECT digest('\xffffff'::bytea, 'md5');
+-- \x8597d4e7e65352a302b63e07bc01a7da
+SELECT digest('\xffffff', 'md5');
+-- \xd721f40e22920e0fd8ac7b13587aa92d   ← 不同結果！調用了 digest(text, text)
+```
+
+> **初學者導讀**：如果你的應用從十六進位字串（如 `'deadbeef'`）生成 digest，務必確認使用 `::bytea` 轉型，否則結果會完全不同。這在跨語言比對（如 C# 的 `SHA256.ComputeHash()` vs PG `digest()`）時尤其容易踩坑。
+
 **實戰範例 1：資料完整性校驗**
 
 ```sql
@@ -8432,6 +6701,25 @@ END $$;
 ```
 
 > **初學者導讀**：不必過度擔心 `crypt()` 很慢。對合法使用者來說，登入是低頻操作（每人每小時可能只登入 1-2 次），50ms 的延遲完全無感。但對攻擊者來說，每秒只能嘗試 ~20 個密碼，暴力破解 8 位數英數混合密碼需要數百年。
+
+#### d2. 各演算法破解速度對比基準
+
+以下資料顯示不同密碼 Hash 演算法在參考硬體上的破解速度（僅供相對比較，現代硬體破解速度約快 10-100 倍）：
+
+| Algorithm | Hashes/sec | 破解 8-char [a-z] | 破解 8-char [A-Za-z0-9] |
+|-----------|-----------|--------------------|-------------------------|
+| crypt-bf/8 (iter=256) | 28 | 246 年 | 251,322 年 |
+| crypt-bf/7 (iter=128) | 57 | 121 年 | 123,457 年 |
+| crypt-bf/6 (iter=64) | 112 | 62 年 | 62,831 年 |
+| crypt-bf/5 (iter=32) | 211 | 33 年 | 33,351 年 |
+| crypt-md5 | 2,681 | 2.6 年 | 2,625 年 |
+| crypt-des | 362,837 | 7 天 | 19 年 |
+| sha1 | 590,223 | 4 天 | 12 年 |
+| md5 | 2,345,086 | 1 天 | 3 年 |
+
+**關鍵結論**：bcrypt（bf）與普通 Hash（md5/sha1）的破解難度差距是 **4-6 個數量級**（28 vs 2,345,086 hashes/sec）。這也是為什麼密碼儲存必須使用 bcrypt 而非 sha256。
+
+> **補充（Senior Dev）**：iter_count 選擇原則：以當前 CPU 實測為準，讓 `crypt()` 執行時間在 **4-100 ms** 之間（每秒 10-250 次），平衡安全性與 user login latency。上表的絕對數字（Pentium 4 時代硬體）已不具參考意義，但**相對比例**仍準確反映各演算法的安全性差距。
 
 #### e. bcrypt 72 位元組限制警告
 
@@ -9666,6 +7954,183 @@ var results = await conn.QueryAsync<Doc>(
 - 使用 `conn.ProcessID`（Npgsql 6.0+）在 log 中記錄 `backend_pid`，方便對照 `pg_stat_activity` 和 `pg_stat_statements`
 - Connection Pool 配合 `idle_in_transaction_session_timeout`：trigram 查詢通常很快，但如果忘記 commit / rollback，會導致 connection 被掛住
 - 在 application startup 階段驗證索引存在（透過 `pg_indexes` 查詢），否則在高流量下觸發 Seq Scan 會直接打爆資料庫
+
+### IX. 千億級實戰基準：Regex + GIN 效能極限測試
+
+#### a. 測試規模
+
+這是一場極端的效能測試——在 **1,008 億行、4.1TB** 的資料上執行 regex 搜尋，驗證 pg_trgm + GIN 在千億級規模下是否仍能在秒級完成。
+
+| 項目 | 數值 |
+|------|------|
+| Cluster | 8 台實體主機（16 core / host），共 **240 個 data node** |
+| Total rows | **1,008 億** (100.8 billion) |
+| Table size | **4,158 GB** (~4.1 TB) |
+| Data characteristic | 12-char hex string（`md5(random()::text)` 前 48-bit），約 83.7% 唯一值 |
+| B-tree index (info) | **2,961 GB** |
+| B-tree index (reverse(info)) | **2,961 GB** |
+| GIN index (gin_trgm_ops) | **2,300 GB** |
+
+**為什麼索引比資料本身還大？** GIN 要把每個字串拆成多個 trigram，每個 trigram 都是一個索引 entry。加上 B-tree index 每個 entry 包含 key + TID 指針，三組索引合計 8,222 GB（約 table 的 2 倍）。
+
+#### b. 數據生成與索引策略
+
+```bash
+# 分批生成 1008 億行，每批 1 億行
+for ((i=1; i<=1008; i++)); do
+  psql -c "COPY (
+    SELECT substring(md5(random()::text), 1, 12)
+    FROM generate_series(1, 100000000)
+  ) TO stdout" \
+  | psql -c "COPY t_regexp_100billion FROM stdin"
+done
+
+# 創建三組索引（含 maintenance_work_mem = 4GB 加速建索引）
+CREATE INDEX idx_t_info ON t_regexp_100billion(info);
+CREATE INDEX idx_t_info_rev ON t_regexp_100billion(reverse(info));
+CREATE INDEX idx_t_info_gin ON t_regexp_100billion USING gin (info gin_trgm_ops);
+```
+
+**為什麼建 `reverse(info)` 索引？** 這是處理後綴查詢（suffix matching）的經典技巧。查詢 `WHERE info LIKE '%abc'` 時 B-tree 無法加速（B-tree 從左到右排序），但反轉字串後 `WHERE reverse(info) LIKE 'cba%'` 就變成前綴查詢，B-tree 完美加速。
+
+> **補充（Senior Dev）**：這是 PG 中處理 suffix matching 的經典技巧。不需 pg_trgm，只需一個 `reverse()` B-tree 表達式索引。PG 17 中 `reverse()` 被標記為 IMMUTABLE，expression index 直接可用。此技巧對任意長度的後綴都有效，不像 pg_trgm 受 trigram 最小長度限制。
+
+#### c. 四種查詢模式效能實測
+
+**模式 1：Prefix 匹配（`^`）— B-tree index range scan**
+
+```sql
+SELECT ctid, tableoid, info
+FROM t_regexp_100billion
+WHERE info ~ '^80ebcdd47';
+-- 返回 52 rows，3.1 秒
+```
+
+`~ '^...'` 被 optimizer 轉換為 B-tree range scan（`>= '80ebcdd47' AND < '80ebcdd48'`），240 個 node 並行執行，Planning time < 1ms。
+
+**模式 2：Suffix 匹配（`reverse()` 技巧）— B-tree index range scan**
+
+```sql
+SELECT ctid, tableoid, info
+FROM t_regexp_100billion
+WHERE reverse(info) ~ '^f42d12089b';
+-- 返回 46 rows，3.1 秒
+```
+
+**模式 3：中間包含匹配（任意位置 substring）— GIN + pg_trgm**
+
+無法用 B-tree prefix trick，必須依賴 GIN：
+
+```sql
+SELECT ctid, tableoid, info
+FROM t_regexp_100billion
+WHERE info ~ 'e7add04871';
+-- 返回 32 rows，4.9 秒（最慢）
+```
+
+4.9 秒中有相當一部分花在 Recheck 上。pattern 長度僅 10 字符（8 個 trigram），candidate set 較大。若 pattern 更長，trigram 越多，交集越精確，速度會更快。
+
+```text
+EXPLAIN 輸出摘要（240 個 node 並行）：
+  Planning time: 0.061 ms
+  Execution time: 4,898 ms
+  → Bitmap Index Scan → Bitmap Heap Scan → Recheck with regex
+```
+
+**模式 4：正則表達式匹配 — GIN + pg_trgm**
+
+```sql
+-- . 匹配任意字符
+SELECT ctid, tableoid, info
+FROM t_regexp_100billion
+WHERE info ~ '.3918.209f';
+-- 返回 38 rows，3.6 秒
+
+-- 複雜 regex：字符類 + 選擇
+SELECT ctid, tableoid, info
+FROM t_regexp_100billion
+WHERE info ~ 'ab2..d[1|f]3c8';
+-- 返回 95 rows，4.6 秒
+```
+
+regex 的速度取決於 pattern 中有多少「確定性字符」：`.` 匹配任意字符不貢獻 trigram，`[1|f]` 匹配 1 或 f，pg_trgm 從中提取確定性序列生成 trigram。pattern 越具體 → trigram 越多 → 候選集越小 → 越快。
+
+#### d. 效能總結
+
+| 查詢模式 | 索引類型 | 時間 | 千億中命中 |
+|----------|----------|------|-----------|
+| Prefix `^` | B-tree (info) | **3.1s** | 52 rows |
+| Suffix (reverse) | B-tree (reverse(info)) | **3.1s** | 46 rows |
+| 中間包含 | GIN (gin_trgm_ops) | **4.9s** | 32 rows |
+| 簡單 regex `.3918.209f` | GIN (gin_trgm_ops) | **3.6s** | 38 rows |
+| 複雜 regex `ab2..d[1|f]3c8` | GIN (gin_trgm_ops) | **4.6s** | 95 rows |
+
+```mermaid
+flowchart TD
+    subgraph "千億級索引選擇決策"
+        Q["你的查詢模式?"]
+        Q -->|"只要前綴"| B1["B-tree(info)"]
+        Q -->|"只要後綴"| B2["B-tree(reverse(info))"]
+        Q -->|"需要 regex / 模糊 / 任意位置"| G["GIN(info gin_trgm_ops)"]
+        Q -->|"全部都需要"| G2["只需 GIN 一個索引<br/>pg_trgm 自動涵蓋全部場景"]
+    end
+
+    subgraph "效能對比"
+        T1["Prefix: B-tree → 3.1s"]
+        T2["Suffix: reverse B-tree → 3.1s"]
+        T3["中間: GIN → 4.9s"]
+        T4["簡單 regex: GIN → 3.6s"]
+        T5["複雜 regex: GIN → 4.6s"]
+    end
+
+    B1 --> T1
+    B2 --> T2
+    G --> T3
+    G --> T4
+    G --> T5
+
+    style G2 fill:#5cb85c,color:white
+```
+
+三個核心洞察：
+
+1. **在正確的索引支援下，千億級資料也能在 3-5 秒內完成 regex 搜尋**——這不是魔法，這是索引的威力
+2. **B-tree 永遠比 GIN 快**：prefix/suffix 查詢 3.1s vs GIN regex 3.6-4.9s。如果可能，優先設計查詢模式讓它能用 B-tree
+3. **只需一個 GIN 索引就能涵蓋所有場景**：pg_trgm 的 GIN 自動支援 prefix、suffix、中間匹配和 regex
+
+### X. 大規模部署生產建議
+
+| 場景 | 推薦 | 原因 |
+|------|------|------|
+| 只需 prefix 查詢 | B-tree `(info text_pattern_ops)` | 最輕量，不需 pg_trgm |
+| 只需 suffix 查詢 | B-tree `(reverse(info))` | 比 GIN 小、更快（無 Recheck） |
+| Regex / 模糊 / 任意位置 | GIN `gin_trgm_ops` | 唯一的 regex 加速方案 |
+| 中日韓文本混合 regex | `pg_bigm`（2-gram） | 比 pg_trgm 更適合 CJK，不需辭典 |
+
+**Regex 查詢優化技巧**：
+
+```sql
+-- 壞寫法：LIKE '%abc%'（無法用 B-tree，退化成 Seq Scan）
+-- 好寫法：用 pg_trgm GIN index
+SELECT * FROM t WHERE info ~ 'abc';
+
+-- 壞寫法：regex 太短（< 3 字符），trigram 過濾無效，退化成 Seq Scan
+-- SELECT * FROM t WHERE info ~ 'a.';
+
+-- 好寫法：regex pattern 確保 ≥ 3 個確定性字符
+SELECT * FROM t WHERE info ~ 'abc.*xyz';
+```
+
+**分佈式查詢考量（Citus / Greenplum）**：
+- GIN index 在每個 shard 上獨立運作，查詢效能線性擴展
+- 瓶頸在「最慢的 shard」，而非總數據量
+- Recheck 是 shard-local 操作，不受跨節點 network 影響
+
+**Single-node PG 16 Parallel Query**：
+- 若數據量在 TB 級（非千億），single-node PG 16 的 parallel bitmap heap scan 可有效利用 multi-core
+- `max_parallel_workers_per_gather` 建議設為 CPU core 數的 50-75%
+
+> **補充（Senior Dev）**：三種索引總體積 = 2,961 + 2,961 + 2,300 = **8,222 GB**（約 table 的 2x）。若只需 regex / 模糊查詢，GIN 一個索引就涵蓋 prefix、suffix、中間匹配三種場景（pg_trgm 自動處理 prefix/suffix），不需額外 B-tree。原文建三個索引是為了對比測試。
 
 
 ## 5. pg_prewarm — 緩存預熱

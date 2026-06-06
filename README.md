@@ -19,9 +19,9 @@
 | **JSON/JSONB** | [`json/json.md`](json/json.md) | JSONB Value Types、Type I/O 機制、陣列提取與 GIN Index、JSONPath / SQL/JSON / json_table（PG 12→17） |
 | **全文檢索** | [`fulltext/fulltext.md`](fulltext/fulltext.md) | zhparser 中文分詞、Whole-Row FTS（Generated Column）、record_out + SCWS 逗號問題與解法 |
 | **系統底層** | [`system.md`](system.md) | Column Order 與 Byte Alignment 全鏈路效能、Bit 位運算標籤系統、Linux Page Fault 與 huge_pages / NUMA |
-| **擴充功能** | [`extensions/extensions.md`](extensions/extensions.md) | 兩大分類 15 個 Extension：Non-Contrib（FDW / pg_partman / Citus 12 / PgBouncer / pg_repack / pg_cron / pg_stat_kcache / hypopg）+ Contrib 內建（pg_stat_statements / auto_explain / pgcrypto / pg_trgm / pg_prewarm / pg_buffercache / btree_gin+btree_gist） |
+| **擴充功能** | [`extensions/extensions.md`](extensions/extensions.md) | 兩大分類 13 個 Extension：Non-Contrib（pg_partman / PgBouncer / pg_repack / pg_cron / pg_stat_kcache / hypopg）+ Contrib 內建（pg_stat_statements / auto_explain / pgcrypto / pg_trgm / pg_prewarm / pg_buffercache / btree_gin+btree_gist） |
 | **分頁查詢** | [`pagination.md`](pagination.md) | OFFSET 效能退化、CURSOR 方案、Keyset Pagination、分頁優化策略 |
-| **其他進階** | [`others/others.md`](others/others.md) | PG 17 開發規範、Trigger Audit（DML+DDL）、JOIN 冗餘 Early DISTINCT、pgcrypto 加密、千億級 pg_trgm Regex、12306 搶票架構設計 |
+| **其他進階** | [`others/others.md`](others/others.md) | PG 17 開發規範、Trigger Audit（DML+DDL）、JOIN 冗餘 Early DISTINCT、12306 搶票架構設計 |
 
 ---
 
@@ -42,9 +42,7 @@
 
 ### 擴充功能（extensions）
 - **# 一、Non-Contrib Extensions（需額外安裝）**
-  - **IMPORT FOREIGN SCHEMA**：`LIMIT TO` / `EXCEPT` 過濾、View/Materialized View 一併導入、PG 14-17 演進（postgres_fdw 2.0、async_append、MERGE pushdown、parallel_foreign_scan）
-  - **pg_partman**：PG 10-17 原生分區演進、自動分區創建/清理、Retention Policy、Background Worker 驅動 partition lifecycle
-  - **Citus 12**：分散式 SQL 引擎、Hash/Range Sharding、Co-Located Join、Schema-Based Sharding、非阻塞 Rebalancing
+  - **pg_partman**：原生分區自動化管理、自動分區創建/清理、Retention Policy、Background Worker 驅動 partition lifecycle
   - **PgBouncer**：Transaction vs Session vs Statement Pooling、生產級 HAProxy 拓撲
   - **pg_repack**：四階段在線重組原理、vs VACUUM FULL / pg_squeeze 對比、配合 pg_cron 定時執行
   - **pg_cron**：PG 內建排程、定時 VACUUM / 分區維護 / 物化視圖刷新
