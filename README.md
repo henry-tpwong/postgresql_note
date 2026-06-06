@@ -11,7 +11,7 @@
 |------|------|------|
 | **Transaction 隔離級別** | [`transaction/transaction.md`](transaction/transaction.md) | MVCC Snapshot 深度解析、Read Committed/Repeatable Read/Serializable 底層原理（SSI/SIREAD）、Write Skew 重現、VACUUM 影響、.NET Dapper/Polly Retry 實戰 |
 | **索引全解析** | [`index.md`](index.md) | 六種掃描類型全解析（Seq/Index/Bitmap/Parallel/Index-Only）、Bitmap Heap Scan 詳解、BRIN/Bloom/GIN/GiST/SP-GiST/RUM、Covering Index、索引失效 20 場景 |
-| **查詢深度解析** | [`query.md`](query.md) | 查詢生命週期、CBO 與 pg_hint_plan、GROUP BY 策略、IN/ANY/VALUES、分頁與計數、Recursive CTE 優化、死循環防禦 |
+| **查詢深度解析** | [`query.md`](query.md) | 查詢生命週期、CBO 與 pg_hint_plan、GROUP BY 策略、IN/ANY/VALUES、分頁與計數、Recursive CTE 優化、死循環防禦、JOIN 冗餘膨脹 Early DISTINCT |
 | **鎖（Lock）** | [`lock.md`](lock.md) | 隱式鎖、Lock Wait 追蹤、秒殺 Advisory Lock、高並發更新、Lock Flooding、max_locks_per_transaction、OLTP advisory lock、無間隙 ID 生成 |
 | **監控與追溯** | [`monitoring.md`](monitoring.md) | pg_stat_activity 生產實戰（5 場景 + 決策圖）、wait_event Top 10、auto_explain、pg_stat_io、track_commit_timestamp |
 | **Vacuum / Bloat** | [`vacuum/vacuum.md`](vacuum/vacuum.md) | MVCC 可見性判斷、Bloat 8 大成因與測試驗證、預防措施、VACUUM FULL vs pg_repack vs pg_squeeze 三方案對比 |
@@ -21,7 +21,7 @@
 | **系統底層** | [`system.md`](system.md) | Column Order 與 Byte Alignment 全鏈路效能、Bit 位運算標籤系統、Linux Page Fault 與 huge_pages / NUMA |
 | **擴充功能** | [`extensions/extensions.md`](extensions/extensions.md) | 兩大分類 13 個 Extension：Non-Contrib（pg_partman / PgBouncer / pg_repack / pg_cron / pg_stat_kcache / hypopg）+ Contrib 內建（pg_stat_statements / auto_explain / pgcrypto / pg_trgm / pg_prewarm / pg_buffercache / btree_gin+btree_gist） |
 | **分頁查詢** | [`pagination.md`](pagination.md) | OFFSET 效能退化、CURSOR 方案、Keyset Pagination、分頁優化策略 |
-| **其他進階** | [`others/others.md`](others/others.md) | PG 17 開發規範、Trigger Audit（DML+DDL）、JOIN 冗餘 Early DISTINCT、12306 搶票架構設計 |
+| **其他進階** | [`others/others.md`](others/others.md) | PG 17 開發規範、Trigger Audit（DML+DDL + 架構導航）、12306 搶票架構設計（varbit / SKIP LOCKED / hash 分流 / pgrouting） |
 
 ---
 
@@ -72,9 +72,8 @@
 
 ### 其他進階（others）
 - **一、PG 17 開發規範**：命名/設計/Query/管理/穩定性五大類 50+ 條規則，標記 4 條已過時規則
-- **二、Trigger Audit**：DML 審計（hstore + Row Trigger 記錄欄位級變更）+ DDL 審計（Event Trigger + hstore）
-- **三、JOIN 冗餘膨脹 Early DISTINCT**：笛卡爾乘積膨脹的根因、每層 JOIN 後立即去重的解法、重現實驗與 CTE 簡化寫法
-- **四、12306 搶票架構**：varbit 座位區段銷售狀態、Array+GIN 車次查詢、SKIP LOCKED 避免 Lock 衝突、pgrouting 路徑規劃、10 大法寶
+- **二、Trigger Audit**：DML 審計（hstore + Row Trigger 欄位級變更）+ DDL 審計（Event Trigger）+ 架構導航（DB Trigger vs C# Interceptor vs WAL）
+- **三、12306 搶票架構**：varbit 座位區段、SKIP LOCKED 搶票、hash 分流防熱點、Partition + BRIN 生產方案、pgrouting 路徑規劃
 
 ### 查詢深度解析（Query）
 - **一、查詢生命週期**：Client Request → Parser → Analyzer → Planner → Executor 六階段逐層拆解、Process-per-Connection 架構設計、三層 Tree 轉換（Parse/Plan/Executor）
@@ -84,6 +83,7 @@
 - **五、分頁與計數優化**：count(*) 替代策略、OFFSET 退化分析、Keyset 位點
 - **六、Recursive CTE 優化**：Index Skip Scan 模擬、Top-N Per Group（44x 加速）
 - **七、Recursive CTE 死循環防禦**：CYCLE 語法（PG 14+）、Production 防禦體系
+- **八、JOIN 冗餘膨脹 Early DISTINCT**：笛卡爾乘積膨脹的根因、每層 JOIN 後立即去重、重現實驗、CTE 簡化寫法（數十秒→數十毫秒）
 
 ### 監控與追溯（Monitoring）
 - **一、慢查詢追溯體系**：pg_stat_activity 生產實戰（5 場景 + 30 秒決策圖 + 鎖阻塞/Plan 不穩定/連線池滿/間歇性慢查詢）、wait_event Top 10、Snapshot vs Time-Series、應用層 backend_pid 記錄
