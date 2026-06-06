@@ -2,20 +2,30 @@
 
 > **閱讀順序：由淺入深，逐步構建 PostgreSQL 生產級技術棧**
 
-本書按 PostgreSQL Extension 的應用層次編排十大章節：
+本書按 PostgreSQL Extension 的安裝方式與應用層次編排兩大分類、共十五個 Extension：
 
-- **第一章（IMPORT FOREIGN SCHEMA）**：跨庫查詢基礎。從單一 remote server 的 foreign table 批量建立開始，掌握 FDW 架構、schema 導入、type mapping，以及 PG 14-17 的 parallel foreign scan / async append / MERGE pushdown 等演進。
-- **第二章（pg_partman）**：PG 10-17 原生宣告式分區的自動化管理。使用 pg_partman 實現自動分區創建、retention policy 定時清理、以及 Background Worker 驅動的 partition lifecycle。
-- **第三章（Citus 12）**：分散式 SQL 引擎。hash/range sharding、co-located join、schema-based sharding、非阻塞 rebalancing 等分散式數據庫核心主題。
-- **第四章（PgBouncer）**：連接池。Process-per-Connection 模型的瓶頸與 Transaction Pooling 的解決方案，含生產級 HAProxy + PgBouncer 拓撲。
-- **第五章（pg_stat_statements）**：查詢歸一化與聚合統計。Top-N 慢查詢、緩存命中率、WAL 產生量、JIT 開銷追蹤。
-- **第六章（auto_explain）**：自動記錄執行計劃。與 pg_stat_statements 互補——WHAT is slow vs WHY it's slow。
-- **第七章（pg_repack）**：在線表重組。不鎖表回收膨脹空間，與 VACUUM FULL / pg_squeeze 三方案對比。
-- **第八章（pg_cron）**：PG 內建排程作業。定時 VACUUM、分區維護、物化視圖刷新。
-- **第九章（pg_stat_kcache）**：查詢 CPU 與實體 IO 統計。getrusage() 獲取真實磁盤讀寫、fsync 次數、CPU 時間。
-- **第十章（hypopg）**：假設性索引分析。不實際建索引即可預覽 EXPLAIN 計劃，零成本試錯。
+**# 一、Non-Contrib Extensions（需額外安裝）** — 8 個，需透過 apt install、源碼編譯或第三方工具安裝：
 
-> 更新於 2026-05-30，全面升級至 PG 16+ 生態。所有範例使用 PG 16 語法與路徑。
+- **IMPORT FOREIGN SCHEMA / postgres_fdw**：跨庫查詢基礎，FDW 架構、schema 導入、parallel foreign scan / async append / MERGE pushdown（PG 14-17 演進）。
+- **pg_partman**：原生宣告式分區自動化管理，自動分區創建、retention policy 定時清理、Background Worker 驅動 partition lifecycle。
+- **Citus 12**：分散式 SQL 引擎，hash/range sharding、co-located join、schema-based sharding、非阻塞 rebalancing。
+- **PgBouncer**：連接池，Transaction/Session/Statement Pooling，生產級 HAProxy 拓撲。
+- **pg_repack**：四階段在線表重組，vs VACUUM FULL / pg_squeeze 三方案對比。
+- **pg_cron**：PG 內建排程作業，定時 VACUUM、分區維護、物化視圖刷新。
+- **pg_stat_kcache**：查詢 CPU 與實體 IO 統計，getrusage() 真實磁盤讀寫分析。
+- **hypopg**：假設性索引分析，零成本試錯 EXPLAIN 計劃。
+
+**# 二、Contrib Extensions（PG 內建，CREATE EXTENSION 即可）** — 7 個，無需額外下載：
+
+- **pg_stat_statements**：查詢歸一化與聚合統計，Top-N 慢查詢、緩存命中率、WAL/JIT 分析。
+- **auto_explain**：自動記錄執行計劃，log_triggers / log_nested_statements（PG 16）。
+- **pgcrypto**：加解密完整指南，digest/hmac 校驗、crypt+gen_salt(bf) 密碼儲存、PGP 對稱/公鑰加密。
+- **pg_trgm**：三元組模糊文本搜索，GIN/GiST 加速 LIKE、similarity() 相似度排序。
+- **pg_prewarm**：緩存預熱，autoprewarm BGW 自動恢復，重啟冷啟動優化。
+- **pg_buffercache**：緩存內容即時診斷，usagecount 時鐘演算法、pg_buffercache_summary()（PG 17）。
+- **btree_gin / btree_gist**：GIN 多欄位複合索引擴展、GiST EXCLUSION CONSTRAINT。
+
+> 更新於 2026-06-06，全面升級至 PG 16+ 生態，兩大分類共 15 個 Extension。所有範例使用 PG 16 語法與路徑。
 
 ---
 
