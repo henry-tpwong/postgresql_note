@@ -21,7 +21,7 @@
 | **系統底層** | [`system.md`](system.md) | Column Order 與 Byte Alignment 全鏈路效能、Bit 位運算標籤系統、Linux Page Fault 與 huge_pages / NUMA |
 | **擴充功能** | [`extensions/extensions.md`](extensions/extensions.md) | 兩大分類 13 個 Extension：Non-Contrib（pg_partman / PgBouncer / pg_repack / pg_cron / pg_stat_kcache / hypopg）+ Contrib 內建（pg_stat_statements / auto_explain / pgcrypto / pg_trgm / pg_prewarm / pg_buffercache / btree_gin+btree_gist） |
 | **分頁查詢** | [`pagination.md`](pagination.md) | OFFSET 效能退化、CURSOR 方案、Keyset Pagination、分頁優化策略 |
-| **其他進階** | [`others/others.md`](others/others.md) | PG 17 開發規範、Trigger Audit（DML+DDL + 架構導航）、pgcrypto 密碼儲存與 PGP 加密、千億級 pg_trgm Regex 模糊查詢、12306 搶票架構設計 |
+| **其他進階** | [`others/others.md`](others/others.md) | PG 17 開發規範（六大章節 + Npgsql 連線/交易/Retry/Prepared Statement/WAL 完整 C# 實戰）、Trigger Audit（DML hstore+JSONB/DDL Event Trigger + pgaudit 對比 + 架構決策速查）、12306 搶票系統全案設計（varbit/SKIP LOCKED/Array+GIN/CURSOR/pgrouting/Parallel Query/Sharding/Recursive CTE） |
 
 ---
 
@@ -71,11 +71,9 @@
 - **二、Advisory Lock 應用場景**：秒殺（231K TPS）、高並發全表更新（18x 加速）、OLTP 排隊控制、無間隙 ID 生成與 Lock Flooding 防禦、`max_locks_per_transaction` 配置
 
 ### 其他進階（others）
-- **一、PG 17 開發規範**：命名/設計/Query/管理/穩定性五大類 50+ 條規則，標記 4 條已過時規則
-- **二、Trigger Audit**：DML 審計（hstore + Row Trigger 欄位級變更）+ DDL 審計（Event Trigger）+ 架構導航（DB Trigger vs C# Interceptor vs WAL）
-- **三、pgcrypto 加密**：digest/hmac 數據校驗、crypt+gen_salt(bf) 密碼儲存、PGP 對稱/公鑰加密、C# Npgsql 實戰、三種方案選擇矩陣
-- **四、千億級 Regex 模糊查詢**：1,008 億行 pg_trgm + GIN 效能實測、Trigram 原理、四種查詢模式（Prefix/Suffix/中間/Regex）、pg_bigm 替代方案
-- **五、12306 搶票架構**：varbit 座位區段、SKIP LOCKED 搶票、hash 分流防熱點、Partition + BRIN 生產方案、pgrouting 路徑規劃
+- **一、PG 17 開發規範**：六大章節完整規範體系（命名/設計/Query/管理/穩定性與效能）+ Npgsql 連線字串完整參數表（14 項）+ FK Action 三選一/Partial Index/B-tree 2000 byte 限制/Stored Procedure 減少 Roundtrip 詳解 + WAL 生命週期與 App Dev 防禦 + ETL 大批量載入（COPY/Binary COPY/批次 INSERT）+ Connection Pool/Polly Retry/Advisory Lock 完整 C# 實作 + Prepared Statement 兩種 Protocol/Named Statement `_p1` 誕生全過程/custom→generic plan 切換機制 + 章末 Developer 落地檢查清單（12 項）
+- **二、Trigger Audit**：DML 審計（JSONB Row Trigger 欄位級 diff + key-level FULL OUTER JOIN 比對）+ DDL 審計（Event Trigger + pg_stat_activity context 快照）+ pgaudit C 層審計 vs plpgsql Trigger vs WAL Logical Decoding 三方案對比 + 架構決策速查表（5 場景）
+- **三、12306 搶票系統**：10 大法寶全景設計 — varbit 座位區段 + Array + GIN 查詢車次（generated column station_pos）+ SKIP LOCKED 防 Lock 衝突（hash 分流防熱點）+ CURSOR 分頁（SCROLL CURSOR 前後翻頁 + WITH HOLD）+ pgrouting 路徑規劃 + **Parallel Query** 多核加速餘票統計（觸發條件/EXPLAIN 對比/PG 9.6→17 演進/parallel_leader_participation）+ **Sharding** 三方案對比（Citus/FDW/Application-Level + Shard Key 選擇陷阱 + 冷熱分離三層策略）+ **Recursive CTE** 圖遍歷（BFS/DFS/環路檢測 PG 14+ CYCLE 子句/跨版本相容寫法）
 
 ### 查詢深度解析（Query）
 - **一、查詢生命週期**：Client Request → Parser → Analyzer → Planner → Executor 六階段逐層拆解、Process-per-Connection 架構設計、三層 Tree 轉換（Parse/Plan/Executor）
