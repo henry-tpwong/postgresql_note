@@ -3571,311 +3571,8 @@ WHERE backend_type = 'parallel worker';
 --              8 | 8            → Pool 滿了，下一個查詢會退化 Serial
 ```
 
-### VII. 法寶 7：Resource Isolation — 尖峰時刻資源優先級隔離
 
-#### a. 什麼是 Resource Isolation
-
-OS 層面的 cgroups v2（Control Groups v2）是 Linux kernel 的資源隔離機制，允許將 process 分組並對每個群組設定資源使用上限與權重。核心三個控制項：
-
-| 控制器 | 參數 | 白話解釋 |
-|--------|------|----------|
-| `cpu` | `cpu.weight` | CPU 時間的相對權重，值越大在競爭時分到越多 CPU。預設 100，範圍 1~10000 |
-| `memory` | `memory.max` | 該 cgroup 能使用的最大記憶體，超出會被 OOM kill |
-| `io` | `io.weight` | 磁碟 IO 的相對權重，與 cpu.weight 機制類似 |
-
-```mermaid
-flowchart TD
-    subgraph "Root Cgroup"
-        R["/sys/fs/cgroup/<br>系統總資源池"]
-    end
-
-    subgraph "Layer 1：業務優先級"
-        H["/high ⚡<br>cpu.weight=500<br>關鍵業務"]
-        M["/medium<br>cpu.weight=200<br>一般業務"]
-        L["/low<br>cpu.weight=50<br>報表/批次"]
-    end
-
-    subgraph "Layer 2：服務級別"
-        H_B["/high/ticket-buy<br>購票 Pool"]
-        H_Q["/high/ticket-query<br>購票查詢"]
-        M_R["/medium/report<br>報表查詢"]
-        L_B["/low/batch<br>批次作業"]
-    end
-
-    subgraph "Layer 3：PG Process"
-        H_B_P["PG Backend<br>Process 1..N"]
-        H_Q_P["PG Backend<br>Process 1..N"]
-        M_R_P["PG Backend<br>Process 1..N"]
-        L_B_P["PG Backend<br>Process 1..N"]
-    end
-
-    R --> H
-    R --> M
-    R --> L
-    H --> H_B
-    H --> H_Q
-    M --> M_R
-    L --> L_B
-    H_B --> H_B_P
-    H_Q --> H_Q_P
-    M_R --> M_R_P
-    L_B --> L_B_P
-
-    style H fill:#2ecc71,color:#fff
-    style M fill:#ffd43b
-    style L fill:#e74c3c,color:#fff
-```
-
-> 補充（Senior Dev）：cgroups v1 有多個獨立子系統（cpu、cpuset、memory、blkio 等），每個 subsystem 有各自獨立的 hierarchy，管理複雜。cgroups v2 將所有控制器統一在一個 hierarchy 下（unified hierarchy），一個 cgroup 可同時設定所有資源限制，大幅簡化管理。**PostgreSQL 的 `systemd` service 預設已支援 cgroups v2 的 CPUAccounting / MemoryAccounting**——PG 15+ 可以透過 `pg_ctl` 將整個 PG cluster 放入一個 cgroup。
-
-#### b. 為什麼 12306 需要
-
-12306 在春運購票尖峰時，場景典型存在兩種互相競爭的工作負載：
-
-1. **購票交易**（寫入、短交易、高優先級、需要低延遲）
-2. **查詢請求**（讀取、可能長查詢、量大但可容忍高延遲）
-
-當不安全隔離時會發生 **noisy neighbor 效應**：
-
-```mermaid
-flowchart TD
-    T0["🔴 春運尖峰<br>瞬間百萬 QPS"] --> T1["大量查詢請求<br>占用全部 CPU"]
-
-    T1 --> T2["購票交易<br>排不到 CPU 排程"]
-    T2 --> T3["每個購票交易<br>執行時間變長"]
-
-    T3 --> T4["🔒 Lock 持有時間變長<br>(FOR UPDATE 未釋放)"]
-    T4 --> T5["其他購票交易<br>因 Lock Wait 排隊"]
-    T5 --> T6["DB Connection Pool<br>逐漸耗盡"]
-
-    T6 --> T7["🚨 Snowball Effect<br>更大的鎖競爭 → 更慢的處理<br>→ 更多 connection → 系統崩潰"]
-
-    T1 --> T8["查詢本身也變慢<br>(CPU cache miss 暴增)"]
-    T8 --> T7
-
-    style T0 fill:#ffd43b
-    style T7 fill:#e74c3c,color:#fff
-```
-
-問題根因：OS scheduler 不區分購票 process 和查詢 process，大家都是平等的 schd_entity。當查詢量暴增，購票交易被排擠，形成連鎖反應。
-
-> 補充（Senior Dev）：這個「查詢拖垮寫入」在金融交易系統也是頭號殺手。實務上就算用了 read/write splitting（讀寫分離），除非徹底把主庫和備庫的 process 放進不同 cgroup，否則 OS 層的磁碟 IO 爭搶一樣會讓 WAL flush 變慢，拖累整個寫入集群。
-
-#### c. PG 層面資源隔離
-
-在沒有 OS cgroups 的情況下（例如雲端 RDS / 托管服務），PG 層面能做以下隔離：
-
-**GUC 參數超時保護**：
-
-| GUC 參數 | 預設值 | 建議值（購票 Pool） | 建議值（查詢 Pool） | 白話解釋 |
-|----------|--------|---------------------|---------------------|----------|
-| `statement_timeout` | 0 (無限制) | 3s | 15s | 單條 SQL 最大執行時間，超時自動 cancel |
-| `lock_timeout` | 0 (無限制) | 1s | 5s | 等待 Lock 的最大時間，超時放棄（不 abort 交易） |
-| `idle_in_transaction_session_timeout` | 0 (無限制) | 10s | 30s | Transaction 開啟但閒置的最大時間，超時斷連 |
-| `idle_session_timeout` | 0 (無限制) | 60s | 300s | 完全 idle 的 session 存活時間（PG 14+） |
-
-```sql
--- 為購票 Pool 的連線設定嚴格 timeout
-ALTER ROLE ticket_buy_user SET statement_timeout = '3s';
-ALTER ROLE ticket_buy_user SET lock_timeout = '1s';
-ALTER ROLE ticket_buy_user SET idle_in_transaction_session_timeout = '10s';
-
--- 為查詢 Pool 的連線設定寬鬆 timeout
-ALTER ROLE ticket_query_user SET statement_timeout = '15s';
-ALTER ROLE ticket_query_user SET lock_timeout = '5s';
-ALTER ROLE ticket_query_user SET idle_in_transaction_session_timeout = '30s';
-```
-
-**連線池分離架構**：
-
-```mermaid
-flowchart LR
-    subgraph "App Server"
-        BP["🔒 購票 Pool<br>MaxPoolSize=50<br>Role: ticket_buy_user"]
-        QP["🔍 查詢 Pool<br>MaxPoolSize=200<br>Role: ticket_query_user"]
-    end
-
-    subgraph "PostgreSQL"
-        PG_S[(PG Instance<br>max_connections=300)]
-        B_CONN["購票 Connection<br>RESERVED: 50 slots"]
-        Q_CONN["查詢 Connection<br>可用: 最多 250"]
-    end
-
-    BP --> B_CONN
-    QP --> Q_CONN
-    B_CONN --> PG_S
-    Q_CONN --> PG_S
-
-    style B_CONN fill:#2ecc71,color:#fff
-    style Q_CONN fill:#3498db,color:#fff
-```
-
-> 補充（Senior Dev）：即使兩個 Pool 共用同一個 PG instance，透過 `max_connections` 的硬上限 + 購票 Pool 保留 50 個 slot，查詢再怎麼爆炸也搶不走購票的最低連線。但 `statement_timeout` 只保護 PG 層的資源（CPU / lock / buffer），無法保護 OS 層的 IO 資源——那必須回到 cgroups。
-
-#### d. C# 開發者如何實踐
-
-兩個獨立的 `NpgsqlDataSource`，配合 DI 註冊與不同的 connection string：
-
-```csharp
-// ========================================
-// Program.cs — 註冊兩個 DataSource
-// ========================================
-var builder = WebApplication.CreateBuilder(args);
-
-// 購票 Pool：小而精，低 timeout
-builder.Services.AddSingleton(sp =>
-{
-    var dsBuilder = new NpgsqlDataSourceBuilder(
-        "Host=pg-master;Database=railway;Username=ticket_buy_user;Password=***;" +
-        "Application Name=ticket-buy;Maximum Pool Size=50;Timeout=3;");
-    return dsBuilder.Build();
-});
-
-// 查詢 Pool：大而寬，可容忍較長查詢
-builder.Services.AddKeyedSingleton("query", (sp, key) =>
-{
-    var dsBuilder = new NpgsqlDataSourceBuilder(
-        "Host=pg-replica;Database=railway;Username=ticket_query_user;Password=***;" +
-        "Application Name=ticket-query;Maximum Pool Size=200;Timeout=15;");
-    return dsBuilder.Build();
-});
-
-// ========================================
-// TicketService.cs — DI 注入，按場景選 DataSource
-// ========================================
-public class TicketService
-{
-    private readonly NpgsqlDataSource _buyDataSource;    // 購票專用
-    private readonly NpgsqlDataSource _queryDataSource;  // 查詢專用
-
-    public TicketService(
-        NpgsqlDataSource buyDataSource,        // 主 DataSource（購票）
-        [FromKeyedServices("query")] NpgsqlDataSource queryDataSource)
-    {
-        _buyDataSource = buyDataSource;
-        _queryDataSource = queryDataSource;
-    }
-
-    // 購票：用購票 Pool（低 latency、短 timeout）
-    public async Task<BookingResult> TryBook(BookingRequest req)
-    {
-        await using var conn = await _buyDataSource.OpenConnectionAsync();
-        await using var tx = await conn.BeginTransactionAsync();
-        try
-        {
-            var seat = await conn.QuerySingleOrDefaultAsync<Seat>(
-                @"SELECT id, bno, sit_no FROM train_sit
-                  WHERE tid = @Tid AND sit_level = @Level
-                    AND station_bit & @Mask = repeat('0', @N)::varbit
-                  ORDER BY station_bit DESC LIMIT 1
-                  FOR UPDATE SKIP LOCKED",
-                new { Tid = req.TrainId, Level = req.Level,
-                      Mask = BuildBitMask(req), N = req.StationCount - 1 }, tx);
-
-            if (seat == null) { await tx.RollbackAsync(); return BookingResult.Failed(); }
-
-            await conn.ExecuteAsync(
-                @"UPDATE train_sit SET station_bit = station_bit | @Mask WHERE id = @Id",
-                new { Mask = BuildBitMask(req), seat.Id }, tx);
-
-            await tx.CommitAsync();
-            return BookingResult.Success(seat);
-        }
-        catch (PostgresException ex) when (ex.SqlState == "55P03") // lock_not_available
-        {
-            await tx.RollbackAsync();
-            return BookingResult.Failed();
-        }
-        catch { await tx.RollbackAsync(); throw; }
-    }
-
-    // 查詢餘票：用查詢 Pool（可容忍較長查詢、走 replica）
-    public async Task<List<RemainingSeat>> QueryRemainingSeats(int trainId)
-    {
-        await using var conn = await _queryDataSource.OpenConnectionAsync();
-        return (await conn.QueryAsync<RemainingSeat>(
-            @"SELECT bno, sit_level, sit_no, station_bit
-              FROM train_sit
-              WHERE tid = @Tid
-                AND station_bit <> repeat('1', 13)::varbit",
-            new { Tid = trainId })).ToList();
-    }
-}
-```
-
-**Connection String 關鍵參數選擇**：
-
-| 參數 | 購票 Pool 值 | 查詢 Pool 值 | 理由 |
-|------|-------------|-------------|------|
-| `Maximum Pool Size` | 50 | 200 | 購票需要快速進出，Pool 太大浪費；查詢量大需大 Pool |
-| `Timeout` | 3s | 15s | 購票取不到連線應快速失敗（Semaphore 重試）；查詢可容忍排隊 |
-| `Connection Idle Lifetime` | 60s | 300s | 購票 Pool 快速回收避免 idle 佔位；查詢保留較久 |
-| `Application Name` | `ticket-buy` | `ticket-query` | 在 `pg_stat_activity.application_name` 區分流量來源 |
-| `Host` | PG Master | PG Replica | 購票寫入走 master；查詢讀取走 replica（讀寫分離） |
-
-> 補充（Senior Dev）：
->
-> **`Timeout` 參數的陷阱**：Npgsql `Timeout` 是等待從 Pool 取得 connection 的最大時間，不是 SQL 執行時間。SQL 執行時間要透過 PG 端的 `statement_timeout` 控制。兩者必須配對：`statement_timeout < Npgsql Timeout`，否則 client 端已 timeout 斷連但 PG 端還在跑 SQL，白白浪費資源。
->
-> **DI 註冊模式選擇**：`AddSingleton` 適合 NpgsqlDataSource（它本身就是 thread-safe 的），不要註冊成 Scoped 或 Transient——DataSource 內部管理 connection pool，多個 instance 會讓 pool 分裂失效。如果真的需要在同一個應用中同時連接多個 DB，用 keyed service 做區分（如上面的 `query` DataSource）。
-
-#### e. 四層防禦架構
-
-```mermaid
-flowchart TD
-    REQ["🚄 購票請求<br>(高優先級)"]
-
-    subgraph L1["Layer 1：OS cgroups"]
-        CG["cpu.weight=500<br>memory.max=8GB<br>io.weight=500"]
-    end
-
-    subgraph L2["Layer 2：PG GUC"]
-        ST["statement_timeout=3s<br>lock_timeout=1s<br>idle_in_transaction_session_timeout=10s"]
-    end
-
-    subgraph L3["Layer 3：Connection Pool"]
-        CP["購票 Pool<br>MaxPoolSize=50<br>Role: ticket_buy_user"]
-    end
-
-    subgraph L4["Layer 4：R/W Splitting"]
-        RW["寫入 → Master<br>讀取 → Replica"]
-    end
-
-    REQ --> CG
-    CG --> ST
-    ST --> CP
-    CP --> RW
-    RW --> DB["PostgreSQL"]
-
-    style CG fill:#2ecc71,color:#fff
-    style ST fill:#3498db,color:#fff
-    style CP fill:#9b59b6,color:#fff
-    style RW fill:#f39c12,color:#fff
-    style DB fill:#1abc9c,color:#fff
-```
-
-**分層對照表**：
-
-| 層級 | 機制 | 保護對象 | 可控性 | 適用場景 |
-|------|------|----------|--------|----------|
-| **L1 OS cgroups** | cpu.weight / memory.max / io.weight | OS 層 CPU、記憶體、磁碟 IO | DBA / SRE（需 OS 權限） | 自建機房、裸機 PG |
-| **L2 PG GUC** | statement_timeout / lock_timeout / idle timeout | PG process 執行時間、lock 等待 | DBA（ALTER ROLE / ALTER DATABASE） | 所有場景，包括 RDS |
-| **L3 Connection Pool** | MaxPoolSize / Role 隔離 | 連線槽位（避免 connection exhaustion） | App Dev（連線字串） | 所有場景，最小成本 |
-| **L4 R/W Splitting** | 讀寫分離 + replica 負載均衡 | Master CPU & IO（寫入流量不受讀取干擾） | App Dev + DBA（streaming replication） | 讀多寫少、有 replica 的場景 |
-
-> 補充（Senior Dev）：
->
-> **四層的優先導入順序**：
-> 1. 先做 **L3 Connection Pool 分離**（改 connection string 最快，10 分鐘搞定）
-> 2. 再加 **L2 PG GUC timeout**（ALTER ROLE，一行 SQL，立刻生效）
-> 3. 然後 **L4 R/W Splitting**（需要搭建 replica，做半天到一天）
-> 4. 最後 **L1 OS cgroups**（需要 OS 權限和重啟，只在自建機房可做）
->
-> **RDS/雲端 PG 的限制**：雲端 RDS 不開放 OS 層存取，只能用 L2~L4。但 AWS RDS 的 `db.r6g.xlarge` 等 instance 級別本身就有資源隔離；真正需要 OS cgroups 的是「多個 PG instance 跑在同一台機器」的場景（如自建 Docker PG cluster）。
-
----
-
-### VIII. 法寶 8：Sharding — 全國鐵路數據分庫儲存
+### VII. 法寶 7：Sharding
 
 #### a. 什麼是 Sharding
 
@@ -3914,7 +3611,72 @@ flowchart TD
 | 資料不重疊 | 一條車次的資料只存在一個 Shard 中（無跨 Shard 重複） |
 | 路由在應用層 | C# 端根據 Shard Key 決定連哪個 DB，PG 本身不感知 |
 
-> 補充（Senior Dev）：Sharding ≠ Partitioning。Partitioning 是**單一 PG 實例內部**的資料拆分（同一台機器、同一個 query planner），Sharding 是**跨多個獨立 PG 實例**的拆分（不同機器、各自 planner）。Partitioning 解決單表過大的查詢效能問題，Sharding 解決單實例的寫入吞吐上限問題。
+**Partitioning vs Sharding：一張表兩種拆法，但天花板不同**
+
+Partitioning 和 Sharding 都「把資料拆開」，但解決的問題層級完全不同：
+
+```mermaid
+flowchart LR
+    subgraph "Partitioning（同一間倉庫）"
+        direction TB
+        P_A["一張 orders 表 5 億行"]
+        P_A --> P_B["orders_2024 （1 億）"]
+        P_A --> P_C["orders_2025 （2 億）"]
+        P_A --> P_D["orders_2026 （2 億）"]
+    end
+
+    subgraph "Sharding（多間倉庫）"
+        direction TB
+        S_A["Shard 0: 北京局"]
+        S_B["Shard 1: 上海局"]
+        S_C["Shard 2: 廣州局"]
+    end
+
+    P_B -.-> WAL["共用同一個 WAL"]
+    P_C -.-> WAL
+    P_D -.-> WAL
+
+    S_A --> W0["獨立 WAL"]
+    S_B --> W1["獨立 WAL"]
+    S_C --> W2["獨立 WAL"]
+
+    style WAL fill:#e74c3c,color:#fff,stroke:#c0392b,stroke-width:3px
+    style W0 fill:#2ecc71,color:#fff
+    style W1 fill:#2ecc71,color:#fff
+    style W2 fill:#2ecc71,color:#fff
+```
+
+| 面向 | Partitioning（分區） | Sharding（分片） |
+|------|---------------------|------------------|
+| 資料位置 | 同一台 PG 實例內 | 多台獨立 PG 實例 / 不同機器 |
+| 主要解決 | 查詢效能、維護效率（pruning / DROP PARTITION） | 單機硬體資源上限（儲存 / 讀 / 寫） |
+| **WAL** | **共用同一個，仍是瓶頸** | **每台獨立，寫入線性擴展** |
+| 對寫入的幫助 | 間接（索引變小、VACUUM 更快）但動不了天花板 | 直接（分散 WAL + 多機並行寫入） |
+| 複雜度 | PG 原生支援（PG 10+），透明 | 需 Citus / FDW / 應用層路由 |
+
+Partitioning 對寫入有間接幫助（每個分區的 B-tree 更小更淺、VACUUM 粒度更細、鎖競爭降低），但所有分區仍然共用同一台機器的 CPU、記憶體、磁碟 IO、以及同一個 WAL 寫入序列。
+
+> **WAL 是整台機器唯一的序列寫入瓶頸——不管你有 10 個分區還是 100 個，寫入最終都經過同一條 WAL。當瓶頸是「整台機器吞吐到天花板了」，分區再多也沒用。**
+
+```mermaid
+flowchart TD
+    A["你的瓶頸是什麼?"] --> B["查詢太慢<br>（大表掃描、DELETE 老資料）"]
+    A --> C["寫入吞吐到天花板<br>（CPU 100%、磁碟 IO 滿）"]
+    A --> D["資料量 > 單機磁碟容量"]
+
+    B --> E["✅ Partitioning<br>（按時間/範圍分區）"]
+    C --> E2["✅ 先試 Connection Pool + 批量寫入<br>仍不夠 → Sharding"]
+    D --> F["✅ Sharding<br>（或 冷熱分離 + OSS）"]
+
+    E --> G["實務組合拳：<br>先 Sharding 到多台機器<br>每台內部再用 Partitioning"]
+    E2 --> G
+    F --> G
+
+    style E2 fill:#e74c3c,color:#fff
+    style F fill:#ffd43b,color:#000
+```
+
+核心原則：Partitioning 讓**讀取**更快（pruning 跳過不相關分區），Sharding 讓**寫入**能水平擴展（多台機器分攤 WAL + 吞吐）。兩者可以疊加——每個 Shard 內部再用 Partitioning，這是 12306 級別系統的標準組合。
 
 #### b. 為什麼 12306 需要
 
@@ -4312,21 +4074,108 @@ flowchart TD
 
 ---
 
-### IX. 法寶 9：Recursive CTE — 鐵路網圖遍歷與轉乘路徑查詢
+### VIII. 法寶 8：Recursive CTE — 一條 SQL 走完整張鐵路網
 
-PostgreSQL 的 Recursive CTE（遞迴公用表達式）可在一條 SQL 中完成圖遍歷。對於 12306 鐵路網場景，它的核心價值是：**給定一個出發站，找出經由火車路線可達的所有站點（可達性查詢），以及換乘次數最少的路徑（BFS 最短路徑）**。
+普通 SQL 只能「從已知資料查出已知資料」。Recursive CTE 讓 SQL 可以「從一個起點出發，沿著路線一層一層往外走，直到走不動為止」——這叫圖遍歷（Graph Traversal），是一般程式語言用 `while` / `for` 迴圈做的事。
 
-#### a. 什麼是 Recursive CTE
+#### a. 最簡單的例子：從 1 數到 10
 
-`WITH RECURSIVE` 的語法結構由三部分組成：
+```sql
+WITH RECURSIVE counter(n) AS (
+    SELECT 1                        -- ① 從 1 開始（只執行一次）
+    UNION ALL
+    SELECT n + 1 FROM counter       -- ② 每輪把上一輪的數字 +1
+    WHERE n < 10                    -- ③ 加到 10 就停
+)
+SELECT * FROM counter;
+-- 結果：1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+```
+
+把這條 SQL 當成「爬樓梯」：
+
+```
+第 0 輪（Anchor）：站在 1 樓                           → 結果 = {1}
+第 1 輪（Recursive）：看上一輪哪幾層，各往上爬 1 層      → 結果 = {1, 2}
+第 2 輪：{2} 往上爬 → 3                                → 結果 = {1, 2, 3}
+...
+第 9 輪：{9} 往上爬 → 10                               → 結果 = {1, 2, ..., 10}
+第 10 輪：n=10，WHERE n < 10 不通過 → 0 行 → 終止
+```
+
+這三塊就是所有 Recursive CTE 的共同結構：
 
 ```text
 WITH RECURSIVE cte_name AS (
-    <非遞迴部分>   -- Anchor Member：初始查詢，只執行一次
+    <起點查詢>       -- Anchor：第一輪的初始值，只跑一次
     UNION ALL
-    <遞迴部分>     -- Recursive Member：以 Work Table 為輸入，反覆執行
+    <遞迴查詢>       -- Recursive：用上一輪的結果當輸入，跑下一輪
+    WHERE <終止條件>  -- 什麼時候停（沒產出新行就自動停）
 )
 SELECT ... FROM cte_name;
+```
+
+**關鍵規則**：`UNION ALL` 的右半邊（遞迴查詢）必須引用 `cte_name` 自己——就像 `while(n < 10) { n = n + 1; }` 中的 `n = n + 1`，自己引用自己才能一圈一圈走下去。
+
+#### b. 換成鐵路網：從北京出發，能到哪些站？
+
+把 `n + 1` 換成 `JOIN railway_edges`，就從「數數字」變成「走鐵路網」：
+
+```sql
+-- 鐵路網：每條邊 (from → to)
+-- 北京→天津、北京→鄭州、鄭州→西安、西安→蘭州...
+
+WITH RECURSIVE reachable(depth, start_station, current_station, path) AS (
+    -- ① Anchor：從北京出發（depth = 1）
+    SELECT 1, '北京', '北京', ARRAY['北京']::TEXT[]
+
+    UNION ALL
+
+    -- ② Recursive：從上一輪到達的站點，沿鐵路網走向下一站
+    SELECT r.depth + 1, r.start_station, e.to_station,
+           r.path || e.to_station
+    FROM reachable r
+    JOIN railway_edges e ON e.from_station = r.current_station
+    WHERE r.depth < 5                      -- ③ 最多轉 4 次車（5 站）
+      AND NOT (e.to_station = ANY(r.path)) -- 防止走回頭路（A→B→A→B...）
+)
+SELECT DISTINCT current_station, depth
+FROM reachable
+ORDER BY depth, current_station;
+```
+
+逐輪走一遍看看發生了什麼：
+
+```
+第 0 輪（Anchor）：站在北京                               path = {北京}
+第 1 輪：北京→天津、北京→鄭州、北京→上海
+         新增 {天津, 鄭州, 上海}                           path = {北京,天津}、{北京,鄭州}...
+第 2 輪：天津→南京、鄭州→西安、鄭州→武漢
+         新增 {南京, 西安, 武漢}                           path = {北京,天津,南京}...
+第 3 輪：西安→蘭州、西安→成都、南京→武漢（但武漢已在 path 中）
+         新增 {蘭州, 成都}                                path = {北京,鄭州,西安,蘭州}...
+第 4 輪：蘭州→西寧、成都→昆明...
+         新增 {西寧, 昆明}                                path = {北京,鄭州,西安,蘭州,西寧}...
+
+最後查：DISTINCT current_station → 北京出發 4 次轉乘內可達的 15 個站點
+```
+
+這就是 BFS（廣度優先搜尋）——先用 SQL 的 Recursive CTE 取代程式語言的 while 迴圈，一條 SQL 走完整張圖：
+
+```mermaid
+flowchart LR
+    BJ["北京"] --> TJ["天津<br>depth=1"]
+    BJ --> ZZ["鄭州<br>depth=1"]
+    BJ --> SH["上海<br>depth=1"]
+
+    TJ --> NJ["南京<br>depth=2"]
+    ZZ --> XA["西安<br>depth=2"]
+    ZZ --> WH["武漢<br>depth=2"]
+
+    XA --> LZ["蘭州<br>depth=3"]
+    XA --> CD["成都<br>depth=3"]
+
+    LZ --> XN["西寧<br>depth=4"]
+    XN --> LS["拉薩<br>depth=5"]
 ```
 
 PostgreSQL 內部用 **Work Table + Intermediate Table** 模型執行遞迴 CTE：
@@ -4339,7 +4188,7 @@ sequenceDiagram
     participant Rec as Recursive Member<br>（遞迴查詢）
 
     Note over Anchor,IT: === 第 0 輪：初始化 ===
-    Anchor->>WT: SELECT ... WHERE from_station = '北京'<br>產生初始行集
+    Anchor->>WT: SELECT ... WHERE current = '北京'<br>產生初始行集
     WT->>IT: 將初始行寫入 Intermediate Table
     Note over IT: 北京→天津 (depth=1)<br>北京→鄭州 (depth=1)
 
@@ -4347,17 +4196,17 @@ sequenceDiagram
     IT->>WT: Intermediate Table <br>變成新的 Work Table
     WT->>Rec: 以 Work Table 為輸入<br>JOIN railway_edges 找下一站
     Rec->>IT: 新行 append 到 Intermediate Table
-    Note over IT: 新增：天津→濟南 (depth=2)<br>鄭州→西安 (depth=2)
+    Note over IT: 新增：天津→南京 (depth=2)<br>鄭州→西安 (depth=2)
 
     Note over Anchor,IT: === 第 2 輪 ===
     IT->>WT: 再次變為 Work Table
     WT->>Rec: 繼續 JOIN
     Rec->>IT: 新行 append
 
-    Note over Rec: 遞迴終止條件：<br>1. Recursive Member 返回 0 行<br>2. 手動 depth 限制達到<br>3. PG 14+ CYCLE 檢測到環路
+    Note over Rec: 遞迴終止條件：<br>1. Recursive Member 返回 0 行<br>2. WHERE depth < N 限制達到<br>3. PG 14+ CYCLE 檢測到環路
 ```
 
-核心機制：每一輪迭代中，**Work Table 只包含上一輪新產生的行**，而不是全部累積結果。這保證了每輪的 JOIN 範圍受控，不會因為 Intermediate Table 膨脹而逐輪變慢。
+核心機制：每一輪迭代中，**Work Table 只包含上一輪新產生的行**（不是全部累積結果）。這保證了每輪的 JOIN 範圍受控，不會因為 Intermediate Table 膨脹而逐輪變慢。
 
 > 補充（Senior Dev）：`UNION` 也可以用在 Recursive CTE（去重），但幾乎總是應該用 `UNION ALL`。`UNION` 會迫使 PG 在每輪迭代後對 Intermediate Table 做排序去重，對於百萬行級別的路網遍歷，這會讓效能崩潰。去重應在最終 `SELECT` 做，而非在遞迴內部。
 
@@ -4908,760 +4757,3 @@ public async Task<List<StationReach>> GetReachableCompatible(
 ```
 
 ---
-
-### X. 法寶 10：MPP 大規模分析 — 春節運力預測與 OLAP
-
-#### a. 什麼是 MPP
-
-MPP（Massively Parallel Processing）是一種 **Shared-Nothing** 分散式架構。集群由一個 **Coordinator（協調節點）** 和數十到數百個 **Segment（執行節點）** 組成：
-
-- **Coordinator**：接收客戶端連線，解析 SQL、產生分散式執行計劃（Distributed Plan），將子查詢派發到各 Segment，最後彙總（Gather）結果返回客戶端
-- **Segment**：各自維護獨立的 PG 實例（有自己的 WAL、Shared Buffer、資料目錄），只負責被分配到的資料分片上的計算
-- **資料分佈**：透過 `DISTRIBUTED BY (column)` 定義分片鍵，使用一致性雜湊（Hash）將每一行路由到特定 Segment
-
-```mermaid
-graph TB
-    Client["🖥️ 應用端<br/>BI / 報表查詢"] -->|"SQL Connection<br/>port 5432"| Coord["🧠 Coordinator<br/>解析 SQL → 產生分散計劃<br/>彙總結果 (Gather)"]
-
-    Coord -->|"Slice 1<br/>全表掃描"| Seg1["💾 Segment 1<br/>Shard 1 (車次 A-H)"]
-    Coord -->|"Slice 1<br/>全表掃描"| Seg2["💾 Segment 2<br/>Shard 2 (車次 I-P)"]
-    Coord -->|"Slice 1<br/>全表掃描"| Seg3["💾 Segment 3<br/>Shard 3 (車次 Q-Z)"]
-
-    Seg1 -->|"局部 COUNT/GROUP BY"| Motion["🔄 Motion (數據重分發)"]
-    Seg2 -->|"局部 COUNT/GROUP BY"| Motion
-    Seg3 -->|"局部 COUNT/GROUP BY"| Motion
-
-    Motion -->|"Slice 2<br/>最終聚合"| Coord
-
-    style Coord fill:#3498db,color:#fff
-    style Seg1 fill:#27ae60,color:#fff
-    style Seg2 fill:#27ae60,color:#fff
-    style Seg3 fill:#27ae60,color:#fff
-    style Motion fill:#e67e22,color:#fff
-```
-
-**MPP 與 Sharding 的核心差異**：
-
-| 維度 | MPP（OLAP） | Sharding（OLTP） |
-|------|------------|------------------|
-| **設計目標** | 吞吐量（Throughput），一條查詢動用所有節點 | 延遲（Latency），一條查詢只命中一個節點 |
-| **查詢模式** | 全表掃描、大範圍聚合、多表 JOIN | 點查（PK lookup）、小範圍範圍掃描 |
-| **資料分佈依據** | 按分片鍵雜湊，均勻打散到所有 Segment | 按業務鍵（如車次 ID），讓相關資料在一起 |
-| **跨節點操作** | Motion（廣播 / 重分發）是常態，查詢計劃中大量出現 | 盡量避免跨節點，依賴 `SKIP LOCKED` 在單節點內完成 |
-| **並行度** | Segment 數 × 每個 Segment 內的 `max_parallel_workers` | 由連接池和應用層控制，不在 DB 內並行 |
-| **典型引擎** | Greenplum, Citus Columnar, ClickHouse, DuckDB | Citus (Row-based), PG-XC, CockroachDB |
-| **12306 場景** | 「歷年春運每區段客流量 YoY 成長率」 | 「立刻鎖定 G101 次 1 車 01A 號座」 |
-
-> 補充（Senior Dev）：MPP 的「Shared-Nothing」與 PostgreSQL 原生 Parallel Query 的「Shared-Everything」有本質差異。原生 Parallel Query 中，多個 worker 在同一個 Shared Buffer 中掃描同一張表的不同 page；MPP 中每個 Segment 讀取的是自己磁碟上獨立的資料分片。因此 MPP 可以橫向擴展到數十個節點，而原生 Parallel Query 受限於單機 CPU 核心數。
-
-#### b. OLAP vs OLTP 分離 — 為什麼分析查詢會摧毀購票系統
-
-**原理**：PostgreSQL 的 Shared Buffer 是一塊有限的共享記憶體（通常設為 RAM 的 25%），所有連線共享。當 OLAP 查詢（全表掃描百億行）和 OLTP 查詢（PK 點查一行）共用同一個 Buffer Pool 時，分析查詢會把熱資料全部擠出 Buffer，導致購票點查全部變成磁碟 I/O——這就是 **Buffer 污染（Buffer Cache Pollution）**。
-
-```mermaid
-flowchart LR
-    subgraph BEFORE["✅ 分離前（OLTP 專用）"]
-        B1["Shared Buffer<br/>（熱資料：今日車次、熱門站點）"]
-        B2["購票點查<br/>全部命中 Buffer"]
-    end
-
-    subgraph AFTER["💀 OLAP 入侵後"]
-        A1["分析查詢：<br/>SELECT ... FROM history_10y<br/>掃描 100 億行"]
-        A1 -->|"順序掃描<br/>使用大量 Buffer"| A2["Shared Buffer<br/>被歷史冷資料佔滿"]
-        A2 -->|"熱資料被擠出"| A3["購票點查<br/>全部變成磁碟 I/O"]
-    end
-
-    B1 --> B2
-
-    style A3 fill:#e74c3c,color:#fff
-    style A2 fill:#e74c3c,color:#fff
-```
-
-**OLAP 查詢對 OLTP 系統的具體傷害鏈**：
-
-| 階段 | 現象 | 瓶頸 | 購票用戶體驗 |
-|------|------|------|------------|
-| ① OLAP 開始 | 順序掃描產生大量 page access | I/O 頻寬被佔用 | 尚無感覺 |
-| ② Buffer 置換 | 冷資料逐出熱資料，Buffer cache hit ratio 從 99% 跌到 60% | Shared Buffer 失效 | 點查開始變慢（10ms → 200ms） |
-| ③ WAL 競爭 | 如果 OLAP 是 `CREATE TABLE AS` 或 `INSERT INTO ... SELECT`，大量 WAL 寫入 | WALWriteLock 爭搶 | 購票交易 COMMIT 變慢 |
-| ④ 鎖競爭 | 分析查詢可能拿 `AccessShareLock` 長時間不釋放 | DDL（如 `ALTER TABLE`）被阻塞 | DBA 的維護作業卡住 |
-| ⑤ 連接耗盡 | OLAP 查詢佔用連線長時間不釋放 | 連接池枯竭 | 新用戶無法建立連線 |
-
-> 補充（Senior Dev）：PG 14+ 的 `buffer_usage_limit`（`-- BUFFER_USAGE_LIMIT`）可限制單條查詢的 Buffer 使用量，例如 `SET buffer_usage_limit = '256MB'`。這是低成本應急手段——讓 OLAP 查詢自己慢，但不拖垮 OLTP。但治本之道仍是**物理分離**（不同實例 / 不同集群）。
-
-#### c. 方案對比
-
-**四大技術方案橫向對比**：
-
-| 方案 | 定位 | 資料分佈 | 查詢最佳化 | PG 相容性 | 維運成本 | 12306 適合度 |
-|------|------|---------|-----------|----------|---------|-------------|
-| **Greenplum** | 獨立 MPP 數據倉庫 | Hash / Random 分佈 | GPORCA 最佳化器，Partition Pruning | PG 8.3 fork，SQL 相容但生態落後 | 高（獨立集群 + 專用管理工具） | ⭐⭐（過重，生態老化） |
-| **Citus Columnar** | PG Extension，行存 OLTP + 列存 OLAP 共存 | Hash 分片 + 列式儲存引擎 | PG 原生最佳化器 + 自訂 Scan Node | 100% PG 生態（Extension） | 中（同一個 PG 集群內擴展） | ⭐⭐⭐⭐⭐（成本最低） |
-| **PG Parallel Query** | 單機多核平行查詢 | Shared-Everything（單機） | Gather + Partial Aggregate | 原生（內建） | 低（只需設 `max_parallel_workers`） | ⭐⭐⭐（10TB 內數據適用） |
-| **DuckDB + duckdb_fdw** | 嵌入式 OLAP 引擎，透過 FDW 查詢 | 單機列存（無分散式） | 向量化執行引擎 | FDW 相容，SQL 方言略有差異 | 中（需維護獨立 DuckDB 檔案） | ⭐⭐⭐（適合定期卸載分析） |
-
-**選擇決策流程**：
-
-```mermaid
-flowchart TD
-    Q1["數據量多大？"] -->|"< 1TB"| Q2["查詢延遲要求？"]
-    Q1 -->|"1TB ~ 10TB"| Q3["能否接受分析專用實例？"]
-    Q1 -->|"> 10TB"| Q4["團隊有 MPP 維運經驗？"]
-
-    Q2 -->|"秒級可接受"| A1["✅ PG Parallel Query<br/>（設 max_parallel_workers = 4~8）"]
-    Q2 -->|"需分鐘級大報表"| A2["✅ DuckDB + duckdb_fdw<br/>（定期卸載到 DuckDB 分析）"]
-
-    Q3 -->|"可以，獨立 PG 實例"| A3["✅ Citus Columnar<br/>（獨立分析節點，列存壓縮比 5~10x）"]
-    Q3 -->|"不行，必須同一集群"| A4["⚠️ Citus Columnar<br/>（同一集群內，設 buffer_usage_limit 隔離）"]
-
-    Q4 -->|"有"| A5["✅ Greenplum<br/>（成熟方案，但注意生態停滯風險）"]
-    Q4 -->|"沒有"| A6["✅ Citus Columnar<br/>（PG 生態，學習成本極低）"]
-
-    style A1 fill:#2ecc71,color:#fff
-    style A2 fill:#2ecc71,color:#fff
-    style A3 fill:#2ecc71,color:#fff
-    style A4 fill:#ffd43b,color:#000
-    style A5 fill:#ffd43b,color:#000
-    style A6 fill:#2ecc71,color:#fff
-```
-
-> 補充（Senior Dev）：Citus Columnar 的核心優勢是 **同一套 PG SQL 同時服務 OLTP 和 OLAP**。Row-based 分散式表處理購票交易，Columnar 表（透過 `SELECT create_distributed_table('history', 'id', colocate_with => 'none');` 然後 `ALTER TABLE history SET ACCESS METHOD columnar;`）處理歷史分析。應用層完全不用改 SQL 語法。
-
-#### d. C# 整合 — 雙 DataSource 分流
-
-在 .NET 應用層，最務實的做法是註冊兩個 `DataSource`，依查詢類型路由到不同的資料庫連線：
-
-```csharp
-// Program.cs — 註冊雙 DataSource
-builder.Services.AddNpgsqlDataSource(
-    builder.Configuration.GetConnectionString("OLTP_PG"),
-    options => options.Name = "OLTP"  // pg_stat_activity 中可見的 application_name
-);
-
-builder.Services.AddNpgsqlDataSource(
-    builder.Configuration.GetConnectionString("OLAP_MPP"),
-    options => options.Name = "OLAP"
-);
-
-// 包裝成強型別介面，避免開發者用錯連線
-public interface ITicketDb
-{
-    NpgsqlDataSource Oltp { get; }   // 購票、鎖座位、退票
-    NpgsqlDataSource Olap { get; }   // 報表、數據挖掘、預測
-}
-
-public class TicketDb : ITicketDb
-{
-    // 建構式注入兩個 Named DataSource
-    public TicketDb(
-        [FromKeyedServices("OLTP")] NpgsqlDataSource oltp,
-        [FromKeyedServices("OLAP")] NpgsqlDataSource olap)
-    {
-        Oltp = oltp;
-        Olap = olap;
-    }
-
-    public NpgsqlDataSource Oltp { get; }
-    public NpgsqlDataSource Olap { get; }
-}
-
-// 使用範例：購票走 OLTP
-public async Task<BuyResult> BuyTicket(long trainId, string seatNo)
-{
-    await using var conn = await _db.Oltp.OpenConnectionAsync();
-    await using var tx = await conn.BeginTransactionAsync();
-
-    var locked = await conn.QuerySingleOrDefaultAsync<string>(
-        @"SELECT seat_no FROM train_sit
-          WHERE train_id = @trainId AND seat_no = @seatNo
-          FOR UPDATE SKIP LOCKED",
-        new { trainId, seatNo }, tx);
-
-    if (locked is null) return BuyResult.SoldOut;
-
-    await conn.ExecuteAsync(
-        @"UPDATE train_sit SET station_bit = station_bit | (@mask::varbit)
-          WHERE train_id = @trainId AND seat_no = @seatNo",
-        new { trainId, seatNo, mask }, tx);
-
-    await tx.CommitAsync();
-    return BuyResult.Success;
-}
-
-// 使用範例：春運預測走 OLAP
-public async Task<IEnumerable<GrowthReport>> GetYoYGrowth(int startYear, int endYear)
-{
-    await using var conn = await _db.Olap.OpenConnectionAsync();
-    // OLAP 查詢不需 transaction，可以容忍 dirty read（報表場景）
-    return await conn.QueryAsync<GrowthReport>(
-        @"SELECT from_station, to_station, year, total_passengers,
-                 total_passengers - LAG(total_passengers) OVER (
-                     PARTITION BY from_station, to_station ORDER BY year
-                 ) AS yoy_growth
-          FROM passenger_stats
-          WHERE year BETWEEN @startYear AND @endYear
-          ORDER BY yoy_growth DESC NULLS LAST",
-        new { startYear, endYear });
-}
-```
-
-```jsonc
-// appsettings.json — 連線字串範例
-{
-  "ConnectionStrings": {
-    "OLTP_PG": "Host=oltp-pg.internal;Port=5432;Database=tickets;Username=app;Application Name=ticket_app_oltp;Max Pool Size=200",
-    "OLAP_MPP": "Host=citus-coordinator.internal;Port=5432;Database=tickets_analytics;Username=app;Application Name=ticket_app_olap;Max Pool Size=10"
-  }
-}
-```
-
-> 補充（Senior Dev）：兩個 DataSource 的 `Max Pool Size` 要分開設定。OLTP 需要大量短連線處理購票峰值（200），OLAP 只需少量長連線跑報表（10）。如果共用一個 Pool Size，OLAP 的長查詢會耗盡連線池，導致 OLTP 無法建立新連線。另外 `Application Name` 務必設定不同值——出問題時 DBA 在 `pg_stat_activity` 一眼就能分辨是 OLTP 還是 OLAP 連線。
-
-#### e. 何時不需要 MPP
-
-不是所有分析場景都需要 MPP。在引入分散式架構的複雜度之前，先問三個問題：
-
-```mermaid
-flowchart TD
-    Start["需要做分析查詢"] --> Q1["數據量 < 1TB？"]
-    Q1 -->|"是"| Q2["查詢有明確的時間範圍過濾？"]
-    Q1 -->|"否"| Q3["已有 OLTP PG 可擴展？"]
-
-    Q2 -->|"是（如只查最近 3 個月）"| S1["✅ Partition Pruning<br/>（按月份 RANGE 分區 + 分析只掃描目標分區）"]
-    Q2 -->|"否（全表聚合）"| Q4["查詢主要依賴時間欄位過濾？"]
-
-    Q3 -->|"是"| S2["✅ Citus Columnar<br/>（擴展現有 PG 集群加 Columnar 表）"]
-    Q3 -->|"否"| S3["✅ MPP（Greenplum / 獨立 Citus 集群）"]
-
-    Q4 -->|"是"| S4["✅ BRIN Index<br/>（按日期欄位建 BRIN，壓縮比極高）"]
-    Q4 -->|"否（多維度隨機過濾）"| Q5["預算 / 人 力允許維護 MPP？"]
-
-    Q5 -->|"是"| S3
-    Q5 -->|"否"| S5["✅ PG Parallel Query + 夜間預聚合<br/>（定時作業把明細匯總到 summary 表）"]
-
-    style S1 fill:#2ecc71,color:#fff
-    style S2 fill:#2ecc71,color:#fff
-    style S4 fill:#2ecc71,color:#fff
-    style S5 fill:#ffd43b,color:#000
-    style S3 fill:#ffd43b,color:#000
-```
-
-**三種輕量替代方案的具體實踐**：
-
-**① Partition Pruning（分區裁剪）**：將大表按時間 RANGE 分區，查詢時只掃描相關分區。
-
-```sql
--- 建分區表（按月）
-CREATE TABLE passenger_stats (
-    id          BIGINT GENERATED ALWAYS AS IDENTITY,
-    from_station TEXT,
-    to_station   TEXT,
-    travel_date  DATE NOT NULL,
-    passengers   INT
-) PARTITION BY RANGE (travel_date);
-
--- 建立每月分區
-CREATE TABLE passenger_stats_2024_01
-    PARTITION OF passenger_stats
-    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
-
--- 分析查詢只掃 2024 Q1 的三個分區（其他分區被 Pruning 跳過）
-EXPLAIN SELECT from_station, to_station, SUM(passengers)
-FROM passenger_stats
-WHERE travel_date BETWEEN '2024-01-01' AND '2024-03-31'
-GROUP BY from_station, to_station;
--- 執行計劃中會看到 "Subplans Removed: 9"（12 個月中移除了 9 個）
-```
-
-**② BRIN Index（區塊範圍索引）**：對按時間順序寫入的資料，BRIN 是成本最低的索引。
-
-```sql
--- BRIN 索引只佔 B+Tree 的 1/1000 空間
-CREATE INDEX idx_ps_travel_date_brin
-    ON passenger_stats USING BRIN (travel_date)
-    WITH (pages_per_range = 32);
-
--- 對比 B+Tree 索引的大小
-SELECT relname, pg_size_pretty(pg_relation_size(oid)) AS index_size
-FROM pg_class
-WHERE relname LIKE '%passenger_stats%' AND relkind = 'i';
--- 結果範例：
--- idx_ps_travel_date_btree  | 2.3 GB
--- idx_ps_travel_date_brin   | 2.1 MB  ← 壓縮比 1000x
-```
-
-**③ 夜間預聚合（Materialized Summary）**：用 `pg_cron` 定時跑彙總，查詢時直接讀摘要表。
-
-```sql
--- 每日凌晨 3 點重建彙總表
-CREATE MATERIALIZED VIEW passenger_daily_summary AS
-SELECT travel_date, from_station, to_station,
-       SUM(passengers) AS total_passengers
-FROM passenger_stats
-GROUP BY travel_date, from_station, to_station;
-
--- pg_cron 排程（每天凌晨 3 點）
-SELECT cron.schedule(
-    'refresh-passenger-summary',
-    '0 3 * * *',
-    'REFRESH MATERIALIZED VIEW CONCURRENTLY passenger_daily_summary'
-);
-```
-
-> 補充（Senior Dev）：實務上最常見的組合是 **Partition（按月）+ BRIN Index（日期欄位）+ 夜間預聚合**，這個組合可以在 10TB 級數據上將分析查詢控制在秒級，且完全不需 MPP 的維運複雜度。MPP 真正的價值在於 **ad-hoc 多維度分析**——也就是業務方臨時丟來的、無法預先建 summary 的跨維度查詢（例如「過去 5 年、每年春運前 30 天、所有途經鄭州且終到廣州的車次中，二等座的上座率趨勢」）。
-
----
-
-## 3. 資料庫設計（偽代碼）
-
-
-核心設計只有兩張表，但設計極其精巧：
-
-**train 表（列車資訊）**：一張表一條車次。亮點在於 `station TEXT[]` 欄位——用陣列存途經站點（如 `{'北京','天津','徐州','南京','蘇州','上海'}`），配合 GIN 索引快速查詢哪些車次途經指定站點。
-
-**train_sit 表（座位資訊）**：一張表一個座位一行。這是整個系統的核心——`station_bit VARBIT` 欄位用位元串表示座位的銷售狀態。假設 14 個站點（13 個區段），`station_bit` 就是一個 13 位元的可變長度位元串。
-
-**Partial Index 的巧妙設計**：`WHERE station_bit <> repeat('1', 13)::varbit` 表示「只索引尚未完全售完的座位」。在已經全部售完的座位不再出現在索引中，查詢時自然跳過它們。
-
-```mermaid
-erDiagram
-    train {
-        int id PK "列車 ID"
-        date go_date "發車日期"
-        name train_num "車次編號"
-        array station "途經站點陣列"
-    }
-    
-    train_sit {
-        bigint id PK "座位記錄 ID"
-        int tid FK "對應 train.id"
-        int bno "車廂號"
-        text sit_level "席別 (一等座/二等座)"
-        int sit_no "座位號"
-        varbit station_bit "區段銷售狀態 (位元串)"
-    }
-    
-    train ||--o{ train_sit : "一輛車有多個座位"
-```
-
-```mermaid
-flowchart TD
-    subgraph "購票流程 (buy function)"
-        B1["1. 從 train 表查詢站點陣列 + 起終點位置"]
-        B1 --> B2["2. 用 array_pos 計算起始站在第幾個位置"]
-        B2 --> B3["3. 用 varbit bit operation 檢查指定區段是否為 0"]
-        B3 --> B4["4. FOR UPDATE SKIP LOCKED 鎖定座位"]
-        B4 --> B5["5. 用 set_bit 更新 station_bit, 標記已售"]
-        B5 --> B6["6. ORDER BY station_bit DESC 優先清掉已售座位"]
-    end
-```
-
-### I. 核心表結構
-
-```sql
--- 列車資訊
-CREATE TABLE train (
-  id INT PRIMARY KEY,
-  go_date DATE,
-  train_num NAME,
-  station TEXT[]     -- 途經站點陣列
-);
-
--- 座位資訊（每個座位一條 row）
-CREATE TABLE train_sit (
-  id SERIAL8 PRIMARY KEY,
-  tid INT REFERENCES train(id),
-  bno INT,                -- 車廂號
-  sit_level TEXT,         -- 席別
-  sit_no INT,             -- 座位號
-  station_bit VARBIT      -- 途經站點 BIT 位
-);
-```
-
-### II. 購票函數
-
-```sql
-CREATE OR REPLACE FUNCTION buy(
-  INOUT i_train_num NAME,
-  INOUT i_fstation TEXT,
-  INOUT i_tstation TEXT,
-  INOUT i_go_date DATE,
-  INOUT i_sits INT,          -- 購買張數
-  OUT o_slevel TEXT,
-  OUT o_bucket_no INT,
-  OUT o_sit_no INT,
-  OUT o_order_status BOOLEAN
-) ...
-```
-
-核心步驟：
-1. 從 `train` 表查詢站點陣列 + 起終點位置
-2. 用 `FOR UPDATE SKIP LOCKED` 選取符合條件的座位
-3. 用 `set_bit()` 更新 `station_bit`，標記已售站點範圍
-4. `ORDER BY station_bit DESC` 優先清掉已售中途票的座位
-
-### III. `array_pos()` 輔助函數
-
-```sql
-CREATE OR REPLACE FUNCTION array_pos(a ANYARRAY, b ANYELEMENT) RETURNS INT AS $$
-DECLARE
-  i INT;
-BEGIN
-  FOR i IN 1..array_length(a, 1) LOOP
-    IF b = a[i] THEN RETURN i; END IF;
-  END LOOP;
-  RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-```
-
-> 補充（Senior Dev）：生產中建議用 PG 內建的 `array_position()` 函數（O(1) vs plpgsql 的 O(n) loop）。
-
-### IV. Partial Index 設計
-
-```sql
--- 只索引還有空位（非全 1）的座位，減少掃描
-CREATE INDEX idx_train_sit_station_bit
-  ON train_sit (station_bit)
-  WHERE station_bit <> repeat('1', 14)::varbit;
-```
-
-> 補充（Senior Dev）：partial index 的關鍵：`WHERE station_bit <> repeat('1', 14)::varbit` 確保只有未售完的座位在 index 中。在 10M row 只賣出 10% 的場景，index 只掃 1M row 而非 10M。
-
----
-
-## 4. 效能基準（PL/pgSQL buy() 函數）
-
-
-效能測試在一個模擬環境中進行：1 趟列車、14 個站點、196M 個座位（200 萬車廂 × 98 座位）。結果非常直觀：
-
-| 模式 | TPS（每秒交易數） | Latency（延遲） |
-|------|-------------------|-----------------|
-| 不加 NOWAIT | 1,831 | 8.7 ms |
-| 加 NOWAIT (`FOR UPDATE NOWAIT`) | **7,818** | 2.0 ms |
-
-**為什麼 NOWAIT 讓效能提升了 4 倍多？** 原因在於鎖等待的行為差異：
-- 不加 NOWAIT：如果座位 A 被其他人鎖定，後續的購票請求會在資料庫內部排隊等待，直到鎖釋放。在高併發下，大量請求堆疊在等待佇列中。
-- 加 NOWAIT：如果座位 A 被鎖定，請求立即報錯返回——應用層捕獲錯誤後自動重試下一個座位。這樣資料庫內部不堆積等待，CPU 被有效率地用於實際處理。
-
-**NOWAIT vs SKIP LOCKED 的選擇**：NOWAIT 報錯後由應用層處理，SKIP LOCKED 則透明地跳過已鎖定行。購票場景 SKIP LOCKED 更合適，因為你不需要知道「哪個座位被鎖了」，只需要找到一個可用的座位。
-
-```mermaid
-flowchart LR
-    subgraph "不加 NOWAIT: 串列排隊"
-        W1["請求1 → 鎖定座位A"] --> W2["請求2 → 等待座位A釋放"]
-        W2 --> W3["...排隊中..."]
-        W3 --> W4["1,831 TPS, 延遲 8.7ms"]
-    end
-    
-    subgraph "加 NOWAIT: 並行處理"
-        N1["請求1 → 鎖定座位A"]
-        N2["請求2 → 座位A已鎖 → 立即失敗 → 重試"]
-        N2 --> N3["請求2重試 → 鎖定座位B ✅"]
-        N3 --> N4["7,818 TPS, 延遲 2.0ms"]
-    end
-    
-    style W4 fill:#ffcccc
-    style N4 fill:#ccffcc
-```
-
-測試環境：1 趟車、14 個站點、196M 座位（200 萬車廂 × 98 座位）。
-
-| 模式 | TPS | Latency |
-|------|-----|---------|
-| 不加 NOWAIT | 1,831 tps | 8.7 ms |
-| 加 NOWAIT (`FOR UPDATE NOWAIT`) | **7,818 tps** | 2.0 ms |
-
-NOWAIT 模式大幅降低鎖等待時間（失敗直接報錯 → application retry，而非在 DB 內排隊）。
-
-### I. 原始 PL/pgSQL buy() 函數（完整版）
-
-```sql
-CREATE OR REPLACE FUNCTION buy(
-  INOUT i_train_num NAME,
-  INOUT i_fstation TEXT,
-  INOUT i_tstation TEXT,
-  INOUT i_go_date DATE,
-  OUT o_slevel TEXT,
-  OUT o_bucket_no INT,
-  OUT o_sit_no INT,
-  OUT o_order_status BOOLEAN
-) RETURNS RECORD AS $$
-DECLARE
-  curs1 REFCURSOR;
-  curs2 REFCURSOR;
-  v_row INT;
-  v_station TEXT[];
-  v_train_id INT;
-  v_train_bucket_id INT;
-  v_train_sit_id INT;
-  v_from_station_idx INT;
-  v_to_station_idx INT;
-  v_station_len INT;
-BEGIN
-  SET enable_seqscan = off;
-  v_row := 0;
-  o_order_status := false;
-
-  -- 查詢列車資訊與站點位置
-  SELECT array_length(station,1), station, id,
-         array_pos(station, i_fstation),
-         array_pos(station, i_tstation)
-  INTO v_station_len, v_station, v_train_id,
-       v_from_station_idx, v_to_station_idx
-  FROM train
-  WHERE train_num = i_train_num AND go_date = i_go_date;
-
-  IF NOT found OR
-     v_from_station_idx IS NULL OR
-     v_to_station_idx IS NULL OR
-     v_from_station_idx >= v_to_station_idx THEN
-    RETURN;
-  END IF;
-
-  -- Cursor 1：優先找已有中途票的座位（station_bit 非全 0 也非全 1）
-  OPEN curs2 FOR
-    SELECT tid, tbid, sit_no FROM train_sit
-    WHERE (station_bit &
-           bitsetvarbit(repeat('0', v_station_len-1)::varbit,
-             v_from_station_idx-1,
-             v_to_station_idx - v_from_station_idx, 1))
-          = repeat('0', v_station_len-1)::varbit
-      AND station_bit <> repeat('1', v_station_len-1)::varbit
-    LIMIT 1
-    FOR UPDATE NOWAIT;
-
-  LOOP
-    FETCH curs2 INTO v_train_id, v_train_bucket_id, o_sit_no;
-    IF found THEN
-      UPDATE train_sit
-      SET station_bit = bitsetvarbit(station_bit,
-            v_from_station_idx-1,
-            v_to_station_idx - v_from_station_idx, 1)
-      WHERE CURRENT OF curs2;
-      GET DIAGNOSTICS v_row = ROW_COUNT;
-      IF v_row = 1 THEN
-        SELECT sit_level, bno INTO o_slevel, o_bucket_no
-        FROM train_bucket WHERE id = v_train_bucket_id;
-        CLOSE curs2;
-        o_order_status := true;
-        RETURN;
-      END IF;
-    ELSE
-      CLOSE curs2;
-      EXIT;
-    END IF;
-  END LOOP;
-
-  -- Cursor 2：找全新空座位
-  OPEN curs1 FOR
-    SELECT id, tid, strpos(sit_bit::text, '0'), sit_level, bno
-    FROM train_bucket
-    WHERE sit_remain > 0
-    LIMIT 1
-    FOR UPDATE NOWAIT;
-  ...
-END;
-$$ LANGUAGE plpgsql;
-```
-
-> `pgrowlocks()` 用於解決熱點鎖等待的嘗試被放棄：德哥原文標註改用 pgrowlocks 查詢已鎖定 row 的成本約 300ms，不如 NOWAIT + application retry 划算。
-
-> 補充（Senior Dev）：
->
-> **現代改進方向**：
-> 1. **Range Type + Exclusion Constraint**：替代 varbit，`int4range(from_pos, to_pos, '[)')` + `EXCLUDE USING GIST (train_id WITH =, seat_range WITH &&)`，讓 DB kernel 層面保證同一座位區段不重複售出
-> 2. **Advisory Lock per Seat**：對於極熱門車次的最後幾個座位，SKIP LOCKED 也無能為力（所有 connection 都 SKIP 同一批 row → 沒 row 可搶）。此時可用 `pg_try_advisory_xact_lock(seat_id)` 做 per-seat 排隊
-> 3. **Queue-based 購票**：由一個 producer 合併購票請求（`LISTEN/NOTIFY` + pg_background），將隨機競爭變成 FIFO 排隊（減少 DB lock contention）
-> 4. **真正的 12306 技術路線**：12306 最終採用的不是傳統 RDBMS 的 row lock 方案，而是**記憶體庫存計算** + **排隊系統**（使用 GemFire / 自研分散式記憶體網格），只在最後扣庫存時寫 DB。PG 的方案是 demo 層面的架構探討，不應直接用於億級 concurrent 的生產環境
-
----
-
-## 5. varbit 優先級策略：最大化利用率
-
-
-這是一個非常聰明的優化——不是隨便選一個空座位，而是選擇「最適合的座位」來最大化整個列車的利用率。
-
-**核心思想**：優先賣掉那些「已經有一部分被售出但仍有空位」的座位，而不是先賣全新的座位。這樣做的邏輯是：
-- 全新的座位（`00000`）有最大的彈性——可以賣給任何區段的請求
-- 已售部分的座位（如 `10100`）的可用區段更少——應該優先清掉它
-
-**ORDER BY station_bit DESC 的數學原理**：varbit 在排序時會當作二進位數值比較。`10100`（二進位）= 20，`01000`（二進位）= 8，`00000` = 0。所以 `ORDER BY station_bit DESC` 會優先選擇數字最大的（即已售 bit 最多的）座位。
-
-```mermaid
-flowchart TD
-    subgraph "三個座位狀態"
-        A["座位 A: 111000<br>(前3段已售)"]
-        B["座位 B: 110000<br>(前2段已售)"]
-        C["座位 C: 000000<br>(全新)"]
-    end
-    
-    subgraph "新請求: 買最後 2 段 (000011)"
-        REQ["需求: 段4-5"]
-    end
-    
-    A --> CHK_A["檢查 A: 111000 & 000011<br>= 111011<br>→ A 的段4-5可用 ✅"]
-    B --> CHK_B["檢查 B: 110000 & 000011<br>= 110011<br>→ B 的段4-5可用 ✅"]
-    C --> CHK_C["檢查 C: 000000 & 000011<br>= 000011<br>→ C 的段4-5可用 ✅"]
-    
-    CHK_A --> DEC["ORDER BY station_bit DESC<br>A(111000) > B(110000) > C(000000)"]
-    CHK_B --> DEC
-    CHK_C --> DEC
-    
-    DEC --> RESULT["選座位 A!<br>原因: A 剩餘區段最少(段4-5)<br>賣掉後段的選擇更少<br>優先清掉以最大化整體利用率"]
-```
-
-座位選擇時的優先級規則：已售中途票越多的座位 → 優先選。
-
-```
-座位 A: 111000 (前 3 站已售)
-座位 B: 110000 (前 2 站已售)
-查詢:   最後 2 站 (000011)
-
-座位 A: 111000 | 000011 = 111011 ← 選這個（剩前 4 站可賣）
-座位 B: 110000 | 000011 = 110011 ← 留著（更多彈性）
-
-ORDER BY station_bit DESC 實現此優先級
-```
-
----
-
-## 6. 阿里雲 RDS PG 客製化增強
-
-
-阿里雲 RDS for PostgreSQL 在中文化場景下提供了一些自訂函數來補充 PostgreSQL 原生功能的不足：
-
-- **bit_count_range_zero()**：PostgreSQL 原生沒有直接「統計 varbit 中指定範圍內有多少個 0」的函數。阿里雲的客製化函數讓餘票統計更高效——不需應用層手動計算。
-- **C 語言實作的 array_pos()**：plpgsql 版本的陣列索引查詢是 O(n) 的逐行迴圈，C 語言版本是 O(1) 的指標運算，在大量調用時效能差異顯著。
-- **varbit 批量操作優化**：購票時可能需要一次更新多個位元（如訂多張票），批量操作比逐行單獨更新效率高。
-
-**現代替代方案**：PG 內建 `array_position()` 函數（O(1) 效能），`get_bit()` / `set_bit()` 對 varbit 操作也已足夠高效。
-
-```mermaid
-flowchart LR
-    subgraph "阿里雲 RDS PG 客製化"
-        C1["bit_count_range_zero()"] --> U1["統計區段剩餘票數"]
-        C2["array_position() 內建"] --> U2["O(1) 站點位置查詢"]
-        C3["varbit 批量操作"] --> U3["一次更新多位元"]
-    end
-    
-    subgraph "PG 原生已支援"
-        N1["PG 14+: array_position()"]
-        N2["PG 14+: get_bit/set_bit"]
-        N3["PG 17: 更多 varbit 操作"]
-    end
-```
-
-| 功能 | 說明 |
-|------|------|
-| `bit_count_range_zero(varbit, start, end)` | 統計指定範圍內 bit=0 的數量（餘票統計） |
-| `array_pos()` C 版本 | O(1) 效能 |
-| `set_bit()` / `get_bit()` 的 varbit 批量操作 | 購票一次更新多位 |
-
----
-
-## 7. App Dev 實戰：購票系統 C# 三層架構
-
-```csharp
-// ========================================
-// Layer 1: Data Access — 核心 SQL：SKIP LOCKED
-// ========================================
-public async Task<SeatBooking?> TryBookSeat(BookingRequest req)
-{
-    await using var conn = await dataSource.OpenConnectionAsync();
-    using var tx = await conn.BeginTransactionAsync();
-    try
-    {
-        var seat = await conn.QuerySingleOrDefaultAsync<SeatBooking>(
-            @"SELECT id, tid, bno, sit_no, station_bit
-              FROM train_sit
-              WHERE tid = @TrainId AND sit_level = @Level
-                AND station_bit <> repeat('1', @N)::varbit
-                AND (station_bit & set_bit(set_bit(repeat('0',@N)::varbit, @F, 1), @T-1, 1))
-                    = repeat('0',@N)::varbit
-              ORDER BY station_bit DESC
-              LIMIT 1
-              FOR UPDATE SKIP LOCKED",  -- 跳過被其他交易鎖定的行
-            new { TrainId = req.TrainId, Level = req.SitLevel,
-                  N = stations.Length-1, F = fromIdx, T = toIdx }, tx);
-
-        if (seat == null) return null;
-
-        await conn.ExecuteAsync(
-            @"UPDATE train_sit SET station_bit = station_bit |
-              set_bit(set_bit(repeat('0',@N)::varbit, @F, 1), @T-1, 1)
-              WHERE id = @SeatId",
-            new { N = stations.Length-1, F = fromIdx, T = toIdx, seat.Id }, tx);
-
-        await tx.CommitAsync();
-        return seat;
-    }
-    catch { await tx.RollbackAsync(); throw; }
-}
-
-// ========================================
-// Layer 2: Business — Retry + Exponential Backoff
-// ========================================
-public async Task<BookingResult> PurchaseTicket(BookingRequest req)
-{
-    for (int retry = 0; retry < 5; retry++)
-    {
-        var seat = await TryBookSeat(req);
-        if (seat != null) return BookingResult.Success(seat);
-        if (retry < 4)
-            await Task.Delay(TimeSpan.FromMilliseconds(50 * Math.Pow(2, retry)));
-    }
-    return BookingResult.Failed("暫無可用座位");
-}
-
-// ========================================
-// Layer 3: API — SemaphoreSlim 限流 + Channel Queue
-// ========================================
-// 方案 A：SemaphoreSlim（適合 < 10,000 TPS）
-private static readonly SemaphoreSlim _throttle = new(200);
-public async Task<IActionResult> Buy(BookingRequest req)
-{
-    if (!await _throttle.WaitAsync(3000))
-        return BadRequest("系統繁忙");
-    try { return Ok(await PurchaseTicket(req)); }
-    finally { _throttle.Release(); }
-}
-
-// 方案 B：Channel Queue（適合 > 10,000 TPS，非同步處理）
-private readonly Channel<BookingRequest> _channel =
-    Channel.CreateBounded<BookingRequest>(10000);
-public ValueTask<bool> Enqueue(BookingRequest req) => _channel.Writer.TryWrite(req);
-```
-
-### I. 架構對比
-
-```mermaid
-flowchart TD
-    A["購票請求"] --> B["TPS?"]
-    B -->|"< 1K"| C["直接 DB: FOR UPDATE SKIP LOCKED"]
-    B -->|"1K-10K"| D["Semaphore + DB"]
-    B -->|"> 10K"| E["Channel Queue + DB"]
-    B -->|"億級春運"| F["Redis 庫存 + DB 最終扣款<br>(非 PG 的責任)"]
-```
-
-> 終極教訓：PostgreSQL 的 SKIP LOCKED 方案在 10,000 TPS 以下完全可行（NOWAIT 模式 7,818 TPS）。但真正的 12306 選的是記憶體網格（GemFire）+ 排隊系統。PG 適合 99% 場景，剩下 1% 需要分散式架構。
-
----
-
-## 整本筆記總回顧
-
-| 章節 | Developer 核心收穫 |
-|------|-------------------|
-| 一、開發規範 | Npgsql 連線字串、Transaction using、Pool、Retry、Advisory Lock |
-| 二、Trigger Audit | DB 層 vs C# Interceptor 的審計決策 |
-| 三、JOIN 優化 | EXISTS > JOIN + DISTINCT、QueryMultiple 拆分 |
-| 四、pgcrypto | Custom GUC 傳 Key、KMS 整合 |
-| 五、pg_trgm | Search API 防護（timeout + pattern 限制） |
-| 六、12306 | SKIP LOCKED + Retry + Semaphore 三層架構 |
-
-## 參考
-
-1. [setbitvarbit UDF](http://blog.163.com/digoal@126/blog/static/163877040201302192427651/)
-2. [阿里雲 RDS PG 用戶畫像推薦系統](https://github.com/digoal/blog/blob/master/201610/20161021_01.md)
-3. [pgrouting 動態路徑規劃](https://github.com/digoal/blog/blob/master/201607/20160710_01.md)
-4. [門禁廣告銷售系統與 PG](https://github.com/digoal/blog/blob/master/201611/20161124_01.md)
