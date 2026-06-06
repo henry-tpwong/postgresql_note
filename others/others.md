@@ -2811,7 +2811,39 @@ LIMIT 1;
 > - `SKIP LOCKED` 本質是 work queue pattern（跳過被其他 worker 正在處理的 item）
 > - `ORDER BY station_bit DESC` 的設計意圖：`111000` 的座位比 `110000` 更優先售出（已售區段越多 → 剩餘區段越少 → 先清掉減少空洞），符合鐵路最大化利用率的目標
 > - `NOWAIT` vs `SKIP LOCKED`：NOWAIT 遇到 locked row 直接報錯（需 application retry），SKIP LOCKED 透明跳過。購票場景 SKIP LOCKED 更合適
-> - **熱點問題**：即使有 SKIP LOCKED，如果同一車次只剩少數座位，大量 connection 仍會競爭同一批 row。德哥原方案中有 `mod(pg_backend_pid(), 100) = mod(pk, 100)` 的 hash 分流技巧（將不同 PID 分流到不同 row range），但有「部分 PID 賣完後找不到票」的風險
+> - **熱點問題**：即使有 SKIP LOCKED，如果同一車次只剩少數座位，大量 connection 仍會競爭同一批 row。所有 connection 的 SQL 完全一樣，全部擠在 `ORDER BY station_bit DESC` 的前幾名，SKIP LOCKED 跳過後又回到同一條 queue 的尾端——等於大家一起在排同一條隊伍。解法是用 hash 分流：**讓每個 connection 只掃描一部分 row**。
+>
+> ```sql
+> -- ✅ Hash 分流：每個 connection 只掃描屬於自己 bucket 的座位
+> SELECT * FROM train_sit
+> WHERE train_num = 'G1921'
+>   AND sit_level = '二等座'
+>   AND getbit(station_bit, from_pos, to_pos-1) = repeat('0', to_pos-from_pos)::varbit
+>   AND mod(id, 100) = mod(pg_backend_pid(), 100)  -- ← hash 分流
+> ORDER BY station_bit DESC
+> FOR UPDATE SKIP LOCKED
+> LIMIT 1;
+> ```
+>
+> 原理：100 個 connection 各自拿到一個 bucket 編號（0~99，由 `pg_backend_pid() % 100` 決定），座位表的 `id % 100` 把 1000 個座位均分成 100 組。每個 connection 只掃自己的那組（約 10 個座位），100 條隊伍各自獨立排隊，互不競爭。
+>
+> ```mermaid
+> flowchart TD
+>     C1["Connection PID=12345<br>bucket = 45"] --> S1["掃描 id % 100 = 45 的座位"]
+>     C2["Connection PID=12346<br>bucket = 46"] --> S2["掃描 id % 100 = 46 的座位"]
+>     C3["Connection PID=12347<br>bucket = 47"] --> S3["掃描 id % 100 = 47 的座位"]
+>     C100["... 100 條獨立隊伍 ..."]
+>
+>     S1 --> R1["找到可售票 → 購買 ✅"]
+>     S2 --> R2["找到可售票 → 購買 ✅"]
+>     S3 --> R3["找到可售票 → 購買 ✅"]
+>
+>     style R1 fill:#2ecc71,color:#fff
+>     style R2 fill:#2ecc71,color:#fff
+>     style R3 fill:#2ecc71,color:#fff
+> ```
+>
+> **Hash 分流的陷阱**：如果 bucket 45 的座位全賣光了，PID=12345 永遠掃不到票，而 bucket 46 可能還有——這叫「hash collision 飢餓」。解決方式：hash 失敗後 fallback 到 `mod(pg_backend_pid()+1, 100)` 嘗試下一個 bucket，或只在座位數 < 閾值時才啟用 hash 分流。
 
 ### IV. 法寶 4：CURSOR
 
