@@ -1,6 +1,6 @@
-# PostgreSQL Transaction 隔離級別 — 從 MVCC 到生產環境實戰
+# PostgreSQL Transaction 全攻略 — 從 MVCC 隔離級別到分佈式事務實戰
 
-> 本文系統性解析 PostgreSQL 四種 Transaction 隔離級別的底層實現、行為差異、生產環境陷阱，以及作為 .NET Application Developer 該如何正確選擇和使用。
+> 本文系統性解析 PostgreSQL Transaction 的兩大主題：單體事務的 MVCC 底層實現與四種隔離級別（一～二）、以及跨資料庫/微服務的分佈式事務方案（三），均以 .NET / Dapper / Npgsql 為應用層載體，提供生產環境排查即用 SQL 與完整 C# 範例。
 
 ---
 
@@ -1218,9 +1218,856 @@ LIMIT 20;
 
 > 補充（Senior Dev）：這 3 條 SQL 的設計原則是「30 秒內鎖定問題方向」，不是「30 秒內解決問題」。實際生產事故中，80% 的情況在這 3 條查詢就能找到根因（長事務、lock wait、或 VACUUM 阻塞）。剩下的 20% 才需要深入 `pg_stat_statements`、`EXPLAIN ANALYZE`、或 application log 交叉比對。
 
+# 三、分佈式事務實現方式
+
+## 1. 什麼是分佈式事務
+
+> 本章解釋分佈式事務的核心概念、為什麼它比單體事務困難，以及 CAP / BASE 理論如何影響方案選型。
+
+### 1. 單體事務 vs 分佈式事務
+
+#### I. 單體事務（你已經熟悉的）
+
+在單一 PostgreSQL 資料庫中，一個事務的操作範圍僅限於一個 DB instance：
+
+```text
+BEGIN;
+  UPDATE accounts SET balance = balance - 500 WHERE id = 1;
+  UPDATE accounts SET balance = balance + 500 WHERE id = 2;
+COMMIT;
+```
+
+PG 透過 WAL（Write-Ahead Log）保證：要嘛全部成功，要嘛全部回滾。這是 ACID 的基石。
+
+#### II. 分佈式事務（新的難題）
+
+當業務邏輯跨越多個資料庫、甚至多個微服務時：
+
+```text
+訂單系統（PostgreSQL DB-A）:  INSERT INTO orders ...
+庫存系統（PostgreSQL DB-B）:  UPDATE inventory SET stock = stock - 1 ...
+支付系統（第三方 API）:       POST /api/pay ...
+```
+
+你不能只靠一個 COMMIT 來保證三個系統同時成功或同時失敗——這就是分佈式事務的核心難題。
+
+```mermaid
+flowchart LR
+    subgraph 單體["單體事務"]
+        TX1["BEGIN"] --> OP1["扣帳戶 A"]
+        OP1 --> OP2["加帳戶 B"]
+        OP2 --> C1["COMMIT / ROLLBACK"]
+    end
+
+    subgraph 分佈式["分佈式事務"]
+        TX2["開始"] --> SVC1["服務 A：訂單 DB"]
+        TX2 --> SVC2["服務 B：庫存 DB"]
+        TX2 --> SVC3["服務 C：支付 API"]
+        SVC1 --> END2["全部成功？<br/>任一失敗則全部補償"]
+        SVC2 --> END2
+        SVC3 --> END2
+    end
+
+    style 單體 fill:#2ecc71,color:#fff
+    style 分佈式 fill:#ffd43b
+```
+
+### 2. CAP 定理
+
+#### I. 三個維度，只能選兩個
+
+| 維度 | 含義 | 白話 |
+|------|------|------|
+| Consistency（一致性） | 所有節點在同一時刻看到相同的資料 | 「查任何一個 DB，結果都一樣」 |
+| Availability（可用性） | 每個請求都能獲得回應 | 「服務永遠不掛，一定有回應」 |
+| Partition Tolerance（分區容錯） | 網路斷開時系統仍能運作 | 「DB-A 和 DB-B 之間網路斷了，系統不能癱瘓」 |
+
+```mermaid
+flowchart TD
+    CAP["CAP 定理：只能三選二"]
+    CAP --> CP["CP（一致 + 分區容錯）<br/>犧牲可用性"]
+    CAP --> AP["AP（可用 + 分區容錯）<br/>犧牲強一致性"]
+    CAP --> CA["CA（一致 + 可用）<br/>網路斷了就破功<br/>分佈式系統中不實際"]
+
+    CP --> CP_EX["例：2PC / XA<br/>協調者等不到回應→全部阻塞"]
+    AP --> AP_EX["例：Saga / 最終一致性<br/>允許短暫不一致，事後補償"]
+
+    style CP fill:#3498db,color:#fff
+    style AP fill:#2ecc71,color:#fff
+    style CA fill:#e74c3c,color:#fff
+```
+
+#### II. 分佈式事務的必然選擇
+
+在分佈式系統中，網路分區（P）不可避免。所以實際選擇是：
+- CP 方案（犧牲可用性）：2PC / XA — 寧可阻塞等待，也不允許不一致
+- AP 方案（犧牲強一致性）：Saga / Outbox — 允許短暫不一致，透過補償達到最終一致
+
+> 補充（Senior Dev）：不要被「三選二」誤導。CAP 定理說的是當分區發生時的取捨，不是平時的設計選擇。正常情況下你完全可以同時滿足 C 和 A。分佈式事務方案的選型，本質上是在決定「當網路出問題時，我寧可阻塞（CP）還是寧可暫時不一致（AP）」。
+
+### 3. BASE 理論
+
+#### I. 與 ACID 的對比
+
+| | ACID | BASE |
+|------|------|------|
+| 適用場景 | 單體資料庫 | 分佈式系統 |
+| 一致性 | 強一致性（寫完立刻一致） | 最終一致性（Eventually Consistent） |
+| 核心理念 | 寧可慢，不能錯 | 先給回應，事後修正 |
+| 實作 | WAL + Lock + MVCC | Saga + 補償 + 重試 |
+
+#### II. BASE 的三個字母
+
+| 字母 | 含義 | 白話 |
+|------|------|------|
+| Basically Available | 基本可用 | 系統可以暫時降級，但不完全掛掉 |
+| Soft State | 軟狀態 | 資料可以有一小段時間不一致 |
+| Eventually Consistent | 最終一致 | 只要不再有新的寫入，資料最終會一致 |
+
+#### III. BASE 的實務理解
+
+```text
+場景：你從 A 銀行轉帳 500 到 B 銀行：
+
+ACID 做法（2PC）：
+  A 銀行鎖住你的帳戶 → 扣款 → B 銀行鎖住收款帳戶 → 入帳 → 同時解鎖
+  中間任何一步失敗 → 全部回滾。查詢時永遠看到「已扣 + 已入」或「未扣 + 未入」
+
+BASE 做法（Saga）：
+  A 銀行扣款 500（立即生效）
+  非同步通知 B 銀行入帳 500（可能延遲幾秒）
+  如果 B 銀行入帳失敗 → 補償：A 銀行加回 500
+  查詢時可能短暫看到「已扣但未入」（軟狀態），最終會一致
+```
+
+```mermaid
+sequenceDiagram
+    participant User as 使用者
+    participant BankA as A 銀行
+    participant BankB as B 銀行
+
+    Note over User,BankB: BASE 最終一致性範例
+
+    User->>BankA: 轉帳 500 到 B 銀行
+    BankA->>BankA: 扣款 500（立即生效）
+    BankA-->>User: 轉帳申請已受理
+
+    Note over BankA,BankB: 此時查餘額可能看到 A 已扣、B 未入<br/>這是「軟狀態」，不是 bug
+
+    BankA->>BankB: 非同步通知入帳
+    BankB->>BankB: 入帳 500
+
+    Note over BankA,BankB: 最終一致
+```
+
+### 4. 分佈式事務的核心難題
+
+| 難題 | 說明 | 舉例 |
+|------|------|------|
+| 部分失敗 | A 成功、B 失敗，如何回滾 A？ | A 扣款成功，B 入帳失敗怎麼辦 |
+| 網路逾時 | A 請求 B 等了 5 秒沒回應——B 是成功還是失敗？ | 重試可能重複扣款，不重試可能沒扣到 |
+| 冪等性 | 同一操作執行多次，結果必須一樣 | 補償操作被重試不該重複退款 |
+| 孤兒事務 | 協調者掛了，參與者的事務卡住沒人管 | 2PC 中 Prepare 後協調者宕機 |
+| 時鐘不同步 | 兩個 DB 的 timestamp 不一致 | 判斷「誰先發生」變得不可靠 |
+
+> 補充（Senior Dev）：分佈式事務的難度本質上是網路的不確定性。單體事務中 COMMIT 是原子的（一個 system call），分佈式事務永遠不可能有真正的「原子 COMMIT」——因為網路上的節點總有可能在你發送 COMMIT 指令的前一刻斷線。所有方案都在用不同的代價來近似這個不可能達成的目標。
+
+
+## 2. 強一致性方案：2PC / 3PC / XA
+
+> 強一致性方案保證所有參與節點要嘛全部提交、要嘛全部回滾。代價是效能和可用性——當協調者或網路出問題時，系統可能長時間阻塞。
+
+### 1. 2PC（Two-Phase Commit，兩階段提交）
+
+#### I. 原理
+
+2PC 引入一個協調者（Coordinator），將提交分為兩個階段：
+
+```text
+Phase 1（Prepare / Voting）：協調者問所有參與者「你準備好提交了嗎？」
+  參與者執行操作但不提交，鎖住資源，回應 YES 或 NO
+
+Phase 2（Commit / Decision）：協調者根據投票結果做最終決定
+  全票 YES → 通知所有參與者 COMMIT
+  任一 NO 或逾時 → 通知所有參與者 ROLLBACK
+```
+
+```mermaid
+sequenceDiagram
+    participant C as 協調者（Coordinator）
+    participant P1 as 參與者 A
+    participant P2 as 參與者 B
+
+    Note over C,P2: Phase 1 — Prepare
+
+    C->>P1: PREPARE（你能提交嗎？）
+    P1->>P1: 執行操作，鎖住資源<br/>寫入 Undo/Redo Log
+    P1-->>C: YES（準備好了）
+
+    C->>P2: PREPARE
+    P2->>P2: 執行操作，鎖住資源
+    P2-->>C: YES
+
+    Note over C,P2: Phase 2 — Commit
+
+    C->>C: 全票 YES，決定 COMMIT
+    C->>P1: COMMIT
+    P1->>P1: 提交，釋放鎖
+    P1-->>C: ACK
+
+    C->>P2: COMMIT
+    P2->>P2: 提交，釋放鎖
+    P2-->>C: ACK
+
+    Note over C,P2: 完成
+```
+
+#### II. 2PC 的致命缺陷：阻塞問題
+
+如果在 Phase 1 之後、Phase 2 之前，協調者掛了，所有參與者卡在「Prepared」狀態——資源已鎖住，但不知道該 COMMIT 還是 ROLLBACK。這叫阻塞問題（Blocking Problem）。
+
+```mermaid
+sequenceDiagram
+    participant C as 協調者
+    participant P1 as 參與者 A
+    participant P2 as 參與者 B
+
+    C->>P1: PREPARE
+    P1-->>C: YES
+    C->>P2: PREPARE
+    P2-->>C: YES
+
+    Note over C: 協調者宕機！
+
+    Note over P1,P2: 資源被鎖住<br/>P1 和 P2 不知道該 COMMIT 還是 ROLLBACK<br/>只能傻等協調者恢復<br/>→ 這叫「阻塞問題」
+
+    Note over C: 幾小時後協調者重啟<br/>從 Log 恢復 → 決定 COMMIT
+    C->>P1: COMMIT
+    C->>P2: COMMIT
+    Note over P1,P2: 終於釋放鎖
+```
+
+#### III. PostgreSQL 的 PREPARE TRANSACTION
+
+PostgreSQL 原生支援 2PC 的第一階段（PREPARE），第二階段由外部協調者控制。
+
+```sql
+-- 參與者 A（PostgreSQL）
+BEGIN;
+UPDATE accounts SET balance = balance - 500 WHERE id = 1;
+PREPARE TRANSACTION 'tx_20260607_001';
+-- 此時事務進入「Prepared」狀態，鎖不會釋放，即使重啟也不丟失
+
+-- 協調者決定 COMMIT
+COMMIT PREPARED 'tx_20260607_001';
+
+-- 或協調者決定 ROLLBACK
+ROLLBACK PREPARED 'tx_20260607_001';
+```
+
+**即用查詢**：找出被遺忘的 Prepared 事務（孤兒事務）
+
+```sql
+SELECT transaction, gid, prepared,
+       now() - prepared AS prepared_duration,
+       owner, database
+FROM pg_prepared_xacts
+ORDER BY prepared;
+```
+
+| Output Column | 解讀 |
+|---------------|------|
+| `gid` | 全域事務 ID（你 PREPARE 時給的名稱） |
+| `prepared` | 進入 Prepared 狀態的時間戳 |
+| `prepared_duration` | 卡了多久——超過 5 分鐘需要人工介入 |
+| `owner` | 哪個使用者發起的 |
+
+> 補充（Senior Dev）：生產環境中，`pg_prepared_xacts` 有資料 = 有人忘了 COMMIT PREPARED 或 ROLLBACK PREPARED。這些事務持有的鎖不會釋放，會阻塞其他操作。建議設定監控告警：`pg_prepared_xacts` 不為空時立刻通知 DBA。
+
+#### IV. 2PC 的優缺點
+
+| 維度 | 評價 |
+|------|------|
+| 一致性 | 強一致（所有節點同時 COMMIT 或 ROLLBACK） |
+| 效能 | Prepare 階段鎖資源，長事務阻塞並發 |
+| 可用性 | 協調者單點故障 = 全系統阻塞 |
+| 複雜度 | 需要外部協調者 + 所有參與者支援 PREPARE |
+| 適用場景 | 單體應用跨多 DB、低並發、必須強一致的金融核心 |
+
+### 2. 3PC（Three-Phase Commit）
+
+#### I. 原理：加一個 Pre-Commit 階段解決阻塞
+
+3PC 在 Prepare 和 Commit 之間插入 Pre-Commit 階段：
+
+```text
+Phase 1（CanCommit）：協調者問「你可以提交嗎？」
+Phase 2（PreCommit） ：協調者通知「大家準備提交」（但不提交）
+Phase 3（DoCommit）  ：協調者通知「正式提交」
+
+關鍵改進：參與者有逾時機制——如果等不到協調者的 DoCommit，可以自行 COMMIT
+          （因為 PreCommit 已經告知「全票通過了」）
+```
+
+#### II. 為何少用？
+
+| 問題 | 說明 |
+|------|------|
+| 網路開銷 | 3 輪訊息 vs 2PC 的 2 輪——高延遲環境下更慢 |
+| 實作複雜 | 逾時邏輯、參與者自主決策邏輯，容易出 bug |
+| 腦裂風險 | 網路分區時，部分參與者自行 COMMIT，部分自行 ROLLBACK |
+| 業界採用率 | 極低，大多直接用 2PC + 人工介入 or 降級為 Saga |
+
+> 補充（Senior Dev）：3PC 是學術上的優化，實務上幾乎沒人用。與其折騰 3PC 的複雜狀態機，不如選擇 XA（標準化 2PC）或降級為最終一致方案（Saga）。PostgreSQL 也不支援 3PC。
+
+### 3. XA 協議
+
+#### I. XA 是什麼？
+
+XA 是 X/Open 組織定義的標準化 2PC 介面——它不改變 2PC 邏輯，只是統一了協調者和參與者之間的 API：
+
+```text
+XA 介面定義（每個參與者都要實作）：
+  xa_start()   — 開始一個 XA 事務分支
+  xa_end()     — 結束一個事務分支
+  xa_prepare() — Phase 1：準備提交
+  xa_commit()  — Phase 2：正式提交
+  xa_rollback()— 回滾
+  xa_recover() — 查詢 Prepared 狀態的事務（用於故障恢復）
+```
+
+#### II. PostgreSQL 的 XA 支援
+
+PostgreSQL 透過 `PREPARE TRANSACTION` 實作 XA 的 `xa_prepare`，並透過 `pg_prepared_xacts` 實作 `xa_recover`。
+
+```sql
+-- 等價於 xa_recover()
+SELECT gid FROM pg_prepared_xacts;
+```
+
+#### III. .NET + TransactionScope + XA 範例
+
+```csharp
+// 使用 TransactionScope 做跨 DB 的分散式事務
+// 底層自動升級為 MSDTC (Windows) 做 XA 協調
+using var scope = new TransactionScope();
+using var conn1 = new NpgsqlConnection(connStr1);
+using var conn2 = new NpgsqlConnection(connStr2);
+conn1.Open();
+conn2.Open();
+
+conn1.Execute("UPDATE accounts SET balance = balance - 500 WHERE id = 1");
+conn2.Execute("UPDATE accounts SET balance = balance + 500 WHERE id = 2");
+
+scope.Complete();
+```
+
+注意：
+- TransactionScope 升級為分佈式事務需要 MSDTC（Windows）或 LTM（Linux）
+- 容器化環境（K8s + Linux）中 MSDTC 不適用，需要外部協調者
+- Npgsql 支援 `Enlist=true`（預設）自動加入 TransactionScope
+
+> 補充（Senior Dev）：TransactionScope 在 .NET Framework 時代是主流做法，但在 .NET Core + 容器化時代逐漸被放棄。建議只在「舊系統遺留 + Windows Server 部署」環境中使用。
+
+#### IV. XA 在現代架構中的定位
+
+| 場景 | 是否適合 XA |
+|------|:---:|
+| 傳統 .NET Framework + Windows 部署 | 是 |
+| 跨 PostgreSQL DB 的事務（同一機房，低延遲） | 可接受 |
+| 微服務 + K8s + Linux 容器 | 否，用 Saga |
+| 跨雲端 / 跨區域 | 否，延遲太高 |
+
+
+## 3. 最終一致性方案：Saga / TCC / Outbox
+
+> 強一致性方案（2PC）的核心困境：鎖資源太久、協調者掛了就全卡。現代微服務架構傾向「寧可短暫不一致，也要系統可用」——這就是最終一致性的哲學。
+
+### 1. Saga 模式
+
+#### I. 核心思想
+
+Saga 把一個分佈式事務拆成多個本地事務，每個本地事務完成後觸發下一個。如果某一步失敗，則反向執行已完成的步驟來補償。
+
+```text
+正向流程：      補償流程（反向）：
+  扣 A 帳戶  →  加回 A 帳戶
+  加 B 帳戶  →  扣回 B 帳戶
+  記錄流水   →  刪除流水
+```
+
+#### II. Choreography（事件驅動 Saga）—— 無中心協調者
+
+每個服務做完自己的事後，發布事件；下一個服務監聽事件，觸發自己的操作。
+
+```mermaid
+sequenceDiagram
+    participant Order as 訂單服務
+    participant MQ as 訊息佇列
+    participant Inventory as 庫存服務
+    participant Pay as 支付服務
+
+    Order->>Order: 建立訂單（本地事務）
+    Order->>MQ: 發布「訂單已建立」事件
+
+    MQ->>Inventory: 消費事件
+    Inventory->>Inventory: 扣庫存（本地事務）
+    Inventory->>MQ: 發布「庫存已扣除」事件
+
+    MQ->>Pay: 消費事件
+    Pay->>Pay: 扣款（本地事務）失敗！
+    Pay->>MQ: 發布「支付失敗」事件
+
+    MQ->>Inventory: 補償事件
+    Inventory->>Inventory: 補償：加回庫存
+
+    MQ->>Order: 補償事件
+    Order->>Order: 補償：取消訂單
+```
+
+優點：簡單、無中心化瓶頸。缺點：各服務之間循環依賴、難以看到全局狀態。
+
+#### III. Orchestration（協調者 Saga）—— 有中心協調者
+
+引入一個 Saga Orchestrator，由它來指揮每一步，並在失敗時觸發補償。
+
+```mermaid
+sequenceDiagram
+    participant Orch as Saga 協調者
+    participant Order as 訂單服務
+    participant Inv as 庫存服務
+    participant Pay as 支付服務
+
+    Orch->>Order: 建立訂單
+    Order-->>Orch: 成功
+
+    Orch->>Inv: 扣庫存
+    Inv-->>Orch: 成功
+
+    Orch->>Pay: 扣款
+    Pay-->>Orch: 失敗
+
+    Note over Orch: 啟動補償
+
+    Orch->>Inv: 補償：加回庫存
+    Inv-->>Orch: 完成
+
+    Orch->>Order: 補償：取消訂單
+    Order-->>Orch: 完成
+```
+
+優點：邏輯集中在協調者、易於理解和維護。缺點：協調者本身需要高可用。
+
+#### IV. 補償機制設計
+
+| 原則 | 說明 | 錯誤範例 |
+|------|------|---------|
+| 補償必須冪等 | 補償可能被重試，執行兩次結果必須一樣 | 退款重複扣了兩次 |
+| 補償不該失敗 | 如果補償也失敗，需要人工介入 | 退款時支付 API 也掛了 |
+| 正向操作先做最可能失敗的 | 越早失敗，需要補償的步驟越少 | 先扣款再扣庫存 |
+| 記錄每一步的狀態 | 補償鏈需要知道哪些步驟已完成 | 沒有狀態記錄，不知道該補償哪幾步 |
+
+### 2. TCC（Try-Confirm-Cancel）
+
+#### I. 原理
+
+TCC 是 Saga 的一種具體實作模式，每個服務提供三個介面：
+
+| 階段 | 介面 | 說明 | 舉例（扣庫存） |
+|------|------|------|--------------|
+| Try | 預留資源 | 檢查 + 鎖定資源，不真正扣減 | 檢查庫存 >= 5，凍結 5 件 |
+| Confirm | 確認提交 | 真正扣減資源（不該失敗） | 凍結 → 正式扣減 |
+| Cancel | 釋放資源 | 釋放已預留的資源（補償） | 解除凍結，退回庫存 |
+
+#### II. TCC vs Saga
+
+| | Saga | TCC |
+|------|------|------|
+| 鎖定方式 | 無預留，直接操作 | Try 階段預留資源 |
+| 補償方式 | 執行反向操作 | Cancel 釋放預留 |
+| 隔離性 | 弱（中間態可見） | 較強（Try 凍結後，別人看到可用庫存已減少） |
+| 實作難度 | 中 | 高（需要設計 Try/Confirm/Cancel 三介面） |
+
+### 3. Outbox Pattern + 訊息佇列
+
+#### I. 為什麼需要 Outbox？
+
+Saga 中每個服務執行完本地事務後，需要「發送訊息」給下一個服務。如果本地事務 COMMIT 後、訊息發送前，app crash 了——訊息就丟了。Outbox 的核心思想：把訊息和業務操作寫在同一個本地事務中。
+
+```text
+沒有 Outbox：
+  BEGIN → UPDATE 庫存 → COMMIT → 發送訊息（app crash → 訊息丟失）
+
+有 Outbox：
+  BEGIN → UPDATE 庫存 → INSERT INTO outbox → COMMIT
+  後續 Worker 從 outbox 讀取 → 發送訊息
+```
+
+#### II. PostgreSQL Outbox 表設計
+
+```sql
+CREATE TABLE outbox (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_type VARCHAR(100) NOT NULL,
+    aggregate_id VARCHAR(100) NOT NULL,
+    event_type VARCHAR(100) NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_at TIMESTAMPTZ,
+    retry_count INT NOT NULL DEFAULT 0
+);
+
+CREATE INDEX idx_outbox_pending ON outbox (created_at)
+    WHERE processed_at IS NULL;
+```
+
+#### III. Outbox 積壓監控
+
+```sql
+SELECT count(*) AS pending_count,
+       min(now() - created_at) AS oldest_pending,
+       max(now() - created_at) AS newest_pending
+FROM outbox
+WHERE processed_at IS NULL;
+```
+
+| Output Column | 解讀 |
+|---------------|------|
+| `pending_count` | 待處理訊息數。持續增長 = Publisher 掛了或消費者掛了 |
+| `oldest_pending` | 最老的訊息卡了多久。> 5 分鐘需要告警 |
+
+### 4. Seata AT Mode（簡介）
+
+#### I. 原理：自動 Undo Log
+
+Seata 是阿里巴巴開源的分佈式事務框架。AT Mode 的核心是自動產生 Undo Log——你寫普通的 SQL，Seata 自動解析，產生反向 SQL 用於補償。
+
+```text
+你的 SQL（由 Seata 代理執行）：
+  UPDATE inventory SET stock = stock - 5 WHERE id = 1
+
+Seata 自動記錄 Undo Log（補償時使用）：
+  UPDATE inventory SET stock = stock + 5 WHERE id = 1
+```
+
+#### II. 與手動 Saga / TCC 的對比
+
+| | Saga（手動） | TCC（手動） | Seata AT Mode |
+|------|:---:|:---:|:---:|
+| 程式碼改動 | 需寫正向 + 補償邏輯 | 需實作 Try/Confirm/Cancel | 幾乎無需改動 |
+| 跨語言 | 是 | 是 | 否（主要 Java） |
+| 適用場景 | .NET 生態 | .NET 生態 | Java 生態 |
+
+> 補充（Senior Dev）：Seata 在 .NET 生態的支援仍不成熟。.NET 專案建議優先選擇 Saga + Outbox 方案，或使用 MassTransit 內建的 Saga State Machine。
+
 ---
 
-# 二、App Dev 視角：.NET / Dapper 實戰
+## 4. 方案對比與選型
+
+> 前面介紹了強一致性（2PC / XA）和最終一致性（Saga / TCC / Outbox）方案。本章提供實務選型的決策路徑。
+
+### 1. 決策路徑圖
+
+```mermaid
+flowchart TD
+    START["我需要分佈式事務嗎？"] --> Q1{"操作跨多個<br/>資料庫或服務？"}
+    Q1 -->|"否"| LOCAL["用本地事務即可<br/>PostgreSQL BEGIN...COMMIT"]
+    Q1 -->|"是"| Q2{"能容忍短暫<br/>資料不一致？"}
+    Q2 -->|"否（必須強一致）"| Q3{"所有參與者在<br/>同一機房？"}
+    Q3 -->|"是"| XA["2PC / XA<br/>（限低延遲環境）"]
+    Q3 -->|"否"| WARN["跨機房強一致<br/>效能極差<br/>考慮重新設計架構"]
+    Q2 -->|"是（最終一致可接受）"| Q4{"業務流程<br/>複雜嗎？"}
+    Q4 -->|"簡單（<4 步）"| CHOREO["Saga Choreography<br/>+ Outbox + 訊息佇列"]
+    Q4 -->|"複雜（>=4 步）"| ORCH["Saga Orchestration<br/>+ Outbox + 訊息佇列"]
+    Q4 -->|"需要較強隔離"| TCC["TCC<br/>（Try-Confirm-Cancel）"]
+
+    style LOCAL fill:#2ecc71,color:#fff
+    style CHOREO fill:#2ecc71,color:#fff
+    style ORCH fill:#2ecc71,color:#fff
+    style XA fill:#ffd43b
+    style TCC fill:#ffd43b
+    style WARN fill:#e74c3c,color:#fff
+```
+
+### 2. 全方案對比表
+
+| 方案 | 一致性 | 效能 | 可用性 | 實作複雜度 | 鎖資源時間 | 適用場景 |
+|------|:---:|:---:|:---:|:---:|:---:|------|
+| 本地事務 | 強一致 | 最高 | 高 | 低 | 毫秒級 | 單一 DB 的所有操作 |
+| 2PC / XA | 強一致 | 低 | 低 | 中 | 秒~分鐘級 | 低延遲跨 DB、金融核心 |
+| Saga Choreography | 最終一致 | 高 | 高 | 中 | 無 | 簡單業務流程（3-4 步） |
+| Saga Orchestration | 最終一致 | 高 | 高 | 中高 | 無 | 複雜業務流程（>4 步） |
+| TCC | 較強最終一致 | 中高 | 高 | 高 | Try 階段鎖定 | 庫存扣減、預算凍結 |
+
+### 3. 從 .NET Developer 視角的建議
+
+| 情境 | 推薦方案 | 理由 |
+|------|---------|------|
+| 單一 PostgreSQL DB | 本地事務 | 不需要分佈式事務 |
+| 跨 2 個 PG DB（同機房） | 2PC / TransactionScope | 強一致、低複雜度 |
+| 微服務架構 | Saga Orchestration + Outbox | 最終一致、高可用 |
+| .NET + K8s + 訊息佇列 | Outbox + MassTransit Saga | MassTransit 內建 Saga State Machine |
+| 庫存/預算凍結場景 | TCC | 需要 Try 階段凍結 |
+
+> 補充（Senior Dev）：在 .NET 生態中，Outbox + MassTransit 是實務上最被驗證穩定的分佈式事務方案。MassTransit 內建了 Saga State Machine、Outbox、Idempotency、Retry、Dead Letter Queue 等全套工具。如果團隊規模小且不想引入額外基礎設施，Outbox + PostgreSQL + BackgroundService 輪詢是最輕量的起步方案。
+
+
+## 5. App Dev 視角：.NET + PostgreSQL 實戰
+
+### 1. 何時用 PREPARE TRANSACTION，何時用 Outbox？
+
+```mermaid
+flowchart TD
+    START["開始設計事務"] --> Q1{"操作跨多個<br/>PostgreSQL DB？"}
+    Q1 -->|"否"| LOCAL["用本地 BEGIN...COMMIT"]
+    Q1 -->|"是"| Q2{"兩個 DB 在<br/>同一機房、低延遲？"}
+    Q2 -->|"是"| Q3{"能接受協調者<br/>單點故障風險？"}
+    Q3 -->|"是"| PREP["PREPARE TRANSACTION<br/>+ TransactionScope"]
+    Q3 -->|"否"| OUT["Outbox + Saga"]
+    Q2 -->|"否（跨機房、跨雲）"| OUT
+
+    style LOCAL fill:#2ecc71,color:#fff
+    style PREP fill:#ffd43b
+    style OUT fill:#2ecc71,color:#fff
+```
+
+### 2. Npgsql + TransactionScope 的正確寫法
+
+```csharp
+using var scope = new TransactionScope(
+    TransactionScopeOption.Required,
+    new TransactionOptions
+    {
+        IsolationLevel = IsolationLevel.ReadCommitted,
+        Timeout = TimeSpan.FromSeconds(30)
+    });
+
+using var conn1 = new NpgsqlConnection(connStr1);
+using var conn2 = new NpgsqlConnection(connStr2);
+conn1.Open();
+conn2.Open();
+
+conn1.Execute("UPDATE accounts SET balance = balance - 500 WHERE id = 1");
+conn2.Execute("UPDATE accounts SET balance = balance + 500 WHERE id = 2");
+
+scope.Complete(); // 觸發 2PC：PG 自動執行 PREPARE → COMMIT PREPARED
+```
+
+#### 生產環境注意事項
+
+| 陷阱 | 說明 | 解法 |
+|------|------|------|
+| TransactionScope 升級為 MSDTC | 同一個 Scope 內開啟第二個 connection 時，自動升級為分佈式事務 | 確保 MSDTC 服務運行（Windows） |
+| 逾時設定 | 預設 Timeout 10 分鐘，但 PG statement_timeout 可能更短 | TransactionScope.Timeout < PG timeout |
+| 孤兒 Prepared 事務 | .NET app crash 後，PG 中遺留 PREPARED 狀態的事務 | 定時檢查 pg_prepared_xacts |
+| Connection Pool 互動 | Pool 中的 connection 可能殘留未清理的事務狀態 | Npgsql 6.0+ 注意 NoResetOnClose |
+
+```sql
+-- 監控孤兒 Prepared 事務
+SELECT gid, prepared, owner,
+       now() - prepared AS stuck_duration
+FROM pg_prepared_xacts
+WHERE now() - prepared > interval '5 minutes';
+```
+
+### 3. Outbox + BackgroundService 完整範例
+
+#### I. 業務邏輯（寫入 Outbox）
+
+```csharp
+public class OrderService
+{
+    private readonly NpgsqlDataSource _ds;
+
+    public async Task<Guid> CreateOrder(CreateOrderCmd cmd)
+    {
+        var orderId = Guid.NewGuid();
+        await using var conn = await _ds.OpenConnectionAsync();
+        await using var tx = await conn.BeginTransactionAsync();
+
+        // Step 1：業務操作
+        await conn.ExecuteAsync(
+            "INSERT INTO orders (id, customer_id, amount) VALUES (@id, @cid, @amt)",
+            new { id = orderId, cid = cmd.CustomerId, amt = cmd.Amount }, tx);
+
+        // Step 2：寫入 Outbox（同一個本地事務）
+        var outboxEvent = new { orderId, cmd.CustomerId, cmd.Amount, createdAt = DateTime.UtcNow };
+        await conn.ExecuteAsync(
+            @"INSERT INTO outbox (aggregate_type, aggregate_id, event_type, payload)
+              VALUES (@Type, @AggId, @Event, @Payload::jsonb)",
+            new { Type = "Order", AggId = orderId.ToString(),
+                  Event = "OrderCreated", Payload = JsonSerializer.Serialize(outboxEvent) },
+            tx);
+
+        await tx.CommitAsync();
+        return orderId;
+    }
+}
+```
+
+#### II. BackgroundService（OutboxPublisher）
+
+```csharp
+public class OutboxPublisher : BackgroundService
+{
+    private readonly NpgsqlDataSource _ds;
+    private readonly IMessageBus _bus;
+    private readonly ILogger<OutboxPublisher> _log;
+
+    private const int BatchSize = 50;
+    private const int PollIntervalMs = 500;
+    private const int MaxRetries = 5;
+
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try { await ProcessBatch(ct); }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            { _log.LogError(ex, "OutboxPublisher error"); }
+            await Task.Delay(PollIntervalMs, ct);
+        }
+    }
+
+    private async Task ProcessBatch(CancellationToken ct)
+    {
+        await using var conn = await _ds.OpenConnectionAsync(ct);
+        var messages = (await conn.QueryAsync<OutboxMessage>(
+            @"SELECT id, aggregate_type, aggregate_id, event_type, payload, retry_count
+              FROM outbox
+              WHERE processed_at IS NULL AND retry_count < @maxRetries
+              ORDER BY created_at LIMIT @batchSize",
+            new { maxRetries = MaxRetries, batchSize = BatchSize })).ToList();
+
+        foreach (var msg in messages)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                await _bus.PublishAsync(msg, ct);
+                await conn.ExecuteAsync("UPDATE outbox SET processed_at = now() WHERE id = @id", new { msg.Id });
+            }
+            catch
+            {
+                await conn.ExecuteAsync("UPDATE outbox SET retry_count = retry_count + 1 WHERE id = @id", new { msg.Id });
+                _log.LogWarning("Failed to publish Outbox message {Id}, retry {Count}", msg.Id, msg.RetryCount + 1);
+            }
+        }
+    }
+}
+```
+
+#### III. 消費端：冪等處理
+
+```csharp
+public class OrderCreatedHandler
+{
+    private readonly NpgsqlDataSource _ds;
+
+    public async Task Handle(OrderCreatedEvent evt)
+    {
+        var processed = await _ds.OpenConnectionAsync()
+            .QuerySingleOrDefaultAsync<bool>(
+                "SELECT EXISTS(SELECT 1 FROM idempotency_keys WHERE key = @key)",
+                new { key = evt.EventId.ToString() });
+        if (processed) return;
+
+        await using var conn = await _ds.OpenConnectionAsync();
+        await using var tx = await conn.BeginTransactionAsync();
+
+        await conn.ExecuteAsync(
+            "UPDATE inventory SET stock = stock - @qty WHERE id = @itemId",
+            new { qty = evt.Qty, itemId = evt.ItemId }, tx);
+
+        await conn.ExecuteAsync(
+            "INSERT INTO idempotency_keys (key, created_at) VALUES (@key, now())",
+            new { key = evt.EventId.ToString() }, tx);
+
+        await tx.CommitAsync();
+    }
+}
+```
+
+### 4. 生產環境注意事項
+
+#### Outbox 監控
+
+| 指標 | 查詢 | 告警閾值 |
+|------|------|------|
+| 積壓數量 | `SELECT count(*) FROM outbox WHERE processed_at IS NULL` | > 1000 |
+| 最老未處理 | `SELECT now() - min(created_at) FROM outbox WHERE processed_at IS NULL` | > 5 分鐘 |
+| 失敗重試 | `SELECT count(*) FROM outbox WHERE retry_count >= 5` | > 0 |
+
+#### Outbox 清理
+
+```sql
+-- 定時清理已處理的舊訊息（避免表無限增長）
+DELETE FROM outbox
+WHERE processed_at IS NOT NULL
+  AND processed_at < now() - interval '7 days';
+```
+
+> 補充（Senior Dev）：Outbox + Idempotency Key 是微服務中處理分佈式事務的黃金組合。Outbox 保證訊息不丟（at-least-once），Idempotency Key 保證不重複處理（exactly-once 語義）。如果法規要求保留審計記錄，將已處理訊息移到歸檔表而非直接 DELETE。
+
+---
+
+## 附錄一、分佈式事務速查卡
+
+### 生產環境速查卡
+
+#### Top 5 分佈式事務常見問題
+
+| # | 症狀 | 最可能根因 | 優先查詢 | 對應章節 |
+|---|------|----------|---------|---------|
+| 1 | 某些 row 被鎖住無法更新 | 遺留的 PREPARED TRANSACTION | `SELECT * FROM pg_prepared_xacts` | 二.1 |
+| 2 | Outbox 訊息堆積 | Publisher 掛了或消費者崩潰 | `SELECT count(*) FROM outbox WHERE processed_at IS NULL` | 三.3、五.3 |
+| 3 | 重複扣款/重複入帳 | 消費端未做冪等 | 檢查 idempotency_keys 表 | 三.3 |
+| 4 | TransactionScope 報錯 | MSDTC 未啟動 | 檢查 MSDTC 狀態，考慮降級 | 二.3、五.2 |
+| 5 | Saga 補償鏈中斷 | 補償操作本身失敗 | 檢查 Saga 狀態表 | 三.1 |
+
+#### 30 秒應急查詢
+
+```sql
+-- #1 有沒有被遺忘的 2PC 事務？
+SELECT gid, prepared, now() - prepared AS duration
+FROM pg_prepared_xacts ORDER BY prepared;
+
+-- #2 Outbox 堆積多少了？
+SELECT count(*) AS pending,
+       max(now() - created_at) AS max_delay
+FROM outbox WHERE processed_at IS NULL;
+```
+
+#### GUC 參數速查
+
+| 參數 | 建議值 | 白話解釋 |
+|------|--------|---------|
+| `max_prepared_transactions` | `100` | 允許 PREPARE TRANSACTION 的最大數量。預設 0 = 禁止 2PC |
+| `statement_timeout` | `30s` | 單條 SQL 最長執行時間 |
+| `idle_in_transaction_session_timeout` | `5min` | 閒置事務自動 kill |
+
+### 版本演進
+
+| 功能 | 版本 | 說明 |
+|------|------|------|
+| `PREPARE TRANSACTION` | PG 7.4+ | PostgreSQL 原生 2PC 支援 |
+| `max_prepared_transactions` | PG 7.4+ | 預設 0 = 禁用 |
+| Npgsql `Enlist=true` | Npgsql 3.0+ | 自動加入 TransactionScope |
+| Npgsql `ProcessID` | Npgsql 6.0+ | 對應 pg_stat_activity.pid |
+
+### 參考
+
+- [PostgreSQL Official — PREPARE TRANSACTION](https://www.postgresql.org/docs/current/sql-prepare-transaction.html)
+- [Npgsql — TransactionScope & Distributed Transactions](https://www.npgsql.org/doc/transactions.html)
+- [Microsoft — Implementing the Outbox Pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/transactional-outbox)
+- [MassTransit — Saga State Machine](https://masstransit-project.com/usage/sagas/)
+
+
+
+
+---
+
+# 四、App Dev 視角：.NET / Dapper 實戰
 
 ## 1. Npgsql 中的 IsolationLevel 設定
 
@@ -1713,7 +2560,7 @@ flowchart TD
 
 ---
 
-# 附錄、SQL Standard vs PostgreSQL 隔離級別對照
+# 附錄一、SQL Standard vs PostgreSQL 隔離級別對照
 
 | 異常現象 | SQL Standard 定義 | PG Read Committed | PG Repeatable Read | PG Serializable |
 |----------|:---:|:---:|:---:|:---:|
