@@ -9,7 +9,7 @@
 
 | 章節 | 檔案 | 主題 |
 |------|------|------|
-| **Transaction 隔離級別** | [`transaction/transaction.md`](transaction/transaction.md) | MVCC Snapshot 深度解析、Read Committed/Repeatable Read/Serializable 底層原理（SSI/SIREAD）、Write Skew 重現、VACUUM 影響、.NET Dapper/Polly Retry 實戰 |
+| **Transaction 全攻略** | [`transaction/transaction.md`](transaction/transaction.md) | MVCC Snapshot 深度解析、四種隔離級別底層原理（SSI/SIREAD/2PL/S2PL）、Write Skew 重現、EvalPlanQual / Lost Update、VACUUM 影響、.NET Dapper/Polly Retry 實戰、**分佈式事務（2PC/XA/Saga/TCC/Outbox + .NET 完整範例）** |
 | **索引全解析** | [`index.md`](index.md) | 六種掃描類型全解析（Seq/Index/Bitmap/Parallel/Index-Only）、Bitmap Heap Scan 詳解、BRIN/Bloom/GIN/GiST/SP-GiST/RUM、Covering Index、索引失效 20 場景 |
 | **查詢深度解析** | [`query.md`](query.md) | 查詢生命週期、CBO 與 pg_hint_plan、GROUP BY 策略、IN/ANY/VALUES、分頁與計數、Recursive CTE 優化、死循環防禦、分組 Top-N（44x）、JOIN 冗餘膨脹 Early DISTINCT |
 | **鎖（Lock）** | [`lock.md`](lock.md) | 隱式鎖、Lock Wait 追蹤、秒殺 Advisory Lock、高並發更新、Lock Flooding、max_locks_per_transaction、OLTP advisory lock、無間隙 ID 生成 |
@@ -21,7 +21,7 @@
 | **系統底層** | [`system.md`](system.md) | Column Order 與 Byte Alignment 全鏈路效能、Bit 位運算標籤系統、Linux Page Fault 與 huge_pages / NUMA |
 | **擴充功能** | [`extensions/extensions.md`](extensions/extensions.md) | 兩大分類 13 個 Extension：Non-Contrib（pg_partman / PgBouncer / pg_repack / pg_cron / pg_stat_kcache / hypopg）+ Contrib 內建（pg_stat_statements / auto_explain / pgcrypto / pg_trgm / pg_prewarm / pg_buffercache / btree_gin+btree_gist） |
 | **分頁查詢** | [`pagination.md`](pagination.md) | OFFSET 效能退化、CURSOR 方案、Keyset Pagination、分頁優化策略 |
-| **其他進階** | [`others/others.md`](others/others.md) | PG 17 開發規範（六大章節 + Npgsql 連線/交易/Retry/Prepared Statement/WAL 完整 C# 實戰）、Trigger Audit（DML hstore+JSONB/DDL Event Trigger + pgaudit 對比 + 架構決策速查）、12306 搶票系統全案設計（varbit/SKIP LOCKED/Array+GIN/CURSOR/pgrouting/Parallel Query/Sharding/Recursive CTE） |
+| **其他進階** | [`others.md`](others.md) | PG 17 開發規範（六大章節 + Npgsql 連線/交易/Retry/Prepared Statement/WAL 完整 C# 實戰）、Trigger Audit（DML hstore+JSONB/DDL Event Trigger + pgaudit 對比 + 架構決策速查）、12306 搶票系統全案設計（varbit/SKIP LOCKED/Array+GIN/CURSOR/pgrouting/Parallel Query/Sharding/Recursive CTE） |
 
 ---
 
@@ -90,11 +90,12 @@
 - **一、慢查詢追溯體系**：pg_stat_activity 生產實戰（5 場景 + 30 秒決策圖 + 鎖阻塞/Plan 不穩定/連線池滿/間歇性慢查詢）、wait_event Top 10、Snapshot vs Time-Series、應用層 backend_pid 記錄
 - **二、track_commit_timestamp**：SLRU 儲存結構、logical replication / snapshot too old / CDC 應用場景、效能影響與 Production 取捨
 
-### Transaction 隔離級別（transaction）
+### Transaction 全攻略（transaction）
 - **一、隔離級別的底層：MVCC 與 Snapshot**：Snapshot 結構（xmin/xmax/xip[]）深度回顧、`GetTransactionSnapshot()` 內部機制、RC vs RR 的 Snapshot 獲取時序對比（stateDiagram）、PG 為何用 Snapshot 而非 Lock
 - **二～五、四種隔離級別完整解析**：Read Uncommitted（PG 中等於 RC 的 MVCC 根本原因）、Read Committed（每個 Statement 新 Snapshot / 幻讀重現 / 生產場景選擇表）、Repeatable Read（gantt 時序圖 / PG 額外防止 Phantom Read 的 snapshot 邊界原理 / Write Skew 完整重現 + Mermaid)、Serializable（SSI 原理 / SIREAD lock page-level 限制 / wr/ww/rw 三種依賴 / serialization failure 觸發流程 / 效能 overhead 量化）
 - **六、隔離級別對 VACUUM 的影響**：OldestXmin 計算、RR transaction 如何阻止 dead tuple 回收（Mermaid 災難鏈）、找出卡住 VACUUM 的 session、`old_snapshot_threshold` / `idle_in_transaction_session_timeout` 解法
-- **生產環境場景**：轉帳 Phantom（FOR UPDATE / RR / Serializable 解法矩陣）、Write Skew 案例（值班醫生 SQL 重現）、隔離級別選擇決策圖（Mermaid flowchart + 速查對照表）
+- **三、分佈式事務實現方式（NEW）**：CAP/BASE 理論、2PC（PREPARE TRANSACTION）/ 3PC / XA + TransactionScope C# 範例、Saga（Choreography/Orchestration）、TCC（Try-Confirm-Cancel）、Outbox Pattern + BackgroundService + 冪等處理、Seata AT Mode、方案對比與選型決策圖
+- **生產環境場景**：轉帳 Phantom（FOR UPDATE / RR / Serializable 解法矩陣）、Write Skew 案例（值班醫生 SQL 重現）、EvalPlanQual / Lost Update、隔離級別選擇決策圖（Mermaid flowchart + 速查對照表）
 - **.NET 實戰**：Npgsql IsolationLevel enum 完整對照、Dapper 正確/錯誤寫法對比（FOR UPDATE + transaction 傳遞）、Polly Retry Pattern（`SqlState 40001` serialization failure）
 
 ### 索引全解析（Index）
