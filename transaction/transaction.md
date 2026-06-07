@@ -563,6 +563,139 @@ flowchart TD
 
 業務建議：**能寫在 SQL 表達式裡的就寫在 SQL 裡**（`balance = balance + 1`）。必須在應用層算的場合（例如依賴外部 API 回傳值來決定新值），務必用 `SELECT ... FOR UPDATE` 先鎖住。
 
+### VI. 場景：Read Committed 下的轉帳 Phantom
+
+#### a. 原理重現
+
+```sql
+-- 準備
+CREATE TABLE accounts (id INT PRIMARY KEY, balance INT);
+INSERT INTO accounts VALUES (1, 1000), (2, 1000);
+
+-- Session A (Read Committed) — 轉帳驗證
+BEGIN;
+SELECT SUM(balance) FROM accounts;           -- 返回 2000
+SELECT balance FROM accounts WHERE id = 1;    -- 返回 1000
+-- 準備扣款...但 Session B 在這個時候插入了
+
+-- Session B (同時)
+UPDATE accounts SET balance = 500 WHERE id = 1;
+COMMIT;
+
+-- Session A (繼續)
+SELECT balance FROM accounts WHERE id = 2;    -- 返回 1000
+SELECT SUM(balance) FROM accounts;           -- 返回 1500 ← 總額變了！
+-- 基於「總額 2000」做的後續判斷全部失效
+COMMIT;
+```
+
+#### b. 解法矩陣
+
+| 解法 | 適用場景 | 限制 |
+|------|---------|------|
+| `SELECT ... FOR UPDATE` | 需要鎖定特定行進行後續修改 | 僅鎖定被 SELECT 的行，不鎖定新插入的行 |
+| 改用 Repeatable Read | 需要多個 SELECT 之間的一致性快照 | 長時間事務會卡 VACUUM |
+| Serializable | 最嚴格的一致性要求 | 需要 retry logic |
+| 應用層重試 | 所有場景 | 增加開發複雜度 |
+
+#### c. 生產環境排查與事後偵測
+
+##### i. 事後偵測：從審計表發現 Phantom Read 痕跡
+
+如果 `accounts` 表有審計欄位（`updated_at`、`audit_log`），可以在事後搜尋疑似 Phantom Read 的異常模式：
+
+```sql
+-- 搜尋短時間內對同一帳戶出現「不一致讀取」的嫌疑交易
+-- 條件：同一個 transaction 範圍內，SUM(balance) 兩次取值不同
+-- 需要審計表記錄每次 SELECT 的時間點
+
+-- 方法 A：檢查是否有 concurrent write 與 SELECT 時間重疊
+WITH suspicious_writes AS (
+    SELECT id, balance, updated_at,
+           lag(updated_at) OVER (PARTITION BY id ORDER BY updated_at) AS prev_updated
+    FROM accounts_audit_log
+    WHERE action = 'UPDATE'
+)
+SELECT id, updated_at, prev_updated,
+       updated_at - prev_updated AS gap,
+       CASE WHEN updated_at - prev_updated < interval '1 second'
+            THEN '⚠️ 疑似 Phantom Read 視窗' END AS risk
+FROM suspicious_writes
+WHERE updated_at - prev_updated < interval '1 second'
+ORDER BY gap;
+
+-- 方法 B：計算總額快照一致性（需在應用層記錄每次總額校驗的時間點）
+SELECT recorded_at,
+       recorded_sum,
+       (SELECT SUM(balance) FROM accounts WHERE updated_at <= a.recorded_at) AS actual_at_time,
+       recorded_sum - (SELECT SUM(balance) FROM accounts WHERE updated_at <= a.recorded_at) AS drift
+FROM account_snapshot_log a
+WHERE recorded_at > now() - interval '1 day'
+  AND abs(recorded_sum - (SELECT SUM(balance) FROM accounts WHERE updated_at <= a.recorded_at)) > 0;
+```
+
+**結果解讀**：
+- `gap < 1 second` 表示有兩筆 UPDATE 幾乎同時發生，可能在另一個 session 的兩個 SELECT 之間
+- `drift <> 0` 表示應用層記錄的總額與資料庫實際值不同，很可能發生過 Phantom Read
+
+##### ii. 即時排查：找出正在對同一表進行 Concurrent Write 的 Session
+
+```sql
+-- 誰正在跟我競爭同一張表？
+SELECT pid, usename, application_name, state,
+       wait_event_type, wait_event,
+       now() - xact_start AS xact_duration,
+       now() - query_start AS query_duration,
+       LEFT(query, 200) AS query
+FROM pg_stat_activity
+WHERE state = 'active'
+  AND query NOT LIKE '%pg_stat_activity%'
+  AND pid <> pg_backend_pid()
+ORDER BY xact_start;
+```
+
+**結果解讀**：
+
+| Column | 正常時 | 異常時（紅旗） |
+|--------|--------|----------------|
+| `xact_duration` | < 1 秒 | > 30 秒 → 可能有人忘了 COMMIT |
+| `query_duration` | < 100ms | > 5 秒 → 查詢卡住 |
+| `wait_event_type = 'Lock'` | 無 | 出現 → 有人持有鎖 |
+| `query 中含 UPDATE/DELETE` | 短時間 | 長時間執行 → 可能造成 Phantom Read 視窗 |
+
+##### iii. 排查 Mermaid 流程圖
+
+```mermaid
+flowchart TD
+    START["🚨 發現總額不一致<br/>或交易重複"] --> CHECK_LOG{"是否有 audit log<br/>或 timestamp 欄位？"}
+    CHECK_LOG -->|"有"| AUDIT["執行事後偵測查詢<br/>搜尋 concurrent write 重疊"]
+    CHECK_LOG -->|"沒有"| LIVE["只能排查當下狀態"]
+
+    AUDIT --> FIND{"找到時間重疊的<br/>concurrent write？"}
+    FIND -->|"是"| CONFIRM["✅ 確認 Phantom Read<br/>→ 改用 FOR UPDATE / RR"]
+    FIND -->|"否"| BUG["可能是 application bug<br/>→ 檢查程式邏輯"]
+
+    LIVE --> CHECK_ACTIVITY["執行 pg_stat_activity<br/>查看 active session"]
+    CHECK_ACTIVITY --> HAS_LONG{"有長時間 active<br/>的 UPDATE session？"}
+    HAS_LONG -->|"是"| KILL["考慮 kill session<br/>或等待 commit"]
+    HAS_LONG -->|"否"| PATTERN["查看 pg_stat_statements<br/>是否有異常 query pattern"]
+
+    style START fill:#e74c3c,color:#fff
+    style CONFIRM fill:#ffd43b
+    style BUG fill:#2ecc71,color:#fff
+```
+
+##### iv. 生產症狀速查
+
+| 業務症狀 | 底層原因 | 優先查 |
+|----------|---------|--------|
+| 退款重複（同一筆交易退款兩次） | SELECT 確認金額 → 另一筆退款 UPDATE BETWEEN → 再次 SELECT 仍有錢 | 此場景 |
+| 庫存總數與明細加總不符 | SUM() 在 transaction 內被其他 session 的 INSERT 改變 | 此場景 |
+| 報表數字每次刷新都不同 | Auto-commit 模式，每條 SELECT 拿到不同 snapshot | 此場景 + Npgsql connection pool |
+| 用戶看到餘額跳動 | 同一頁面多條 AJAX 各自獨立 SELECT | Read Committed 預設行為 |
+
+> 補充（Senior Dev）：Phantom Read 是 RC 的設計行為，不是 bug。如果業務邏輯依賴「兩個 SELECT 之間資料不變」，卻使用了 RC，這是應用層設計缺陷。最簡單的解法是在關鍵 SELECT 後加 `FOR UPDATE`（即使不打算 update），利用 row lock 阻止 concurrent write；或用 RR 取得 stable snapshot。要注意 `FOR UPDATE` 會阻塞其他 writer，在高並發場景需評估效能影響。
+
 ---
 
 ## 4. Repeatable Read — PG 比 SQL Standard 更強
@@ -780,7 +913,91 @@ ORDER BY min(age(backend_xmin));
 
 ## 5. Serializable — 最高隔離級別
 
-### I. SSI（Serializable Snapshot Isolation）原理
+### I. 傳統做法：2PL / S2PL（兩階段鎖定）
+
+Serializable 的實作方式有兩條路線：**鎖式**（S2PL，如 SQL Server）和**快照式**（SSI，如 PostgreSQL）。純 2PL 因 Cascading Rollback 問題在實務中已被 S2PL 取代——所有鎖式資料庫的 Serializable 都是 S2PL 或其變體。
+
+```mermaid
+sequenceDiagram
+    participant T1 as T1（用 2PL）
+    participant DB as 資料庫
+    participant T2 as T2
+
+    rect rgb(200, 255, 200)
+        Note over T1: 🟢 Phase 1：Growing<br/>只能加鎖，不能釋放
+        T1->>DB: 讀取 row → 加 shared lock
+        T1->>DB: 寫入 row → 加 exclusive lock
+        Note over T1: 🔒 鎖越拿越多<br/>至今沒放過任何一把鎖
+    end
+
+    T1-->>T1: ⚡ T1 覺得「這行改完了」<br/>釋放第一把鎖（exclusive lock）
+    Note over T1: ⬆️ 這一瞬間<br/>Phase 1 → Phase 2！
+
+    rect rgb(255, 230, 200)
+        Note over T1: 🔴 Phase 2：Shrinking<br/>釋了第一把鎖後，不能再加新鎖
+        Note over T1: T1 釋放 exclusive lock<br/>但還沒 COMMIT ❗
+    end
+
+    T2->>DB: 讀取同一 row
+    Note over DB: T1 已釋鎖 → T2 不被阻塞
+    DB-->>T2: 讀到 T1 未 COMMIT 的值<br/>→ Dirty Read ⚠️
+    Note over T2: T2 基於這個值繼續做事<br/>（當下還不知道是髒的）
+
+    T1->>DB: ROLLBACK ❗
+    Note over T2: 💀 T2 手裡的資料變成假的了<br/>但已經基於它做了決策<br/>→ Cascading Rollback
+```
+
+> **T1 什麼時候進入 Phase 2？** 釋放**第一把鎖**的瞬間。在 2PL 規則下，一旦放了任何鎖就不能再拿新鎖——所以放鎖那一刻就是 Growing → Shrinking 的分界線。觸發原因通常是 T1 覺得「這行已經處理完了，先放鎖讓別人用」，但實際上整個交易還沒結束（可能還有其他邏輯在跑）。
+>
+> **Dirty Read 時序**：T2 讀取當下拿到的是「未 COMMIT 的值」——這就是 Dirty Read 的定義，不管 T1 後來是 COMMIT 還是 ROLLBACK。真正的傷害在 T1 ROLLBACK 後才顯現：T2 手裡的資料變成假資料，但 T2 可能已經基於它做了後續操作。
+
+```text
+S2PL（Strict 2PL）：2PL 的強化版
+  規則：所有 write lock 必須持有到 COMMIT 才釋放
+  保證：序列化 + 無連鎖回滾
+  問題：寫者會長時間阻塞讀者和寫者 → 並發吞吐量低
+```
+
+2PL vs S2PL vs SSI 三種實作的鎖行為對比：
+
+```mermaid
+flowchart LR
+    subgraph S2PL_Flow["S2PL（嚴格兩階段鎖定）"]
+        S2PL_B["🔒 讀取 → 加 shared lock"]
+        S2PL_B --> S2PL_R["別人想讀同一行 → ✅ 不阻塞"]
+        S2PL_B --> S2PL_W["別人想寫同一行 → ❌ 阻塞"]
+        S2PL_W2["🔒 寫入 → 加 exclusive lock"]
+        S2PL_W2 --> S2PL_R2["別人想讀同一行 → ❌ 阻塞"]
+        S2PL_W2 --> S2PL_W3["別人想寫同一行 → ❌ 阻塞"]
+        S2PL_W2 --> S2PL_C["COMMIT 後才釋放所有鎖<br/>✅ 無 Cascading Rollback"]
+    end
+
+    subgraph SSI_Flow["SSI（PostgreSQL Serializable）"]
+        SSI_R["📸 讀取 → 不加鎖，記錄 SIREAD"] --> SSI_W["✏️ 寫入 → 只鎖該行"]
+        SSI_W --> SSI_C["COMMIT 時檢查依賴圖"]
+        SSI_C --> SSI_OK{"有 rw-循環？"}
+        SSI_OK -->|"否"| SSI_DONE["✅ 提交成功"]
+        SSI_OK -->|"是"| SSI_ABORT["❌ Abort（不阻塞，報錯讓你 retry）"]
+    end
+
+    style S2PL_R fill:#2ecc71,color:#fff
+    style S2PL_W fill:#e74c3c,color:#fff
+    style S2PL_R2 fill:#e74c3c,color:#fff
+    style S2PL_W3 fill:#e74c3c,color:#fff
+    style SSI_DONE fill:#2ecc71,color:#fff
+    style SSI_ABORT fill:#e74c3c,color:#fff
+```
+
+S2PL 的鎖相容性總結：
+
+| 持有鎖 | 別人想讀 | 別人想寫 |
+|--------|:---:|:---:|
+| Shared lock（讀鎖） | ✅ 不阻塞 | ❌ 阻塞 |
+| Exclusive lock（寫鎖） | ❌ 阻塞 | ❌ 阻塞 |
+
+**一句話對比**：S2PL 用鎖防衝突——讀不阻塞讀，但**讀阻塞寫、寫阻塞讀寫** → 高並發場景下瓶頸明顯。SSI 用事後檢查防衝突——讀寫全部不阻塞 → 高並發友好，但可能 COMMIT 時 abort。
+
+### II. SSI（Serializable Snapshot Isolation）原理
 
 PostgreSQL 從 9.1 開始使用 **SSI（Serializable Snapshot Isolation）** 實現 Serializable，而非傳統的兩階段鎖定（2PL）或嚴格兩階段鎖定（S2PL）。
 
@@ -809,7 +1026,7 @@ flowchart TD
     style Abort fill:#e74c3c,color:#fff
 ```
 
-### II. SIREAD Lock — 讀操作的隱形鎖
+### III. SIREAD Lock — 讀操作的隱形鎖
 
 在 Serializable 級別下，每個 SELECT 都會隱式地獲取 **SIREAD lock**（讀取謂詞鎖）。它不像普通鎖那樣阻塞其他人，而是記錄「我讀了哪些資料」，用於後續的依賴偵測。
 
@@ -825,9 +1042,7 @@ SIREAD lock 的粒度不是 row-level，而是 **page-level**。這意味著：
 - 如果其他事務修改了這個 page 中的**任何行**（即使不是你讀的那一行），就可能觸發 rw-antidependency
 - 在高並發場景下，page-level granularity 可能導致 **false positive serialization failure**
 
-> 補充（Senior Dev）：page-level SIREAD lock 是 PostgreSQL SSI 的一個已知 trade-off。在某些場景下（例如多個不相關的 row 恰好在同一個 page 中），可能會導致不必要的 serialization failure。PG 9.2 引入了 `predicate_lock_consistency` 參數（PG 10 移除），並持續改進 false positive 率。但核心局限仍存在：SIREAD 是 page 級別，不是 row 級別。
-
-### III. Serialization Failure 的觸發條件
+### IV. Serialization Failure 的觸發條件
 
 SSI 會在你 COMMIT 時檢查依賴圖中是否存在**包含 rw-antidependency 的循環**。如果存在，PostgreSQL 會 abort 其中一個事務並回傳 error：
 
@@ -854,7 +1069,7 @@ flowchart TD
     style FAIL fill:#e74c3c,color:#fff
 ```
 
-### IV. 效能 Overhead 與 Production 取捨
+### V. 效能 Overhead 與 Production 取捨
 
 | 面向 | Read Committed | Repeatable Read | Serializable |
 |------|:---:|:---:|:---:|
@@ -878,578 +1093,9 @@ WHERE locktype = 'SIReadLock'
 GROUP BY mode;
 ```
 
-### V. 生產環境排查
-
-#### a. Serialization Failure Rate 監控
-
-Serializable 的核心代價是 **abort rate**。以下查詢計算當前資料庫的 rollback 比例，作為初始判斷：
-
-```sql
--- 監控 serialization failure rate（需配合應用層 retry 的次數一起看）
-SELECT datname, xact_commit, xact_rollback,
-       round(100.0 * xact_rollback / NULLIF(xact_commit + xact_rollback, 0), 2) AS rollback_pct
-FROM pg_stat_database
-WHERE datname = current_database();
-```
-
-**結果解讀**：
-- `rollback_pct`：所有 rollback（包含業務邏輯主動 ROLLBACK + serialization failure）佔總事務的比例
-- 此查詢**無法區分** serialization failure rollback 和業務主動 ROLLBACK，需要配合應用層 metric（retry counter）一起看
-- 🔴 **> 5%** 需要關注（前提是已排除業務大量主動 ROLLBACK 的場景）
-- 🔴 **> 10%** + `xact_commit` 不高 → Serializable 可能在 thundering herd retry 循環中
-
-> 補充（Senior Dev）：單靠 `pg_stat_database` 無法精確區分 rollback 原因。更精確的做法是在應用層記錄每次 retry 的次數和原因。Npgsql 會在 `PostgresException` 中給出 `SqlState = "40001"`（serialization_failure），可以針對此錯誤碼埋點統計。
-
-#### b. SIREAD Lock 分佈檢查
-
-```sql
--- 當前 SIREAD lock 分佈 —— 檢查是否升級到 relation-level（false positive 風險高）
-SELECT locktype, mode, relation::regclass AS table_name,
-       page, tuple, granted, count(*)
-FROM pg_locks
-WHERE locktype = 'SIReadLock'
-GROUP BY 1, 2, 3, 4, 5, 6
-ORDER BY count DESC;
-```
-
-**結果解讀**：
-- **page 不為 NULL** → 正常，粒度為 page-level（每個事務預設最多 64 個 page-level SIREAD lock）
-- **page 為 NULL 且 relation 不為 NULL** → SIREAD lock 已升級為 **relation-level**，意味著該事務讀取的行橫跨超過 64 個 page。Relation-level lock 會導致大量 false positive——只要有人修改同一張表的**任何行**就可能觸發 abort
-- 如果頻繁出現 relation-level SIREAD lock，考慮調高 `max_pred_locks_per_transaction`（從預設 64 調至 256 或更高）
-
-#### c. 從日誌找出被 Abort 的 Serializable 事務
-
-Serialization failure 的 error message 特徵關鍵字：
-
-```sql
--- 無法直接在 SQL 中查詢已發生的 serialization failure，但可以從 PG log 中搜尋
--- （以下為 grep pattern，非 SQL）
--- ERROR:  could not serialize access due to read/write dependencies among transactions
--- DETAIL:  Reason code: Canceled on identification as a pivot, during commit attempt.
--- HINT:  The transaction might succeed if retried.
-```
-
-若 PG 已啟用 `log_min_messages = warning` 且 `log_destination` 包含檔案，可在 log 中搜尋 `could not serialize access` 關鍵字，或用以下 SQL 檢查最近的 error log：
-
-```sql
--- PG 16+ 可用 pg_stat_activity 的 wait_event 相關欄位，但歷史 serialization failure 仍需從 log 分析
--- 此查詢只能看到「當前正在等待」的 session
-SELECT pid, usename, application_name,
-       wait_event_type, wait_event,
-       query, now() - query_start AS query_duration
-FROM pg_stat_activity
-WHERE state = 'active'
-  AND wait_event IS NOT NULL
-ORDER BY query_start;
-```
-
-> 補充（Senior Dev）：生產環境建議啟用 `auto_explain` 擴展並設定 `auto_explain.log_min_duration = 0` 加上 `auto_explain.log_level = 'NOTICE'`，配合 `log_lock_waits = on` 來捕捉鎖等待。Serialization failure 本身是 client-side error（SQLSTATE 40001），不會記錄在 `pg_stat_statements` 的 error count 中。
-
-#### d. Serializable Abort Rate 過高的排查路徑
-
-```mermaid
-flowchart TD
-    START["🚨 Serializable<br/>事務頻繁報錯：<br/>could not serialize access"]
-    START --> CHECK1{"rollback_pct<br/>> 5%？"}
-    CHECK1 -->|"否"| OK1["✅ 正常：偶發<br/>app 端 retry 即可"]
-    CHECK1 -->|"是"| CHECK2{"SIREAD lock<br/>大量為 relation-level？"}
-    CHECK2 -->|"是"| SOLUTION1["✅ 調高<br/>max_pred_locks_per_transaction<br/>從 64 調到 256"]
-    CHECK2 -->|"否"| CHECK3{"並發寫入熱點<br/>在同一 batch 中？"}
-    CHECK3 -->|"是"| SOLUTION2["✅ 重構業務邏輯：<br/>用排隊或分片<br/>減少對同一 page 的競爭"]
-    CHECK3 -->|"否"| CHECK4{"retry 次數<br/>是否過高（> 3 次）？"}
-    CHECK4 -->|"是"| SOLUTION3["✅ 減少事務粒度：<br/>把大事務拆成小事務<br/>或降低隔離級別"]
-    CHECK4 -->|"否"| CHECK5{"真的需要<br/>Serializable？"}
-    CHECK5 -->|"否"| SOLUTION4["✅ 降級為 RR +<br/>FOR UPDATE 鎖"]
-    CHECK5 -->|"是"| ACCEPT["⚠️ 接受高 abort rate<br/>確保應用層有 retry<br/>並監控 P99 latency"]
-
-    style START fill:#e74c3c,color:#fff
-    style SOLUTION1 fill:#2ecc71,color:#fff
-    style SOLUTION2 fill:#2ecc71,color:#fff
-    style SOLUTION3 fill:#2ecc71,color:#fff
-    style SOLUTION4 fill:#2ecc71,color:#fff
-    style ACCEPT fill:#ffd43b
-    style OK1 fill:#2ecc71,color:#fff
-```
-
-#### e. 生產症狀：高並發下的典型失敗模式
-
-| 症狀 | 現象 | 根因 |
-|------|------|------|
-| **Thundering herd retry** | Abort → 全部重試 → 再次搶同一資源 → 再次 abort，循環 | 多個事務競爭同一 page 上的不同 row，page-level SIREAD 導致 false positive |
-| **Retry amplification** | 1 個請求 abort 後重試 3 次，每次都觸發新的事務依賴 | 每次重試是一個新 snapshot，和其他重試的事務形成新的依賴循環 |
-| **長事務拖累** | 一個長時間的 Serializable 事務導致大量並行事務 abort | 長時間持有 SIREAD lock，大量後續寫入與之形成 rw-antidependency |
-| **Commits 減少但 rollback 暴增** | 系統吞吐量急劇下降 | Serializable 的事務在 COMMIT 階段才檢查——前面所有工作白做 |
-
-> 補充（Senior Dev）：在決定使用 Serializable 前，問自己三個問題：(1) 這真的是 Write Skew 場景嗎？ (2) 能用 `FOR UPDATE` 替代嗎？ (3) Abort rate 在可接受範圍內（< 2%）嗎？大多數「我以為需要 Serializable」的場景，其實用 RR + 精確的 row lock 就能解決，且沒有 retry overhead。
-
 ---
 
-## 6. 隔離級別如何影響 VACUUM
-
-### I. OldestXmin 的計算
-
-VACUUM 只能清理「所有活躍事務都不再需要看到」的 dead tuple。這個邊界值就是 **OldestXmin**——資料庫中所有活躍事務的 snapshot.xmin 的最小值。
-
-```
-OldestXmin = MIN(所有活躍事務的 backend_xmin)
-```
-
-一個 dead tuple 的 `xmax < OldestXmin` 才能被 VACUUM 回收。
-
-### II. Repeatable Read 對 VACUUM 的殺傷力
-
-```mermaid
-flowchart TD
-    subgraph Problem["生產環境常見災難"]
-        APP["Application<br/>BEGIN ISOLATION LEVEL RR<br/>SELECT ...<br/>然後卡住了（忘了 COMMIT）"]
-        APP --> OLD_XMIN["OldestXmin = 這個事務的 xmin<br/>（可能是 1 小時前的值）"]
-        OLD_XMIN --> VAC["VACUUM 無法清理<br/>任何 xmax >= OldestXmin 的 dead tuple"]
-        VAC --> BLOAT["📈 表膨脹（Bloat）<br/>dead tuple 堆積<br/>查詢效能持續下降"]
-    end
-
-    style APP fill:#e74c3c,color:#fff
-    style BLOAT fill:#e74c3c,color:#fff
-```
-
-**為什麼 RR 特別危險？** Read Committed 的事務每次 statement 會更新 snapshot，但後續的 statement 可能拿到更新的 snapshot（xmin 前進）。而 RR 從頭到尾持著最老的 snapshot，**OldestXmin 永遠不會前進**。
-
-```sql
--- 找出正在阻止 VACUUM 的事務（通常是 RR 或 idle-in-transaction）
-SELECT pid, datname, usename, application_name,
-       state, backend_xmin,
-       age(backend_xmin) AS xmin_age,
-       now() - xact_start AS xact_duration,
-       LEFT(query, 200) AS last_query
-FROM pg_stat_activity
-WHERE backend_xmin IS NOT NULL
-  AND state = 'idle in transaction'
-ORDER BY age(backend_xmin) DESC;
-```
-
-- `age(backend_xmin)` = 這個 transaction 的 snapshot 年資（以 transaction 數計算）
-- 如果超過數百萬（大量寫入後），大量 dead tuple 被這個 snapshot 保護，無法回收
-
-**Bloat 可視化查詢** —— 看看哪張表受影響最嚴重：
-
-```sql
--- 即用查詢：各表的 dead tuple 堆積情況
-SELECT schemaname, relname, n_live_tup, n_dead_tup,
-       round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct,
-       n_tup_del, n_tup_upd, last_autovacuum, last_autoanalyze
-FROM pg_stat_user_tables
-WHERE n_dead_tup > 0
-ORDER BY n_dead_tup DESC
-LIMIT 20;
-```
-
-**結果解讀**：
-- **n_live_tup**：表中的 live tuple 估算數量
-- **n_dead_tup**：表中的 dead tuple 估算數量（被 UPDATE/DELETE 產生的舊版本）
-- **dead_pct**：dead tuple 佔總 tuple 的百分比。🔴 **> 20%** 建議手動 VACUUM；**> 50%** 表示 autovacuum 可能已停擺
-- **n_tup_del / n_tup_upd**：自上次統計重置以來的刪除/更新次數——配合 dead_pct 判斷是「累積很久」還是「最近大量寫入」
-- **last_autovacuum**：如果為 NULL 或時間很久遠，表示 autovacuum 從未執行或被阻塞
-
-**Autovacuum 阻塞檢查** —— 確認 autovacuum 是否在運行：
-
-```sql
--- 即用查詢：檢查 autovacuum 是否正在執行或被阻塞
-SELECT pid, query, now() - query_start AS duration,
-       state, wait_event_type, wait_event
-FROM pg_stat_activity
-WHERE query LIKE '%autovacuum%'
-  AND state = 'active';
-```
-
-**結果解讀**：
-- 如果回傳 0 行 → autovacuum 可能被長時間未關閉的事務阻塞（autovacuum 也受限於 OldestXmin）
-- 如果有行但 `wait_event = 'LWLock'` → autovacuum worker 本身在等待鎖，通常是被另一個 VACUUM 或 ANALYZE 阻塞
-- `duration` 很長（> 30 分鐘）且處理大表 → 正常；`duration` 很短（< 10 秒）且頻繁出現 → autovacuum 在不斷被 cancel（可能因 `lock_timeout`）
-
-> 補充（Senior Dev）：生產環境中，**長時間的 Repeatable Read transaction 是 Bloat 的第一大元兇**，排名比大規模 DELETE 更高。一個忘了關閉的 RR transaction 可以讓你一個週末回來發現表膨脹了 3 倍。解法：
-> - `idle_in_transaction_session_timeout = '5min'`（PG 10+，直接 kill）
-> - `old_snapshot_threshold = '1h'`（PG 9.6+，強制 snapshot 過期，但查詢可能報 "snapshot too old" error）
-> - 盡量用 Read Committed，只在需要一致性快照的場景才用 RR
-
----
-
-# 二、生產環境場景
-
-## 1. 場景：Read Committed 下的轉帳 Phantom
-
-### I. 原理重現
-
-```sql
--- 準備
-CREATE TABLE accounts (id INT PRIMARY KEY, balance INT);
-INSERT INTO accounts VALUES (1, 1000), (2, 1000);
-
--- Session A (Read Committed) — 轉帳驗證
-BEGIN;
-SELECT SUM(balance) FROM accounts;           -- 返回 2000
-SELECT balance FROM accounts WHERE id = 1;    -- 返回 1000
--- 準備扣款...但 Session B 在這個時候插入了
-
--- Session B (同時)
-UPDATE accounts SET balance = 500 WHERE id = 1;
-COMMIT;
-
--- Session A (繼續)
-SELECT balance FROM accounts WHERE id = 2;    -- 返回 1000
-SELECT SUM(balance) FROM accounts;           -- 返回 1500 ← 總額變了！
--- 基於「總額 2000」做的後續判斷全部失效
-COMMIT;
-```
-
-### II. 解法矩陣
-
-| 解法 | 適用場景 | 限制 |
-|------|---------|------|
-| `SELECT ... FOR UPDATE` | 需要鎖定特定行進行後續修改 | 僅鎖定被 SELECT 的行，不鎖定新插入的行 |
-| 改用 Repeatable Read | 需要多個 SELECT 之間的一致性快照 | 長時間事務會卡 VACUUM |
-| Serializable | 最嚴格的一致性要求 | 需要 retry logic |
-| 應用層重試 | 所有場景 | 增加開發複雜度 |
-
-### III. 生產環境排查與事後偵測
-
-#### a. 事後偵測：從審計表發現 Phantom Read 痕跡
-
-如果 `accounts` 表有審計欄位（`updated_at`、`audit_log`），可以在事後搜尋疑似 Phantom Read 的異常模式：
-
-```sql
--- 搜尋短時間內對同一帳戶出現「不一致讀取」的嫌疑交易
--- 條件：同一個 transaction 範圍內，SUM(balance) 兩次取值不同
--- 需要審計表記錄每次 SELECT 的時間點
-
--- 方法 A：檢查是否有 concurrent write 與 SELECT 時間重疊
-WITH suspicious_writes AS (
-    SELECT id, balance, updated_at,
-           lag(updated_at) OVER (PARTITION BY id ORDER BY updated_at) AS prev_updated
-    FROM accounts_audit_log
-    WHERE action = 'UPDATE'
-)
-SELECT id, updated_at, prev_updated,
-       updated_at - prev_updated AS gap,
-       CASE WHEN updated_at - prev_updated < interval '1 second'
-            THEN '⚠️ 疑似 Phantom Read 視窗' END AS risk
-FROM suspicious_writes
-WHERE updated_at - prev_updated < interval '1 second'
-ORDER BY gap;
-
--- 方法 B：計算總額快照一致性（需在應用層記錄每次總額校驗的時間點）
-SELECT recorded_at,
-       recorded_sum,
-       (SELECT SUM(balance) FROM accounts WHERE updated_at <= a.recorded_at) AS actual_at_time,
-       recorded_sum - (SELECT SUM(balance) FROM accounts WHERE updated_at <= a.recorded_at) AS drift
-FROM account_snapshot_log a
-WHERE recorded_at > now() - interval '1 day'
-  AND abs(recorded_sum - (SELECT SUM(balance) FROM accounts WHERE updated_at <= a.recorded_at)) > 0;
-```
-
-**結果解讀**：
-- `gap < 1 second` 表示有兩筆 UPDATE 幾乎同時發生，可能在另一個 session 的兩個 SELECT 之間
-- `drift <> 0` 表示應用層記錄的總額與資料庫實際值不同，很可能發生過 Phantom Read
-
-#### b. 即時排查：找出正在對同一表進行 Concurrent Write 的 Session
-
-```sql
--- 誰正在跟我競爭同一張表？
-SELECT pid, usename, application_name, state,
-       wait_event_type, wait_event,
-       now() - xact_start AS xact_duration,
-       now() - query_start AS query_duration,
-       LEFT(query, 200) AS query
-FROM pg_stat_activity
-WHERE state = 'active'
-  AND query NOT LIKE '%pg_stat_activity%'
-  AND pid <> pg_backend_pid()
-ORDER BY xact_start;
-```
-
-**結果解讀**：
-
-| Column | 正常時 | 異常時（紅旗） |
-|--------|--------|----------------|
-| `xact_duration` | < 1 秒 | > 30 秒 → 可能有人忘了 COMMIT |
-| `query_duration` | < 100ms | > 5 秒 → 查詢卡住 |
-| `wait_event_type = 'Lock'` | 無 | 出現 → 有人持有鎖 |
-| `query 中含 UPDATE/DELETE` | 短時間 | 長時間執行 → 可能造成 Phantom Read 視窗 |
-
-#### c. 排查 Mermaid 流程圖
-
-```mermaid
-flowchart TD
-    START["🚨 發現總額不一致<br/>或交易重複"] --> CHECK_LOG{"是否有 audit log<br/>或 timestamp 欄位？"}
-    CHECK_LOG -->|"有"| AUDIT["執行事後偵測查詢<br/>搜尋 concurrent write 重疊"]
-    CHECK_LOG -->|"沒有"| LIVE["只能排查當下狀態"]
-
-    AUDIT --> FIND{"找到時間重疊的<br/>concurrent write？"}
-    FIND -->|"是"| CONFIRM["✅ 確認 Phantom Read<br/>→ 改用 FOR UPDATE / RR"]
-    FIND -->|"否"| BUG["可能是 application bug<br/>→ 檢查程式邏輯"]
-
-    LIVE --> CHECK_ACTIVITY["執行 pg_stat_activity<br/>查看 active session"]
-    CHECK_ACTIVITY --> HAS_LONG{"有長時間 active<br/>的 UPDATE session？"}
-    HAS_LONG -->|"是"| KILL["考慮 kill session<br/>或等待 commit"]
-    HAS_LONG -->|"否"| PATTERN["查看 pg_stat_statements<br/>是否有異常 query pattern"]
-
-    style START fill:#e74c3c,color:#fff
-    style CONFIRM fill:#ffd43b
-    style BUG fill:#2ecc71,color:#fff
-```
-
-#### d. 生產症狀速查
-
-| 業務症狀 | 底層原因 | 優先查 |
-|----------|---------|--------|
-| 退款重複（同一筆交易退款兩次） | SELECT 確認金額 → 另一筆退款 UPDATE BETWEEN → 再次 SELECT 仍有錢 | `## 1` 場景 |
-| 庫存總數與明細加總不符 | SUM() 在 transaction 內被其他 session 的 INSERT 改變 | `## 1` 場景 |
-| 報表數字每次刷新都不同 | Auto-commit 模式，每條 SELECT 拿到不同 snapshot | `## 1` + Npgsql connection pool |
-| 用戶看到餘額跳動 | 同一頁面多條 AJAX 各自獨立 SELECT | Read Committed 預設行為 |
-
-> 補充（Senior Dev）：Phantom Read 是 RC 的設計行為，不是 bug。如果業務邏輯依賴「兩個 SELECT 之間資料不變」，卻使用了 RC，這是應用層設計缺陷。最簡單的解法是在關鍵 SELECT 後加 `FOR UPDATE`（即使不打算 update），利用 row lock 阻止 concurrent write；或用 RR 取得 stable snapshot。要注意 `FOR UPDATE` 會阻塞其他 writer，在高並發場景需評估效能影響。
-
-## 2. 場景：Repeatable Read 導致 VACUUM 積壓
-
-### I. 原理
-
-前面 6.II 已經說明了 OldestXmin 的影響。這是生產環境最常見的 Bloat 成因——比大規模 DELETE 更難排查，因為**表面上看起來沒有問題**：查詢正常、沒有 error、沒有 lock wait，但表的大小在偷偷增長。
-
-### II. 即用查詢
-
-```sql
--- 找出每個 database 中最老的 xmin（決定 VACUUM 能回收多老的 dead tuple）
-SELECT datname,
-       age(datfrozenxid) AS frozen_xid_age,
-       datfrozenxid,
-       (SELECT age(backend_xmin) FROM pg_stat_activity
-        WHERE datname = d.datname AND backend_xmin IS NOT NULL
-        ORDER BY age(backend_xmin) DESC LIMIT 1) AS oldest_active_xmin
-FROM pg_database d
-WHERE datname = current_database();
-```
-
-### III. 應急解法
-
-| 優先級 | 行動 |
-|--------|------|
-| 1 | 找出 RR idle-in-transaction session → kill |
-| 2 | `SET idle_in_transaction_session_timeout = '5min'` |
-| 3 | 改用 Read Committed（90% 場景不需要 RR） |
-| 4 | 手動 `VACUUM FREEZE` 標記老 tuple 為 frozen（繞過 xmin 限制） |
-
-### IV. 持續監控
-
-#### a. Bloat 估算查詢（依賴 pg_stat_user_tables，無需 extension）
-
-```sql
--- 計算每個表的 dead tuple 佔比（不需要 pgstattuple extension）
-SELECT schemaname, relname,
-       n_live_tup, n_dead_tup,
-       round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct,
-       pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
-       last_vacuum, last_autovacuum,
-       now() - last_autovacuum AS since_last_autovac
-FROM pg_stat_user_tables
-WHERE n_dead_tup > 1000
-ORDER BY dead_pct DESC
-LIMIT 20;
-```
-
-**結果解讀**：
-
-| Column | 意義 | 解讀 |
-|--------|------|------|
-| `n_dead_tup` | 已標記刪除但尚未被 VACUUM 回收的 row 數量 | > 10 萬 → 嚴重積壓 |
-| `dead_pct` | dead tuple 佔總 tuple 比例 | 見下方閾值表 |
-| `since_last_autovac` | 距離上次 autovacuum 的時間 | > 1 小時且 dead_pct > 20% → autovacuum 被阻塞 |
-| `last_autovacuum IS NULL` | 從未被 autovacuum | 表太小未達閾值，或 autovacuum 被關閉 |
-
-#### b. 警戒閾值與建議動作
-
-| dead_pct | 等級 | 症狀 | 建議動作 |
-|----------|------|------|---------|
-| < 5% | 🟢 正常 | 無 | 不需處理 |
-| 5% – 10% | 🟡 觀察 | 查詢效能微幅下降 | 確認 vacuum frequency，檢查是否有長事務 |
-| 10% – 20% | 🟠 分析根因 | Seq Scan 開始變慢、Index Scan 掃到 dead tuple 增加 | 找出 oldest xmin 持有者（`backend_xmin` 最老的 session） |
-| 20% – 50% | 🔴 手動介入 | 表掃描時間明顯增加、disk 使用率上升 | `VACUUM (VERBOSE)` 手動清理，必要時 kill 長事務 |
-| > 50% | 💀 危急 | 查詢可能 timeout、disk 接近滿載 | 立即 kill 最老的 `idle in transaction` session，手動 `VACUUM FULL`（需停機） |
-
-#### c. 生產症狀列舉
-
-| 應用層症狀 | PG 層原因 | 優先查看 |
-|-----------|----------|---------|
-| 某張表的 SELECT 越來越慢，但 EXPLAIN 沒變 | dead tuple 暴增，Index/Seq Scan 掃到大量垃圾行 | `dead_pct` > 20% |
-| `pg_stat_user_tables.seq_scan` 的累積時間持續增加 | 同上（Seq Scan 最直接受 bloat 影響） | `pg_stat_user_tables` |
-| Disk 使用率上升但 `INSERT/UPDATE` 量沒變 | dead tuple 佔據物理空間不被回收 | `pg_total_relation_size` vs 預期大小 |
-| Autovacuum log 中頻繁出現 `skipped: old xmin` | 有長事務（通常是 RR idle-in-transaction）鎖住 OldestXmin | `## 2` 場景 + 執行 `backend_xmin` 查詢 |
-| 定時 batch job 執行時間逐步拉長 | Bloat 累積效應，查詢成本隨 dead tuple 線性增長 | 設定 autovacuum cost limit 或排程 manual vacuum |
-
-> 補充（Senior Dev）：`pg_stat_user_tables.n_dead_tup` 是估算值，由最後一次 ANALYZE 或 VACUUM 得出。如果很久沒做 ANALYZE，這個數字可能不準確。需要精確值時可以用 `pgstattuple` extension 的 `pgstattuple('table_name')` 函數，但該函數會做全表掃描，在生產環境大表上謹慎使用。
-
-#### d. 自動化告警建議
-
-| Metric | 告警閾值 | 工具 | 說明 |
-|--------|---------|------|------|
-| `pg_stat_user_tables.n_dead_tup / (n_live_tup + n_dead_tup)` | > 20% | Prometheus `postgres_exporter` / pgwatch2 | Bloat 比例過高 |
-| `age(backend_xmin)` | > 5 分鐘 | pgwatch2 / 自訂 cron job | 有長事務卡 VACUUM |
-| `pg_database.age(datfrozenxid)` | > 2 億 | Prometheus `postgres_exporter` | 接近 wraparound 風險 |
-| `idle in transaction` session count | > 5 | 自訂監控查詢 | 有人忘了 COMMIT/ROLLBACK |
-| `pg_stat_user_tables.last_autovacuum` > 1 小時 | 警告 | pgwatch2 內建 | Autovacuum 可能被阻塞或太慢 |
-
-> 補充（Senior Dev）：pgwatch2 內建了多數 PG 監控 metric，包括 dead tuple 比例、xmin age、idle in transaction 數量。如果團隊已有 Prometheus + Grafana stack，`postgres_exporter` 的 `pg_stat_user_tables` metric 可直接對應上述查詢。自訂 cron job 也是輕量替代方案——每 5 分鐘跑一次 bloat 查詢，超過閾值就送 Slack/Telegram 通知。
-
-## 3. 場景：Serializable Write Skew — 實際案例
-
-```sql
--- 值班醫生表
-CREATE TABLE doctors (id INT PRIMARY KEY, on_call BOOLEAN);
-INSERT INTO doctors VALUES (1, true), (2, true);
-
--- Session A (Serializable)
-BEGIN ISOLATION LEVEL SERIALIZABLE;
-SELECT COUNT(*) FROM doctors WHERE on_call;  -- 2
-UPDATE doctors SET on_call = false WHERE id = 1;
-
--- Session B (Serializable，同時）
-BEGIN ISOLATION LEVEL SERIALIZABLE;
-SELECT COUNT(*) FROM doctors WHERE on_call;  -- 2
-UPDATE doctors SET on_call = false WHERE id = 2;
-
--- Session A COMMIT → 成功
--- Session B COMMIT → ❌ ERROR: could not serialize access
-```
-
-SSI 偵測到了 rw-antidependency 循環（A 讀了 B 後來寫的 row，B 讀了 A 後來寫的 row），abort 了 B。
-
-### III. App Dev Retry Pattern
-
-```csharp
-// See Section 三 for full retry pattern
-```
-
-### IV. 生產環境監控
-
-#### a. 監控 Dashboard 指標
-
-| Metric | 資料來源 | 正常值 | 告警閾值 | 說明 |
-|--------|---------|--------|---------|------|
-| Serialization failure rate | App log 統計 `40001` error | < 0.1% | > 1% | 超過 1% 表示衝突頻繁，retry overhead 過大 |
-| Serialization failure rate（危急） | App log 統計 `40001` error | < 0.1% | > 5% | **立即行動**：考慮降級或重新設計資料模型 |
-| `pg_stat_database.xact_rollback / xact_commit` | PG stats | < 1% | > 5% | Rollback 比率高，但不一定全是 serialization failure |
-| SIREAD lock count | `pg_locks` | 0–100 | > 10,000 | SIREAD lock 總數過多，記憶體壓力增加 |
-| SIREAD lock 升級為 relation-level | `pg_locks WHERE locktype='SIReadLock' AND page IS NULL AND tuple IS NULL` | 0 | > 0 | 升級為 relation-level 表示 page-level 衝突過多，false positive 大增 |
-| `pg_stat_database.conflicts` | PG stats | 0 | > 0 | 只有 standby 有值（recovery conflict），primary 上恆為 0 |
-| Avg transaction duration (Serializable) | App log 或 pg_stat_statements | < 100ms | > 1 秒 | **Serializable 的衝突機率與 transaction 時長成正比** |
-
-> 補充（Senior Dev）：Serialization failure rate 的最大敵人不是並發量，而是 **transaction 時長**。外部 API call、user think time、大資料量處理在 Serializable transaction 內都是地雷。如果你非得用 Serializable，確保 transaction 內只有「資料庫操作」，其他 I/O 全部放在 transaction 外。
-
-#### b. 高衝突率診斷路徑
-
-```mermaid
-flowchart TD
-    START["🚨 Serialization failure<br/>rate > 5%"] --> Q1{"平均 transaction<br/>時長多長？"}
-    Q1 -->|"< 100ms"| Q2["檢查 SIREAD lock<br/>是否升級為 relation-level"]
-    Q1 -->|"> 1 秒"| LONG["🔴 先縮短 transaction<br/>把外部 I/O 移出去"]
-
-    Q2 --> REL_LOCK{"有 relation-level<br/>SIREAD lock？"}
-    REL_LOCK -->|"是"| HOTSPOT["🟠 熱點衝突<br/>→ 檢查 page-level lock<br/>是否集中在特定 pages"]
-    REL_LOCK -->|"否"| PAGE_CHECK["檢查 page-level<br/>SIREAD lock 分佈"]
-
-    HOTSPOT --> SOLUTION1["解法：<br/>• SELECT FOR UPDATE 鎖定行<br/>• 細化資料模型減少重疊<br/>• 改 Read Committed + 樂觀鎖"]
-
-    PAGE_CHECK --> CONCENTRATED{"page 衝突集中<br/>在同一批 pages？"}
-    CONCENTRATED -->|"是"| SOLUTION2["解法：<br/>• 分散寫入目標（例如<br/>  用 hash partition）<br/>• 減少同 page 的並發 UPDATE"]
-    CONCENTRATED -->|"否（分散）"| RETRY_CHECK["可能是合理的高並發<br/>→ 增加 retry delay<br/>或降級到 RR + 業務補償"]
-
-    LONG --> LONG_CHECK{"長事務原因？"}
-    LONG_CHECK -->|"外部 API call"| FIX1["重構：API call 移出<br/>transaction 外"]
-    LONG_CHECK -->|"大量資料處理"| FIX2["考慮 batch 分批<br/>或 cursor-based 處理"]
-    LONG_CHECK -->|"user think time"| FIX3["不要在有使用者互動<br/>的流程中使用 Serializable"]
-
-    style START fill:#e74c3c,color:#fff
-    style LONG fill:#e74c3c,color:#fff
-    style HOTSPOT fill:#ffd43b
-    style SOLUTION1 fill:#2ecc71,color:#fff
-    style SOLUTION2 fill:#2ecc71,color:#fff
-```
-
-#### c. 即用查詢：檢查 SIREAD Lock 衝突情況
-
-```sql
--- 檢查 page-level SIREAD lock 分佈
-SELECT locktype, mode,
-       page, tuple,
-       count(*) AS lock_count
-FROM pg_locks
-WHERE locktype = 'SIReadLock'
-GROUP BY 1, 2, 3, 4
-ORDER BY count(*) DESC
-LIMIT 20;
-```
-
-**結果解讀**：
-
-| 情況 | 看到什麼 | 含義 |
-|------|---------|------|
-| SIREAD lock 集中某幾個 page | `page` 欄位重複出現，`lock_count` > 100 | 熱點衝突，多個 transaction 讀寫同一批 page |
-| SIREAD lock 出現 `page IS NULL` | relation-level lock | 記憶體中的 page-level lock 過多，PG 自動升級為 relation-level（false positive 大增） |
-| SIREAD lock 總數 | `SELECT count(*) FROM pg_locks WHERE locktype='SIReadLock'` | > 10,000 表示系統中有大量 Serializable transaction 同時執行 |
-
-```sql
--- 誰持有的 SIREAD lock 最多？
-SELECT p.pid, p.usename, p.application_name,
-       p.state,
-       age(now(), p.xact_start) AS xact_age,
-       count(l.pid) AS siread_locks
-FROM pg_locks l
-JOIN pg_stat_activity p ON l.pid = p.pid
-WHERE l.locktype = 'SIReadLock'
-GROUP BY p.pid, p.usename, p.application_name, p.state, p.xact_start
-ORDER BY siread_locks DESC
-LIMIT 10;
-```
-
-#### d. App Dev 視角：為什麼盲目增加 Retry 次數是錯的
-
-當 serialization failure rate 高時，直覺反應是「retry 更多次」。但這會導致 **Thundering Herd 效應**：
-
-```mermaid
-sequenceDiagram
-    participant T1 as Tx A (retry 1)
-    participant T2 as Tx B (retry 1)
-    participant T3 as Tx A (retry 2)
-    participant T4 as Tx B (retry 2)
-    participant PG as PostgreSQL
-
-    Note over T1,T2: Wave 1: 2 tx 同時開始
-    T1->>PG: BEGIN Serializable
-    T2->>PG: BEGIN Serializable
-    T1->>PG: COMMIT (成功)
-    T2->>PG: COMMIT (40001, abort)
-    Note over T2: 等待 100ms 後 retry
-
-    Note over T3,T4: Wave 2: retry 與新 tx 疊加
-    T2->>PG: BEGIN Serializable (retry)
-    T3->>PG: BEGIN Serializable (新請求)
-    Note over T2,T3: 3 個 tx 競爭，衝突更高
-    T3->>PG: COMMIT (成功)
-    T2->>PG: COMMIT (40001, abort again)
-    T4->>PG: COMMIT (40001, abort)
-    Note over T2,T4: retry delay 100ms 不夠分散
-```
-
-**問題本質**：如果你有 N 個請求/sec、retry 3 次，最差情況下實際的並發量會是 N × 3。retry 越多，雪球越大。
-
-**正確策略**：
-
-| 情況 | 策略 | 原因 |
-|------|------|------|
-| Abort rate < 1% | Retry 3 次，exponential backoff | 正常設計行為 |
-| Abort rate 1%–5% | Retry 3 次 + **增加 backoff 上限**（如 max 2 秒） | 讓 retry 分散到更大的時間窗口 |
-| Abort rate > 5% | **先降級**，不要盲目增加 retry 次數 | 降級到 `SELECT FOR UPDATE` + RC，或 RR + 業務補償 |
-
-> 補充（Senior Dev）：PG 的 SSI 在設計上就不是給「所有 transaction 都用 Serializable」的場景。它的假設是**只有少數關鍵 transaction 用 Serializable**。如果你的系統中 Serializable transaction 佔比超過 10%–20%，你需要重新審視為什麼需要 Serializable，而不是調 retry policy。
-
-## 4. 隔離級別選擇決策矩陣
+## 6. 隔離級別選擇決策矩陣
 
 ```mermaid
 flowchart TD
@@ -1574,7 +1220,7 @@ LIMIT 20;
 
 ---
 
-# 三、App Dev 視角：.NET / Dapper 實戰
+# 二、App Dev 視角：.NET / Dapper 實戰
 
 ## 1. Npgsql 中的 IsolationLevel 設定
 
@@ -1718,55 +1364,162 @@ flowchart LR
 
 - **Structured Logging 建議**：使用 Serilog / NLog 的 structured logging（`{PID}` 而非字串拼接），方便在 Grafana / ELK 中以 PID 為 key 跨系統查詢
 - 建議在 `conn.Open()` 後立刻記錄，確保每次建立實體連線都有 log
-- 使用 connection pool 時，`conn.ProcessID` 在 connection 歸還後可能被新的 backend 重用——查問題時要注意時間窗口對齊
+- **Connection Pool 下的 PID 重用陷阱**：Npgsql 的 connection pool 會重複使用同一個實體連線——Request A 用完歸還 pool，Request B 再從 pool 拿出**同一條實體連線**。這兩個請求看到的 `conn.ProcessID` 會是相同值，因為底層是同一個 PG backend：
 
-> 補充（Senior Dev）：Npgsql 6.0 前 `ProcessID` 屬性名為 `ConnectorID`（內部連線 ID，非 PG pid），6.0+ 才改名對應 PG 的 pid。如果還在用舊版，升級 Npgsql 是最佳解。
+```text
+時間 10:00:00  Request A → pool 取出 conn #1（BackendPID=12345）
+             App Log: "BackendPID=12345, RequestId=A"
+時間 10:00:01  Request A 完成，conn #1 歸還 pool
+時間 10:00:05  Request B → pool 取出 conn #1（還是 BackendPID=12345！）
+             App Log: "BackendPID=12345, RequestId=B"
+```
 
-#### c. Connection Pool 與 idle_in_transaction_session_timeout 的陷阱
+所以**不能只看 PID**，必須同時對齊時間戳——`pg_stat_activity` 中 PID=12345 在 10:00:00 的 query 屬於 Request A，但在 10:00:05 的 query 屬於 Request B。查問題時的正確做法是：從 app log 找到「出事的時間 + PID」，再到 `pg_stat_activity`（或 PG log）中以**時間窗口**對齊，而非只靠 PID。
 
-**為什麼發生**：
+#### c. NpgsqlDataSource Connection Pool 的陷阱
+
+Npgsql 7.0+ 推薦使用 `NpgsqlDataSource` 取代手動 `new NpgsqlConnection()`。DataSource 內建 connection pool，是單例（app 生命週期內只建立一次），每次 `CreateConnection()` 或 `OpenConnectionAsync()` 從 pool 中取連線：
+
+```csharp
+// Program.cs — 註冊一次，全 app 共用
+var dataSourceBuilder = new NpgsqlDataSourceBuilder(connectionString);
+dataSourceBuilder.ConnectionStringBuilder.ApplicationName = "MyApp-OrderService";
+dataSourceBuilder.ConnectionStringBuilder.MaxPoolSize = 100;
+dataSourceBuilder.ConnectionStringBuilder.MinPoolSize = 5;
+dataSourceBuilder.ConnectionStringBuilder.ConnectionIdleLifetime = 300;
+dataSourceBuilder.ConnectionStringBuilder.ConnectionPruningInterval = 10;
+await using var dataSource = dataSourceBuilder.Build();
+
+// DI 註冊
+builder.Services.AddNpgsqlDataSource(connectionString);
+
+// 使用——每次呼叫從 pool 取一條連線，用完自動歸還
+await using var conn = await dataSource.OpenConnectionAsync();
+// ... 執行 SQL ...
+// conn.DisposeAsync() 時歸還 pool（不是真正關閉）
+```
+
+**為什麼會發生 idle timeout 陷阱**：
 
 ```mermaid
 sequenceDiagram
-    participant App as 🖥️ App Instance（Pool）
+    participant Svc as 🖥️ App（DataSource Pool）
     participant PG as 🗄️ PostgreSQL
 
-    App->>PG: Connection 1（idle，放在 pool 中）
-    Note over PG: idle_in_transaction_session_timeout = 5min
-    PG-->>App: 5 分鐘後 PG kill Connection 1
-    Note over App: Pool 不知道 connection 已死
-    App->>PG: 從 pool 取出 Connection 1 執行 query
-    PG-->>App: ❌ "connection is closed" /<br/>"server closed the connection unexpectedly"
+    Note over Svc: Pool 中有 5 條 idle connection
+
+    rect rgb(255, 230, 200)
+        Note over PG: idle_in_transaction_session_timeout = 5min
+        PG-->>Svc: 5 分鐘後 PG kill 所有 idle connection
+    end
+
+    Note over Svc: DataSource pool 不知道連線已死<br/>（PG kill 時未發 TCP RST，不通知 client）
+
+    Svc->>PG: 取出 conn #3 執行 query
+    PG-->>Svc: ❌ NpgsqlException<br/>"server closed the connection unexpectedly"
 ```
 
-這是最常見的生產環境「偶發性連線錯誤」根因之一——PG kill 連線時 Npgsql pool 不會收到通知，直到下次使用才發現連線已斷。
+**流程說明**：
+1. App 請求結束後，`conn` 被 `Dispose` → 歸還 DataSource pool，實體 TCP 連線保持 open
+2. PG 端的 `idle_in_transaction_session_timeout` 倒數 5 分鐘 → kill 該 backend
+3. PG kill 時只關閉自己這邊的 socket，**不通知 client**（沒有發 TCP RST 去暴力中斷）
+4. DataSource pool 毫不知情，仍認為這條 conn 可用
+5. 下一個請求取出這條 conn → 寫入 query → PG 端早已不存在 → `NpgsqlException`
 
 **怎麼查**：
 
+> **注意**：被 PG kill 的連線會從 `pg_stat_activity` 消失，無法直接用 SQL 查到「已死但 pool 不知」的連線。以下查詢的用途是反推：檢查 idle 超過預期時間的連線數——如果 PG 設了 `idle_in_transaction_session_timeout = 5min`，這些連線理論上該被 kill 了卻還活著，表示 timeout 沒設或沒生效。另一個角度是：這些連線處於「隨時可能被 PG kill」的危險狀態，pool 若不及時回收，下一個請求就會踩雷。
+
 ```sql
--- 偵測已被 PG kill 但 pool 仍持有的 idle 連線數
--- 若 PG 有設 idle_in_transaction_session_timeout = 5min，這些很可能已斷
-SELECT count(*) AS suspected_dead_connections
+-- 找出 idle 超過 5 分鐘的連線（若 PG timeout=5min，這些要嘛沒被設、要嘛快被 kill 了）
+SELECT count(*) AS idle_over_5min,
+       array_agg(pid) AS pid_list
 FROM pg_stat_activity
 WHERE wait_event_type = 'Client'
   AND state = 'idle'
   AND age(now(), state_change) > interval '5 minutes';
 ```
 
-| Output Column | 解讀 |
-|---------------|------|
-| `suspected_dead_connections` | 超過 5 分鐘的 idle 連線數。數值持續 > 0 表示 pool 設定與 PG timeout 不匹配，app 下一次使用這些連線就會報錯 |
+**App 端偵測才是真正的告警**：因為 PG 端看不到已死的連線，必須從 app log 中搜尋 `server closed the connection unexpectedly` 或 `Exception while reading from stream`，這才是 pool 拿出死連線的證據。
 
 **怎麼解**：
 
-| 解法 | 適用場景 | 優缺點 |
-|------|---------|--------|
-| `ConnectionIdleLifetime` < PG timeout | 固定 pool 大小的 app | 簡單，Npgsql pool 會主動在期限內回收舊連線 |
-| Npgsql 6.0+ `KeepAlive` / `TcpKeepAlive` | 容器化 / K8s 環境 | TCP keepalive 可在 OS 層偵測斷線，比 application 層 timeout 更快發現 |
-| PG 端 `idle_session_timeout`（PG14+） | DBA 可控 | 僅限 PG14+；與 `idle_in_transaction_session_timeout` 不同，kill 的是非 in-transaction 的 idle 連線 |
-| 不用 pool，每次 new connection | 低並發 batch job | 最安全但 connection 建立 overhead 大（SSL handshake + authentication） |
+| 解法 | NpgsqlDataSource 設定 | 適用場景 |
+|------|----------------------|---------|
+| `ConnectionIdleLifetime` < PG timeout | `dataSourceBuilder.ConnectionStringBuilder.ConnectionIdleLifetime = 240`（小於 PG 端 300） | **首選**。Pool 會在連線存活 240 秒後主動關閉重建，永遠不會碰到 PG 端的 300 秒 timeout |
+| TCP KeepAlive | `dataSourceBuilder.ConnectionStringBuilder.KeepAlive = 30`（每 30 秒送 keepalive probe） | K8s / 容器環境，中間網路層（LB / Service Mesh）idle timeout 通常比 PG 更短 |
+| `ConnectionPruningInterval` | `dataSourceBuilder.ConnectionStringBuilder.ConnectionPruningInterval = 10` | 搭配 IdleLifetime 使用，pool 每 10 秒檢查一次是否有過期連線 |
+| PG 端 `idle_session_timeout`（PG14+） | 無需 app 端設定 | 只 kill 非 in-transaction 的 idle 連線，與 `idle_in_transaction_session_timeout` 不同 |
 
-#### d. 生產症狀對照表
+> 補充（Senior Dev）：Data Source 是 Npgsql 7.0 引入的推薦模式。它解決了舊 `NpgsqlConnection` 手動管理 pool 的幾個痛點：(1) 自動處理連線生命週期，不用擔心忘了 `Dispose`；(2) 內建 multiplexing（單一 TCP 連線多工多條 query）；(3) DI 友好，`AddNpgsqlDataSource()` 一行註冊。如果你還在用 `new NpgsqlConnection()` + 手動 `Open()`/`Close()`，強烈建議遷移。
+
+#### d. 生產環境常見問題：Pool 耗盡（"pool has been exhausted"）
+
+**症狀**：App 拋出 `TimeoutException`，訊息包含 `The connection pool has been exhausted`。所有依賴 DB 的 API 全掛。
+
+**為什麼發生**：Npgsql DataSource pool 的大小是固定的（預設 `MaxPoolSize = 100`）。當所有 100 條連線都在使用中，第 101 個請求就會排隊等待，超過 timeout 後報錯。
+
+```mermaid
+flowchart TD
+    START["🚨 Pool Has Been Exhausted"] --> Q1{"最近有大量<br/>long-running query？"}
+    Q1 -->|"是"| CASE1["🟡 場景 A：慢查詢佔用連線<br/>每條 query 跑 10 秒<br/>100 connections = 10 QPS 上限"]
+    Q1 -->|"否"| Q2{"pg_stat_activity 中大量<br/>idle in transaction？"}
+    Q2 -->|"是"| CASE2["🔴 場景 B：有人忘了 COMMIT<br/>連線被佔著不做事也不釋放<br/>（idle in transaction）"]
+    Q2 -->|"否"| Q3{"突然的流量尖峰？"}
+    Q3 -->|"是"| CASE3["🟠 場景 C：流量超出 pool 容量<br/>短時間內請求暴增"]
+    Q3 -->|"否"| CASE4["⚠️ 場景 D：Connection Leak<br/>conn 沒被 Dispose<br/>連線不歸還 pool"]
+
+    CASE1 --> SOL1["✅ 優化慢查詢 / 加 statement_timeout<br/>暫時調高 MaxPoolSize 止血"]
+    CASE2 --> SOL2["✅ Kill idle in transaction session<br/>設定 idle_in_transaction_session_timeout"]
+    CASE3 --> SOL3["✅ 調高 MaxPoolSize<br/>或加 PgBouncer 做連線排隊"]
+    CASE4 --> SOL4["✅ 檢查 code：確保 using / await using<br/>每個 conn 都有 Dispose"]
+
+    style START fill:#e74c3c,color:#fff
+    style CASE2 fill:#e74c3c,color:#fff
+```
+
+**30 秒診斷查詢**：
+
+```sql
+-- 第 1 條：現在誰佔著連線？
+SELECT state, count(*) AS conn_count
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+  AND application_name LIKE '%YourApp%'   -- ← 換成你的 ApplicationName
+GROUP BY state
+ORDER BY count DESC;
+
+-- 正常時：active < 20%, idle > 80%
+-- 🔴 idle in transaction > 0 就要注意（有人忘了 COMMIT）
+-- 🔴 active 接近 MaxPoolSize → pool 快耗盡
+```
+
+```sql
+-- 第 2 條：哪條 SQL 佔連線最久？
+SELECT pid, usename, state,
+       now() - query_start AS query_duration,
+       now() - xact_start AS xact_duration,
+       LEFT(query, 150) AS query
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+  AND application_name LIKE '%YourApp%'
+  AND state <> 'idle'
+ORDER BY query_start;
+-- 紅旗：query_duration > 5s 的 SQL = 慢查詢，佔住連線不釋放
+```
+
+**解法矩陣**：
+
+| 場景 | 止血（立刻） | 根治（長期） |
+|------|------------|------------|
+| A. 慢查詢 | 調高 `MaxPoolSize` 到 200 | `statement_timeout = 30s`；優化 query；加 index |
+| B. 忘了 COMMIT | `SELECT pg_terminate_backend(pid)` kill 掉 | `idle_in_transaction_session_timeout = 5min` |
+| C. 流量尖峰 | 調高 `MaxPoolSize`；加 PgBouncer | 擴容 / 限流 / 訊息佇列削峰 |
+| D. Connection Leak | 重啟 app（連線全部釋放） | 檢查所有 `NpgsqlConnection` 是否都有 `await using` |
+
+> **MaxPoolSize 不是越大越好**：每個 PG backend 佔 5-10MB memory。1000 個 connection = 5-10GB 記憶體只用在連線上。超過 200 建議導入 PgBouncer（transaction mode），把 app 端物理連線控制在 100 以下。
+
+#### e. 生產症狀對照表
 
 以下表格幫助 App Dev 從自己看到的異常，快速定位 PG 層根因與應讀章節：
 
@@ -1925,29 +1678,7 @@ var retryPolicy = Policy
 
 > 補充（Senior Dev）：`Random.Shared` 是 .NET 6+ 的 thread-safe 隨機數產生器，適合在 Polly 的 `sleepDurationProvider` 中使用（該 delegate 可能被多個 thread 同時呼叫）。如果使用 Polly v8+，`WaitAndRetry` API 略有不同（改為 `WaitAndRetryAsync` + `RetryStrategyBuilder`），上述範例以 Polly v7 為準，升級時要注意 migration。
 
-#### c. 即用查詢：從 PG 端監控 Serialization Failure 趨勢
-
-```sql
--- 查看各資料庫的 rollback 比例（包含所有類型的 rollback）
-SELECT datname,
-       xact_commit, xact_rollback,
-       round(100.0 * xact_rollback / NULLIF(xact_commit + xact_rollback, 0), 2) AS rollback_pct,
-       stats_reset
-FROM pg_stat_database
-ORDER BY rollback_pct DESC;
-```
-
-| Output Column | 解讀 |
-|---------------|------|
-| `datname` | 資料庫名稱 |
-| `xact_commit` | 自 stats_reset 以來的 commit 總數 |
-| `xact_rollback` | 自 stats_reset 以來的 rollback 總數（**包含所有類型**：業務 rollback + serialization failure + deadlock + statement error 觸發的 implicit rollback） |
-| `rollback_pct` | rollback 比例。正常應 < 1%，若 > 5% 需立刻調查 |
-| `stats_reset` | 統計歸零時間。若與近期變動（上版、DB 重啟）吻合，資料代表性可能不足 |
-
-> 補充（Senior Dev）：`xact_rollback` 是一個籠統的數字，**無法單獨區分 serialization failure**。要精確統計 40001，需要搭配 app 端 metrics（上述 `db_serialization_retry_exhausted`）或啟用 PG 17+ 的 `pg_stat_session` 進行 per-session 追蹤。實務上，將 app metrics + DB stats 疊在一起看才能完整判斷：`rollback_pct` 突然飆高 + app 端 `retry_exhausted` 沒變 → 可能是業務 bug（不該 rollback 的地方 rollback 了），而非 SSI 問題。
-
-#### d. 架構建議：同步 Retry vs Message Queue + Outbox Pattern
+#### c. 架構建議：同步 Retry vs Message Queue + Outbox Pattern
 
 並非所有場景都適合在 app 層做同步 retry：
 
