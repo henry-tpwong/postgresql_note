@@ -1568,6 +1568,17 @@ scope.Complete();
 - Npgsql 支援 `Enlist=true`（預設）自動加入 TransactionScope
 
 > 補充（Senior Dev）：TransactionScope 在 .NET Framework 時代是主流做法，但在 .NET Core + 容器化時代逐漸被放棄。建議只在「舊系統遺留 + Windows Server 部署」環境中使用。
+>
+> **那 .NET 8 應該用什麼？** 現代 .NET 8 + K8s 環境中，分佈式事務的推薦方案按優先級排序：
+>
+> | 方案 | 適用場景 | .NET 生態對應 |
+> |------|---------|-------------|
+> | **Outbox + 非同步 Saga** | 最終一致可接受（90% 場景） | 自行實作 Outbox + BackgroundService，或 MassTransit 內建 Saga State Machine |
+> | **Outbox + MassTransit** | 複雜 Saga 流程（>4 步） | MassTransit + PostgreSQL + RabbitMQ/Kafka |
+> | **手動 PREPARE TRANSACTION** | 必須強一致、同機房、低延遲 | 自行管理 `pg_prepared_xacts` + Recover 邏輯 |
+> | **TransactionScope / MSDTC** | 僅限 Windows Server 遺留系統 | Npgsql `Enlist=true` |
+>
+> 核心思路：放棄同步 2PC（鎖資源太久、容器不支援 MSDTC），轉向「本地事務 + Outbox 保證訊息不丟 + 非同步補償」的最終一致模型。詳見下方三、最終一致性方案。
 
 #### IV. XA 在現代架構中的定位
 
@@ -1596,7 +1607,49 @@ Saga 把一個分佈式事務拆成多個本地事務，每個本地事務完成
   記錄流水   →  刪除流水
 ```
 
-#### II. Choreography（事件驅動 Saga）—— 無中心協調者
+Saga 和 2PC 的核心差別：2PC 在 Prepare 階段「鎖住資源等別人」，Saga 是「先做了再說，錯了再補償」。
+
+```mermaid
+flowchart LR
+    subgraph 2PC_Flow["2PC：鎖住等"]
+        A1["扣 A 帳戶（鎖住）"] --> A2["等 B 說 OK"]
+        A2 --> A3["同時 COMMIT"]
+    end
+
+    subgraph Saga_Flow["Saga：先做再補"]
+        B1["扣 A 帳戶（COMMIT）"] --> B2["觸發 B"]
+        B2 --> B3{"B 成功？"}
+        B3 -->|"是"| B4["完成"]
+        B3 -->|"否"| B5["補償 A：加回 + COMMIT"]
+    end
+
+    style A2 fill:#ffd43b
+    style B5 fill:#e74c3c,color:#fff
+```
+
+#### II. Choreography vs Orchestration 決策
+
+| 維度 | Choreography（事件驅動） | Orchestration（中心協調） |
+|------|------------------------|------------------------|
+| 誰指揮 | 無中心，服務各自監聽事件 | Saga Orchestrator |
+| 狀態追蹤 | 分散在各服務（難排查） | 集中在 Orchestrator（易排查） |
+| 循環依賴 | 可能出現（A 發事件 B 處理，B 又觸發 A） | 由 Orchestrator 控制流程，不會循環 |
+| 複雜流程 | 難維護（事件鏈） | 易維護（集中狀態機） |
+| 適合場景 | 簡單流程（< 3 步）、事件驅動架構 | 複雜流程（>= 3 步）、需要可視化狀態 |
+
+```mermaid
+flowchart TD
+    START["選擇 Saga 模式"] --> Q1{"步驟數 < 3<br/>且無複雜分支？"}
+    Q1 -->|"是"| Q2{"服務間已用<br/>事件驅動？"}
+    Q2 -->|"是"| CHOREO["Choreography<br/>（最簡單）"]
+    Q2 -->|"否"| ORCH["Orchestration<br/>（集中管理更清晰）"]
+    Q1 -->|"否"| ORCH
+
+    style CHOREO fill:#2ecc71,color:#fff
+    style ORCH fill:#2ecc71,color:#fff
+```
+
+#### III. Choreography（事件驅動 Saga）—— 無中心協調者
 
 每個服務做完自己的事後，發布事件；下一個服務監聽事件，觸發自己的操作。
 
@@ -1607,11 +1660,11 @@ sequenceDiagram
     participant Inventory as 庫存服務
     participant Pay as 支付服務
 
-    Order->>Order: 建立訂單（本地事務）
+    Order->>Order: 建立訂單（本地事務 + Outbox）
     Order->>MQ: 發布「訂單已建立」事件
 
     MQ->>Inventory: 消費事件
-    Inventory->>Inventory: 扣庫存（本地事務）
+    Inventory->>Inventory: 扣庫存（本地事務 + Outbox）
     Inventory->>MQ: 發布「庫存已扣除」事件
 
     MQ->>Pay: 消費事件
@@ -1625,9 +1678,9 @@ sequenceDiagram
     Order->>Order: 補償：取消訂單
 ```
 
-優點：簡單、無中心化瓶頸。缺點：各服務之間循環依賴、難以看到全局狀態。
+優點：簡單、無中心化瓶頸、服務自主。缺點：循環依賴、全局狀態分散難排查。
 
-#### III. Orchestration（協調者 Saga）—— 有中心協調者
+#### IV. Orchestration（協調者 Saga）—— 有中心協調者
 
 引入一個 Saga Orchestrator，由它來指揮每一步，並在失敗時觸發補償。
 
@@ -1656,9 +1709,69 @@ sequenceDiagram
     Order-->>Orch: 完成
 ```
 
-優點：邏輯集中在協調者、易於理解和維護。缺點：協調者本身需要高可用。
+優點：邏輯集中在協調者、易於理解和維護、可視化流程。缺點：協調者本身需要高可用。
 
-#### IV. 補償機制設計
+#### V. Saga 狀態持久化與恢復
+
+Orchestrator 必須把自己的狀態持久化（不能只存在記憶體中），否則 Orchestrator crash 後無法知道補償到哪一步：
+
+```sql
+CREATE TABLE saga_state (
+    saga_id UUID PRIMARY KEY,
+    saga_type VARCHAR(100) NOT NULL,
+    current_step VARCHAR(100) NOT NULL,
+    status VARCHAR(20) NOT NULL,  -- 'Running', 'Completed', 'Compensating', 'Failed'
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 恢復查詢：重啟後找出所有未完成的 Saga
+SELECT * FROM saga_state
+WHERE status IN ('Running', 'Compensating')
+ORDER BY created_at;
+```
+
+```csharp
+// Saga Orchestrator 骨架
+public class SagaOrchestrator
+{
+    public async Task ExecuteAsync<T>(T saga, CancellationToken ct)
+    {
+        // 從 DB 恢復狀態（支援 crash recovery）
+        var state = await LoadStateAsync(saga.SagaId) ?? SaveNewState(saga, "Step1");
+
+        try
+        {
+            var currentStep = state.CurrentStep switch
+            {
+                "Step1" => await Step1Async(saga, ct),
+                "Step2" => await Step2Async(saga, ct),
+                "Step3" => await Step3Async(saga, ct),
+                _ => throw new InvalidOperationException()
+            };
+
+            await UpdateStateAsync(saga.SagaId, currentStep, "Running");
+        }
+        catch (Exception ex)
+        {
+            await UpdateStateAsync(saga.SagaId, state.CurrentStep, "Compensating");
+            await CompensateAsync(state, ex);  // 反向執行已完成的步驟
+            await UpdateStateAsync(saga.SagaId, "Done", "Failed");
+        }
+    }
+
+    private async Task CompensateAsync(SagaState state, Exception ex)
+    {
+        _log.LogWarning("Saga {Id} compensating from step {Step}", state.SagaId, state.CurrentStep);
+        // 反向補償：Step3 → Step2 → Step1，每個補償操作都要冪等
+        foreach (var step in GetCompletedSteps(state).Reverse())
+            await CompensateStepAsync(step);
+    }
+}
+```
+
+#### VI. 補償機制設計
 
 | 原則 | 說明 | 錯誤範例 |
 |------|------|---------|
@@ -1666,6 +1779,8 @@ sequenceDiagram
 | 補償不該失敗 | 如果補償也失敗，需要人工介入 | 退款時支付 API 也掛了 |
 | 正向操作先做最可能失敗的 | 越早失敗，需要補償的步驟越少 | 先扣款再扣庫存 |
 | 記錄每一步的狀態 | 補償鏈需要知道哪些步驟已完成 | 沒有狀態記錄，不知道該補償哪幾步 |
+
+> **Saga + Outbox 的標準組合**：每個 Saga 步驟的輸出事件透過 Outbox 發送，保證「本地操作成功 → 下一步一定被觸發」。Orchestrator 的狀態表本身也在同一個 PostgreSQL 中，利用 WAL 原子性保證狀態一致。
 
 ### 2. TCC（Try-Confirm-Cancel）
 
@@ -1688,22 +1803,48 @@ TCC 是 Saga 的一種具體實作模式，每個服務提供三個介面：
 | 隔離性 | 弱（中間態可見） | 較強（Try 凍結後，別人看到可用庫存已減少） |
 | 實作難度 | 中 | 高（需要設計 Try/Confirm/Cancel 三介面） |
 
-### 3. Outbox Pattern + 訊息佇列
+### 3. Outbox Pattern + 訊息佇列（.NET 分佈式事務主流方案）
 
-#### I. 為什麼需要 Outbox？
+> Outbox + Saga 是 .NET 生態中最被驗證穩定的分佈式事務組合。核心思路：**Outbox 保證訊息不丟，Saga 保證跨服務協調，Idempotency Key 保證不重複處理**。
 
-Saga 中每個服務執行完本地事務後，需要「發送訊息」給下一個服務。如果本地事務 COMMIT 後、訊息發送前，app crash 了——訊息就丟了。Outbox 的核心思想：把訊息和業務操作寫在同一個本地事務中。
+#### I. 為什麼 Outbox 是 .NET 的黃金標準？
+
+雙寫問題（Dual Write Problem）是分佈式事務中最常見的坑：
 
 ```text
-沒有 Outbox：
-  BEGIN → UPDATE 庫存 → COMMIT → 發送訊息（app crash → 訊息丟失）
+寫法 A（Fire-and-Forget）：
+  BEGIN → UPDATE 庫存 → COMMIT
+  然後 → 發送訊息給下一個服務
+  若 app crash → 庫存扣了但訊息沒發 → 訂單永遠卡在「待扣庫存」
 
-有 Outbox：
-  BEGIN → UPDATE 庫存 → INSERT INTO outbox → COMMIT
+寫法 B（先發訊息再寫庫存）：
+  發送訊息 → BEGIN → UPDATE 庫存 → COMMIT
+  若 庫存扣款失敗 → 訊息已發出無法撤回 → 下游做了不該做的操作
+
+寫法 C（Outbox，唯一正確）：
+  BEGIN → UPDATE 庫存 → INSERT INTO outbox → COMMIT（同一個本地事務）
   後續 Worker 從 outbox 讀取 → 發送訊息
+  若 app crash → PG WAL 保證庫存和 outbox 同時 COMMIT 或同時 ROLLBACK
 ```
 
-#### II. PostgreSQL Outbox 表設計
+Outbox 利用 PostgreSQL 的 **WAL 原子性**：`UPDATE` 和 `INSERT INTO outbox` 在同一個 `BEGIN...COMMIT` 中，要嘛一起成功、要嘛一起失敗。訊息一旦寫入 Outbox 表，即使 app 立刻 crash，也不會丟失。
+
+```mermaid
+flowchart TD
+    A["業務操作 + INSERT INTO outbox<br/>同一個本地事務"] --> B["COMMIT"]
+    B --> C{"App crash 了？"}
+    C -->|"否"| D["Publisher 讀取 outbox → 發送訊息"]
+    C -->|"是"| E["重啟後 Publisher 繼續處理<br/>未發送的 outbox 記錄"]
+    D --> F["消費端處理 + 冪等檢查"]
+    E --> D
+    F --> G["標記 processed_at = now()"]
+
+    style A fill:#2ecc71,color:#fff
+    style E fill:#3498db,color:#fff
+    style G fill:#2ecc71,color:#fff
+```
+
+#### II. PostgreSQL Outbox 表設計（完整版）
 
 ```sql
 CREATE TABLE outbox (
@@ -1714,27 +1855,1036 @@ CREATE TABLE outbox (
     payload JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     processed_at TIMESTAMPTZ,
-    retry_count INT NOT NULL DEFAULT 0
+    retry_count INT NOT NULL DEFAULT 0,
+    last_error TEXT
 );
 
+-- 加速未處理訊息的查詢（partial index，只索引未處理的行）
 CREATE INDEX idx_outbox_pending ON outbox (created_at)
     WHERE processed_at IS NULL;
+
+-- 加速已處理訊息的清理
+CREATE INDEX idx_outbox_processed ON outbox (processed_at)
+    WHERE processed_at IS NOT NULL;
+
+-- 冪等鍵表（消費端使用）
+CREATE TABLE idempotency_keys (
+    key VARCHAR(200) PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    consumed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 定期清理已處理的冪等鍵（防止表無限增長）
+CREATE INDEX idx_idempotency_created ON idempotency_keys (created_at);
 ```
 
-#### III. Outbox 積壓監控
+#### III. 寫入 Outbox（與業務操作同一個本地事務）
+
+```csharp
+public class OrderService
+{
+    private readonly NpgsqlDataSource _ds;
+    private readonly ILogger<OrderService> _log;
+
+    public async Task<Guid> CreateOrder(CreateOrderCmd cmd, CancellationToken ct = default)
+    {
+        var orderId = Guid.NewGuid();
+        await using var conn = await _ds.OpenConnectionAsync(ct);
+        await using var tx = await conn.BeginTransactionAsync(ct);
+
+        // Step 1：業務操作
+        await conn.ExecuteAsync(new(
+            "INSERT INTO orders (id, customer_id, amount, status) VALUES (@id, @cid, @amt, 'pending')",
+            new { id = orderId, cid = cmd.CustomerId, amt = cmd.Amount }), tx);
+
+        // Step 2：扣庫存（同一 DB 情況下的本地操作，跨 DB 就由 Saga 協調）
+        await conn.ExecuteAsync(new(
+            "UPDATE inventory SET stock = stock - @qty WHERE id = @itemId AND stock >= @qty",
+            new { qty = cmd.Quantity, itemId = cmd.ItemId }), tx);
+
+        // Step 3：寫入 Outbox（與上面兩步同一個本地事務）
+        var outboxEvent = new OrderCreatedEvent(orderId, cmd.CustomerId, cmd.Amount, DateTime.UtcNow);
+        await conn.ExecuteAsync(new(
+            @"INSERT INTO outbox (aggregate_type, aggregate_id, event_type, payload)
+              VALUES (@Type, @AggId, @Event, @Payload::jsonb)",
+            new
+            {
+                Type = "Order",
+                AggId = orderId.ToString(),
+                Event = nameof(OrderCreatedEvent),
+                Payload = JsonSerializer.Serialize(outboxEvent)
+            }), tx);
+
+        await tx.CommitAsync(ct);
+        _log.LogInformation("Order {Id} created, Outbox event published", orderId);
+        return orderId;
+    }
+}
+```
+
+> **關鍵認知**：Outbox 的「寫入」不是發送訊息，只是把訊息內容**持久化到資料庫**。真正的發送由背景 Publisher 非同步完成。這樣即使發送失敗也可以重試，不影響業務交易的 COMMIT。
+
+#### IV. OutboxPublisher 實作：三種發送方式對比
+
+| 方式 | 延遲 | 架構複雜度 | 適用場景 |
+|------|:---:|:---:|------|
+| **輪詢（Polling）** | 100-500ms | 最低 | 起步方案、低流量 |
+| **LISTEN/NOTIFY** | < 50ms | 中 | 需要低延遲、可控環境 |
+| **Debezium + Kafka Connect** | < 50ms | 高 | 大流量、已有 Kafka 基建 |
+
+##### a. 輪詢模式（最簡單，推薦起步方案）
+
+```csharp
+public class OutboxPollingPublisher : BackgroundService
+{
+    private readonly NpgsqlDataSource _ds;
+    private readonly IMessageBus _bus;
+    private readonly ILogger<OutboxPollingPublisher> _log;
+
+    private const int BatchSize = 50;
+    private const int PollIntervalMs = 500;
+    private const int MaxRetries = 5;
+
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try { await ProcessBatch(ct); }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            { _log.LogError(ex, "Outbox polling error"); }
+            await Task.Delay(PollIntervalMs, ct);
+        }
+    }
+
+    private async Task ProcessBatch(CancellationToken ct)
+    {
+        await using var conn = await _ds.OpenConnectionAsync(ct);
+
+        var messages = (await conn.QueryAsync<OutboxMessage>(new(
+            @"SELECT id, aggregate_type, aggregate_id, event_type, payload, retry_count
+              FROM outbox
+              WHERE processed_at IS NULL
+                AND retry_count < @maxRetries
+              ORDER BY created_at
+              LIMIT @batchSize
+              FOR UPDATE SKIP LOCKED",   -- 多 Instance 安全，各自取不同行
+            new { maxRetries = MaxRetries, batchSize = BatchSize })))
+            .ToList();
+
+        foreach (var msg in messages)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                await _bus.PublishAsync(msg.ToEvent(), ct);
+                await conn.ExecuteAsync(new(
+                    "UPDATE outbox SET processed_at = now() WHERE id = @id",
+                    new { msg.Id }));
+            }
+            catch (Exception ex)
+            {
+                await conn.ExecuteAsync(new(
+                    @"UPDATE outbox SET retry_count = retry_count + 1, last_error = @err
+                      WHERE id = @id",
+                    new { msg.Id, err = ex.Message }));
+                _log.LogWarning(ex, "Outbox publish failed for {Id}, retry {Count}",
+                    msg.Id, msg.RetryCount + 1);
+            }
+        }
+    }
+}
+```
+
+**為什麼用 `FOR UPDATE SKIP LOCKED`？** 多個 app instance 同時輪詢時，`SKIP LOCKED` 確保每個 instance 取到不重複的行——instance A 鎖住第 1-50 行，instance B 自動跳過已鎖的行，取第 51-100 行。不需要外部分散式鎖。
+
+##### b. LISTEN/NOTIFY 模式（低延遲，100ms 內送達）
+
+```csharp
+public class OutboxNotifyPublisher : BackgroundService
+{
+    private readonly NpgsqlDataSource _ds;
+    private readonly IMessageBus _bus;
+
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        // 啟動 LISTEN
+        await using var listenConn = await _ds.OpenConnectionAsync(ct);
+        listenConn.Notification += async (_, args) =>
+        {
+            if (args.Channel == "outbox_new")
+                await ProcessBatch(ct);
+        };
+        await listenConn.ExecuteAsync("LISTEN outbox_new");
+
+        // 寫入 Outbox 時觸發 NOTIFY（在業務 SQL 中加上）
+        // INSERT INTO outbox (...) VALUES (...);
+        // NOTIFY outbox_new;
+
+        // 定時輪詢作為 fallback（防止 NOTIFY 遺失）
+        while (!ct.IsCancellationRequested)
+        {
+            await Task.Delay(5000, ct);
+            await ProcessBatch(ct);
+        }
+    }
+}
+```
 
 ```sql
-SELECT count(*) AS pending_count,
-       min(now() - created_at) AS oldest_pending,
-       max(now() - created_at) AS newest_pending
-FROM outbox
-WHERE processed_at IS NULL;
+-- 在 Postgres 端建立 Trigger 自動 NOTIFY（零應用層改動）
+CREATE OR REPLACE FUNCTION notify_outbox() RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM pg_notify('outbox_new', NEW.id::text);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_outbox_notify
+    AFTER INSERT ON outbox
+    FOR EACH ROW EXECUTE FUNCTION notify_outbox();
 ```
 
-| Output Column | 解讀 |
-|---------------|------|
-| `pending_count` | 待處理訊息數。持續增長 = Publisher 掛了或消費者掛了 |
-| `oldest_pending` | 最老的訊息卡了多久。> 5 分鐘需要告警 |
+##### c. Debezium + Kafka Connect（大流量、已有 Kafka 基建）
+
+Debezium 監聽 PG 的 WAL，自動將 `outbox` 表的 INSERT 轉換為 Kafka 訊息。**零應用層程式碼**——不需要 Publisher、不需要輪詢。
+
+```text
+Debezium Outbox Transform 配置要點：
+  transforms.outbox.type=io.debezium.transforms.outbox.EventRouter
+  transforms.outbox.route.by.field=aggregate_type     → Kafka topic = Order / Payment
+  transforms.outbox.table.fields.mapping=payload:json  → Kafka message body
+```
+
+> **三種方式的選擇**：無特殊需求從輪詢開始（最簡單、零依賴、出問題最好排查）。延遲敏感場景加上 LISTEN/NOTIFY 作為加速層，輪詢作為 fallback。已有 Kafka 基建且團隊熟悉 Debezium 的，用 Debezium 可以完全消除 Publisher 程式碼。
+
+#### V. 多 Instance 部署的發送去重
+
+`FOR UPDATE SKIP LOCKED` 解決了「多個 instance 搶同一批訊息」的問題。但如果 instance A 拿到訊息後、標記 `processed_at` 前 crash 了，instance B 會在下一次輪詢中重新處理。
+
+```text
+Instance A：SELECT ... FOR UPDATE SKIP LOCKED → 拿到 msg #100
+Instance A：發送訊息到 RabbitMQ 成功
+Instance A：正要 UPDATE processed_at 時 → crash 💀
+Instance B（30 秒後）：SELECT ... WHERE processed_at IS NULL → 又拿到 msg #100
+Instance B：再次發送 → RabbitMQ 收到重複訊息
+```
+
+這不是 bug——Outbox 的語義是 **at-least-once**。訊息可能重複發送，**消費端必須冪等**。
+
+#### VI. 消費端冪等處理（Exactly-Once 語義）
+
+```csharp
+public class OrderCreatedHandler : IMessageHandler<OrderCreatedEvent>
+{
+    private readonly NpgsqlDataSource _ds;
+    private readonly ILogger<OrderCreatedHandler> _log;
+
+    public async Task Handle(OrderCreatedEvent evt, CancellationToken ct)
+    {
+        // 冪等檢查：這個 event 是否已處理過？
+        await using var checkConn = await _ds.OpenConnectionAsync(ct);
+        var alreadyProcessed = await checkConn.QuerySingleOrDefaultAsync<bool>(new(
+            "SELECT EXISTS(SELECT 1 FROM idempotency_keys WHERE key = @key)",
+            new { key = evt.EventId.ToString() }));
+
+        if (alreadyProcessed)
+        {
+            _log.LogDebug("Event {Id} already processed, skipping", evt.EventId);
+            return;
+        }
+
+        // 處理業務邏輯 + 記錄冪等鍵（同一個本地事務）
+        await using var conn = await _ds.OpenConnectionAsync(ct);
+        await using var tx = await conn.BeginTransactionAsync(ct);
+
+        await conn.ExecuteAsync(new(
+            "INSERT INTO shipments (order_id, status) VALUES (@oid, 'preparing')",
+            new { oid = evt.OrderId }), tx);
+
+        await conn.ExecuteAsync(new(
+            "INSERT INTO idempotency_keys (key) VALUES (@key) ON CONFLICT DO NOTHING",
+            new { key = evt.EventId.ToString() }), tx);
+
+        await tx.CommitAsync(ct);
+    }
+}
+```
+
+**冪等鍵設計原則**：
+
+| 策略 | 範例 | 優點 | 缺點 |
+|------|------|------|------|
+| **Event ID（推薦）** | Publisher 在 INSERT outbox 時生成 UUID | 最簡單 | 需要 Publisher 生成 |
+| **業務鍵** | `Order-{orderId}-Created-{timestamp}` | 不需額外欄位 | timestamp 精度可能衝突 |
+| **Offset 式** | Kafka partition + offset | Kafka 原生支援 | 只適用 Kafka |
+
+#### VII. 失敗處理與 Dead Letter
+
+經過 `MaxRetries` 次重試仍無法發送的訊息，不該永久卡在 outbox 表中阻塞後續訊息：
+
+```csharp
+// Publisher 中增加 Dead Letter 處理
+if (msg.RetryCount >= MaxRetries)
+{
+    await conn.ExecuteAsync(new(
+        @"INSERT INTO outbox_dead_letter (original_id, aggregate_type, event_type, payload, last_error)
+          VALUES (@id, @type, @event, @payload, @error)",
+        new { msg.Id, msg.AggregateType, msg.EventType, msg.Payload, msg.LastError }));
+
+    await conn.ExecuteAsync(new(
+        "UPDATE outbox SET processed_at = now() WHERE id = @id",  // 標記為已處理，不再重試
+        new { msg.Id }));
+
+    _log.LogError("Outbox message {Id} moved to dead letter after {Count} retries",
+        msg.Id, MaxRetries);
+}
+```
+
+```sql
+CREATE TABLE outbox_dead_letter (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    original_id UUID NOT NULL,
+    aggregate_type VARCHAR(100) NOT NULL,
+    event_type VARCHAR(100) NOT NULL,
+    payload JSONB NOT NULL,
+    last_error TEXT,
+    moved_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+| 告警閾值 | 行動 |
+|------|------|
+| `outbox_dead_letter` 有新記錄 | 立即通知 on-call，人工檢查為何發送失敗 |
+| Dead letter 增長速度 > 1/min | 緊急：可能是 Message Broker 掛了 |
+
+#### VIII. Outbox 清理與 Partitioning
+
+Outbox 表會隨著業務量持續增長。清理策略：
+
+```sql
+-- 定時清理已處理的舊訊息（建議每天凌晨執行）
+DELETE FROM outbox
+WHERE processed_at IS NOT NULL
+  AND processed_at < now() - interval '7 days';
+
+-- 大表建議用分批刪除（避免長時間鎖表）
+WITH deleted AS (
+    SELECT id FROM outbox
+    WHERE processed_at IS NOT NULL
+      AND processed_at < now() - interval '7 days'
+    LIMIT 10000
+)
+DELETE FROM outbox WHERE id IN (SELECT id FROM deleted);
+
+-- PG 12+ 可用 Partitioning 按日期分區（自動淘汰舊分區）
+CREATE TABLE outbox (
+    id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ...
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE outbox_2026_06 PARTITION OF outbox
+    FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+```
+
+#### IX. Outbox + MassTransit 完整實作指南（.NET 8 + Kafka + Dapper）
+
+MassTransit 內建了 Outbox + Saga State Machine，是 .NET 生態中處理分佈式事務的最成熟方案。以下從零開始，以一個「建立訂單 → 扣庫存 → 扣款」的 Saga 流程為例，使用 **Kafka** 作為 Transport、**Dapper** 作為狀態持久化方案。
+
+##### a. NuGet 套件
+
+```xml
+<PackageReference Include="MassTransit" Version="8.2.*" />
+<PackageReference Include="MassTransit.Kafka" Version="8.2.*" />
+<PackageReference Include="MassTransit.DapperIntegration" Version="8.2.*" />
+<PackageReference Include="Dapper" Version="2.1.*" />
+```
+
+##### b. 專案結構
+
+```text
+OrderService/
+  Api/              ← ASP.NET Minimal API / Controller
+  Domain/
+    Order.cs        ← 業務 Entity
+    Events.cs       ← 訊息合約（Contract）
+  Saga/
+    OrderStateMachine.cs   ← Saga 狀態機
+    OrderState.cs          ← Saga 持久化狀態
+  Program.cs               ← 啟動配置
+  // 不需要 OrderDbContext.cs！
+```
+
+##### c. 定義訊息合約（Contract）
+
+訊息合約是服務之間的通訊語言，必須定義在共享的 Class Library 中：
+
+```csharp
+// ============================================================
+// Contracts/Events.cs —— 訊息合約（共享 Library）
+// ============================================================
+// 所有服務之間通訊的「語言」，必須定義在共享 Class Library 中
+// Kafka Topic 名稱通常與 Event 類型名稱對應（MassTransit 自動處理）
+// 使用 record 而非 class：不可變 + value-based equality + 簡潔語法
+
+/// <summary>
+/// 訂單已提交事件 — Saga 的起點
+/// 使用者 POST /orders → API 發布此事件 → Saga 開始協調
+/// </summary>
+public record OrderSubmitted
+{
+    public Guid OrderId { get; init; }     // Saga 的 CorrelationId
+    public Guid CustomerId { get; init; }  // 後續步驟可能需要的業務資料
+    public decimal Amount { get; init; }   // 扣款金額
+    public DateTime Timestamp { get; init; } // 事件發生時間（用於排查時序）
+}
+
+/// <summary>
+/// 庫存預留成功 — 消費端扣庫存成功後發布
+/// </summary>
+public record InventoryReserved
+{
+    public Guid OrderId { get; init; }
+    public DateTime Timestamp { get; init; }
+}
+
+/// <summary>
+/// 庫存預留失敗 — 庫存不足等原因，觸發 Saga 補償
+/// </summary>
+public record InventoryReservationFailed
+{
+    public Guid OrderId { get; init; }
+    public string Reason { get; init; }    // 失敗原因，寫入 log 方便排查
+    public DateTime Timestamp { get; init; }
+}
+
+/// <summary>
+/// 付款完成 — Saga 成功終態的前一步
+/// </summary>
+public record PaymentCompleted
+{
+    public Guid OrderId { get; init; }
+    public DateTime Timestamp { get; init; }
+}
+
+/// <summary>
+/// 付款失敗 — 觸發雙重補償：釋放庫存 + 取消訂單
+/// </summary>
+public record PaymentFailed
+{
+    public Guid OrderId { get; init; }
+    public string Reason { get; init; }    // 銀行回傳的失敗訊息
+    public DateTime Timestamp { get; init; }
+}
+
+// ============================================================
+// 命令（Command） —— 發給 Consumer 的操作指令
+// ============================================================
+// 命令命名慣例：動詞 + 名詞（ReserveInventory、ProcessPayment）
+// 事件命名慣例：名詞 + 過去式（InventoryReserved、PaymentCompleted）
+// 這兩類分到不同的 Kafka Topic，避免 Saga Event 和 Command 混在一起
+
+/// <summary>
+/// 取消訂單 — 補償命令
+/// </summary>
+public record CancelOrder
+{
+    public Guid OrderId { get; init; }
+    public string Reason { get; init; }    // 記錄為什麼被取消（庫存不足？付款失敗？）
+}
+
+/// <summary>
+/// 釋放庫存 — 補償命令（把扣掉的庫存加回去）
+/// </summary>
+public record ReleaseInventory
+{
+    public Guid OrderId { get; init; }
+}
+```
+
+##### d. Saga 狀態（持久化到 PostgreSQL，Dapper 版）
+
+```csharp
+// ============================================================
+// Saga/OrderState.cs —— Saga 持久化狀態
+// ============================================================
+// 實作 SagaStateMachineInstance：MassTransit 要求的介面
+// Dapper 版不需要 DbContext，MassTransit 自動處理 CRUD
+public class OrderState : SagaStateMachineInstance
+{
+    // ----- MassTransit 必備欄位 -----
+    public Guid CorrelationId { get; set; }  // Saga 主鍵 = OrderId，Kafka 用它做 partition key
+    public string CurrentState { get; set; } // MassTransit 自動管理（"Submitted"→"InventoryReserved"→...）
+    public ulong RowVersion { get; set; }    // 對應 PG xmin，每次 UPDATE 自動 +1（樂觀鎖）
+
+    // ----- 業務欄位（可選，方便查詢當前 Saga 狀態） -----
+    public Guid CustomerId { get; set; }    // 哪個客戶的訂單
+    public decimal Amount { get; set; }     // 訂單金額（扣款時用）
+    public DateTime CreatedAt { get; set; } // Saga 建立時間（排查逾時 Saga 用）
+}
+```
+
+**不需要 DbContext！** `MassTransit.DapperIntegration` 在首次啟動時自動建立所需的 saga 表：
+
+```sql
+-- MassTransit.DapperIntegration 自動建立的表
+CREATE TABLE IF NOT EXISTS saga_order_states (
+    CorrelationId UUID PRIMARY KEY,
+    CurrentState VARCHAR(64) NOT NULL,
+    CustomerId UUID,
+    Amount DECIMAL,
+    CreatedAt TIMESTAMPTZ,
+    RowVersion xid  -- PG 原生 xmin，Dapper 當作樂觀鎖
+);
+```
+
+RowVersion 使用 PG 原生 `xmin` 系統欄位——每次 UPDATE 自動遞增，無需額外欄位管理和索引維護。
+
+##### e. Saga State Machine（核心邏輯）
+
+```csharp
+// ============================================================
+// Saga/OrderStateMachine.cs —— Saga 狀態機（核心邏輯）
+// ============================================================
+// MassTransitStateMachine<T> 是 MassTransit 提供的 DSL，
+// 用宣告式語法定義「狀態 → 收到事件 → 做什麼 → 進入下一個狀態」
+public class OrderStateMachine : MassTransitStateMachine<OrderState>
+{
+    // ----- 宣告所有可能的狀態 -----
+    // 每個 State 對應 CurrentState 欄位中的一個字串值
+    public State Submitted { get; private set; }           // 初始：已收到訂單，等待扣庫存
+    public State InventoryReserved { get; private set; }   // 庫存 OK，等待付款
+    public State OrderCompleted { get; private set; }      // 終態：全部成功
+    public State OrderCancelled { get; private set; }      // 終態：失敗，已補償
+
+    // ----- 宣告所有可能收到的事件 -----
+    // Event<T>：當 Kafka Topic 收到匹配類型的訊息時觸發
+    public Event<OrderSubmitted> OrderSubmitted { get; private set; }
+    public Event<InventoryReserved> InventoryReserved { get; private set; }
+    public Event<InventoryReservationFailed> InventoryReservationFailed { get; private set; }
+    public Event<PaymentCompleted> PaymentCompleted { get; private set; }
+    public Event<PaymentFailed> PaymentFailed { get; private set; }
+
+    public OrderStateMachine()
+    {
+        // ----- 將 Event 對應到 Saga 的 CorrelationId -----
+        // CorrelateById：從訊息中取出 OrderId，找到對應的 Saga 實例
+        // 這是 Saga 模式的核心——讓「無序到達的事件」能正確路由到「正確的 Saga 實例」
+        Event(() => OrderSubmitted, x => x.CorrelateById(m => m.Message.OrderId));
+        Event(() => InventoryReserved, x => x.CorrelateById(m => m.Message.OrderId));
+        Event(() => InventoryReservationFailed, x => x.CorrelateById(m => m.Message.OrderId));
+        Event(() => PaymentCompleted, x => x.CorrelateById(m => m.Message.OrderId));
+        Event(() => PaymentFailed, x => x.CorrelateById(m => m.Message.OrderId));
+
+        // ============================================================
+        // 初始狀態：尚未收到任何事件 → 收到 OrderSubmitted
+        // ============================================================
+        Initially(
+            When(OrderSubmitted)                    // 當收到 OrderSubmitted 事件
+                .Then(context =>                    // 保存業務資料到 Saga 狀態
+                {
+                    context.Saga.CustomerId = context.Message.CustomerId;
+                    context.Saga.Amount = context.Message.Amount;
+                    context.Saga.CreatedAt = context.Message.Timestamp;
+                    // 這裡不做 DB 操作（Saga 狀態的持久化由 MassTransit 自動處理）
+                })
+                .TransitionTo(Submitted)            // 狀態 → Submitted
+                .Publish(context => new ReserveInventory  // 發布命令給庫存服務
+                {
+                    OrderId = context.Message.OrderId,
+                    CustomerId = context.Message.CustomerId
+                })
+                // Publish 的行為：寫入 PostgreSQL Outbox → 非同步發送到 Kafka
+        );
+
+        // ============================================================
+        // 狀態 Submitted：等待庫存回應
+        // ============================================================
+        During(Submitted,
+            // 庫存扣減成功 → 進入下一階段：付款
+            When(InventoryReserved)
+                .TransitionTo(InventoryReserved)
+                .Publish(context => new ProcessPayment       // 發布扣款命令
+                {
+                    OrderId = context.Saga.CorrelationId,   // 從 Saga 狀態取 OrderId
+                    Amount = context.Saga.Amount            // 從 Saga 狀態取金額
+                }),
+
+            // 庫存扣減失敗 → 補償：取消訂單（注意：不需要補償庫存，因為根本沒扣成功）
+            When(InventoryReservationFailed)
+                .Then(context => context.Publish(new CancelOrder
+                {
+                    OrderId = context.Saga.CorrelationId,
+                    Reason = context.Message.Reason
+                }))
+                .TransitionTo(OrderCancelled)   // 終態
+        );
+
+        // ============================================================
+        // 狀態 InventoryReserved：庫存已扣，等待付款結果
+        // ============================================================
+        During(InventoryReserved,
+            // 付款成功 → 訂單完成
+            When(PaymentCompleted)
+                .Then(context => context.Publish(new CompleteOrder
+                {
+                    OrderId = context.Saga.CorrelationId
+                }))
+                .TransitionTo(OrderCompleted),  // 終態
+
+            // 付款失敗 → 雙重補償：釋放庫存 + 取消訂單
+            //
+            // 注意：context.Publish() 不是直接發送 Kafka 訊息！
+            // 因為配置了 UsePostgresOutbox()，Publish 的行為是：
+            //   ① 將訊息內容 INSERT INTO mt_outbox（與 Saga 狀態更新同一個 DB 事務）
+            //   ② 背景 Outbox Publisher 輪詢 mt_outbox → 非同步發送到 Kafka
+            // 這樣保證：Saga 狀態更新成功 → Outbox 寫入成功（原子性）
+            //           Saga 狀態更新失敗 → Outbox 也不會寫入（不會誤發補償訊息）
+            //
+            // 兩個 Publish 寫入同一個事務的 Outbox，發送順序不保證
+            // 但消費端各自冪等，所以順序不重要
+            When(PaymentFailed)
+                .Then(context =>
+                {
+                    // 補償 1：把扣掉的庫存加回去（寫入 Outbox，非直接發 Kafka）
+                    context.Publish(new ReleaseInventory
+                    {
+                        OrderId = context.Saga.CorrelationId
+                    });
+                    // 補償 2：取消訂單
+                    context.Publish(new CancelOrder
+                    {
+                        OrderId = context.Saga.CorrelationId,
+                        Reason = context.Message.Reason
+                    });
+                })
+                .TransitionTo(OrderCancelled)   // 終態
+        );
+
+        // ----- 標記終態 -----
+        // OrderCompleted 和 OrderCancelled 收到任何事件都忽略（Saga 已結束）
+        SetCompletedWhenFinalized();
+    }
+}
+```
+
+##### f. Program.cs（完整啟動配置：Kafka + Dapper + Outbox）
+
+```csharp
+// ============================================================
+// Program.cs —— 啟動配置
+// ============================================================
+var builder = WebApplication.CreateBuilder(args);
+var connStr = builder.Configuration.GetConnectionString("Postgres");
+
+// ============================================================
+// 註冊 MassTransit：Kafka Transport + Dapper Saga + PostgreSQL Outbox
+// ============================================================
+builder.Services.AddMassTransit(x =>
+{
+    // ----- Saga State Machine -----
+    // DapperRepository：MassTransit.DapperIntegration 自動處理 saga_order_states 表
+    // 首次啟動自動 CREATE TABLE IF NOT EXISTS，後續啟動直接使用
+    // RowVersion 用 PG 原生 xmin 欄位，無需手動管理樂觀鎖
+    x.AddSagaStateMachine<OrderStateMachine, OrderState>()
+        .DapperRepository(connStr);
+
+    // ----- Consumer 註冊 -----
+    // 每個 Consumer 會自動建立對應的 Kafka Topic Endpoint
+    // Consumer 之間互相獨立，不會競爭同一條訊息（各自訂閱不同的 Topic）
+    x.AddConsumer<ReserveInventoryConsumer>();   // 訂閱 reserve-inventory-cmd
+    x.AddConsumer<ProcessPaymentConsumer>();     // 訂閱 process-payment-cmd
+    x.AddConsumer<CancelOrderConsumer>();        // 訂閱 cancel-order-cmd
+    x.AddConsumer<ReleaseInventoryConsumer>();   // 訂閱 release-inventory-cmd
+
+    // ----- Kafka Transport 配置 -----
+    x.UsingKafka((ctx, cfg) =>
+    {
+        cfg.Host("localhost:9092");  // Kafka bootstrap server（正式環境設多個）
+
+        // ============================================================
+        // TopicEndpoint 的雙重作用
+        // ============================================================
+        // cfg.TopicEndpoint<T>("topic-name", "consumer-group", ...) 同時做了兩件事：
+        //
+        //   ① Producer 端：決定 context.Publish<T>() 時發送到哪個 Kafka Topic
+        //      → 背景 Outbox Publisher 也看這個設定，把 mt_outbox 中的訊息發到對應 Topic
+        //
+        //   ② Consumer 端：指定哪個 Consumer Group 訂閱這個 Topic
+        //      → 同一 Group 內的多個 Instance 會自動分配 Partition
+        //
+        // 所以 Saga StateMachine 中 context.Publish(new ReleaseInventory{...}) 的
+        // Kafka Topic 就是下面這行設定的 "release-inventory-cmd"
+
+        // ============================================================
+        // 事件 Topic —— 發給 Saga State Machine 的
+        // ============================================================
+        // 參數：(Topic 名稱, Consumer Group, 選項)
+        // Consumer Group：相同 group 的多個 instance 會自動分配 Partition
+        cfg.TopicEndpoint<OrderSubmitted>("order-submitted", "order-saga-group", e => { });
+        cfg.TopicEndpoint<InventoryReserved>("inventory-reserved", "order-saga-group", e => { });
+        cfg.TopicEndpoint<InventoryReservationFailed>("inventory-failed", "order-saga-group", e => { });
+        cfg.TopicEndpoint<PaymentCompleted>("payment-completed", "order-saga-group", e => { });
+        cfg.TopicEndpoint<PaymentFailed>("payment-failed", "order-saga-group", e => { });
+
+        // ============================================================
+        // 命令 Topic —— 發給 Consumer 執行的
+        // ============================================================
+        // 事件和命令分到不同的 Consumer Group：
+        //   order-saga-group → Saga 自己消費（更新狀態）
+        //   inventory-consumer → 庫存 Consumer 消費（執行扣庫存）
+        cfg.TopicEndpoint<ReserveInventory>("reserve-inventory-cmd", "inventory-consumer", e =>
+        {
+            e.ConcurrentMessageLimit = 20;   // 每 partition 最多同時處理 20 條
+            // 設定上限防止瞬間流量打爆 DB connection pool
+        });
+        cfg.TopicEndpoint<ProcessPayment>("process-payment-cmd", "payment-consumer", e => { });
+        cfg.TopicEndpoint<CancelOrder>("cancel-order-cmd", "order-consumer", e => { });
+        cfg.TopicEndpoint<ReleaseInventory>("release-inventory-cmd", "inventory-consumer", e => { });
+
+        // ============================================================
+        // PostgreSQL Outbox —— 保證訊息不丟的核心設定
+        // ============================================================
+        // UsePostgresOutbox 做的事：
+        //   1. 建立 mt_outbox / mt_outbox_state / mt_inbox_state 三張表
+        //   2. 啟動 BackgroundService 定期輪詢 outbox → 發送到 Kafka
+        //   3. 消費端自動用 mt_inbox_state 做冪等（防止重複處理）
+        cfg.UsePostgresOutbox(ctx);
+    });
+});
+
+// ============================================================
+// API 端點
+// ============================================================
+var app = builder.Build();
+app.MapPost("/orders", async (CreateOrderCmd cmd, IPublishEndpoint publisher) =>
+{
+    var orderId = Guid.NewGuid();
+
+    // 核心原則：API 只發布事件，不直接操作 DB
+    // 所有後續步驟（扣庫存、扣款）由 Saga + Consumer 非同步處理
+    // Publish → 寫入 Outbox → 背景 Publisher 發送到 Kafka → Saga 開始協調
+    await publisher.Publish(new OrderSubmitted
+    {
+        OrderId = orderId,
+        CustomerId = cmd.CustomerId,
+        Amount = cmd.Amount,
+        Timestamp = DateTime.UtcNow  // 統一用 UTC，避免跨時區排查混亂
+    });
+
+    // 回傳 202 Accepted（已受理）而非 201 Created（尚未建立完成）
+    // 使用者可以輪詢 GET /orders/{orderId} 查詢 Saga 進度
+    return Results.Accepted($"/orders/{orderId}", new { orderId });
+});
+
+app.Run();
+```
+
+##### g. Consumer 實作（使用 Dapper）
+
+```csharp
+// ============================================================
+// Consumers/ReserveInventoryConsumer.cs —— 扣庫存
+// ============================================================
+// IConsumer<T>：當 Kafka Topic 收到 T 類型的訊息時，自動呼叫 Consume()
+// Consumer 需要註冊到 DI（AddConsumer<T>），MassTransit 自動管理 lifecycle
+public class ReserveInventoryConsumer : IConsumer<ReserveInventory>
+{
+    private readonly NpgsqlDataSource _ds;  // Npgsql 連線池（.NET 7+ 推薦的寫法）
+
+    public async Task Consume(ConsumeContext<ReserveInventory> context)
+    {
+        // 從 DI 獲取連線（每次 Consume 一個新連線，用完歸還 Pool）
+        await using var conn = await _ds.OpenConnectionAsync(context.CancellationToken);
+
+        // 扣庫存 + 原子判斷（同一條 SQL）
+        // WHERE stock > 0：防止超賣（樂觀鎖，不需要 SELECT FOR UPDATE）
+        // ExecuteAsync 回傳 affected rows，0 表示庫存不足或不存在
+        var result = await conn.ExecuteAsync(
+            "UPDATE inventory SET stock = stock - 1 WHERE id = @itemId AND stock > 0",
+            new { itemId = 1 });  // 示範用硬編碼，正式環境從 context.Message 取 itemId
+
+        if (result > 0)
+        {
+            // 庫存扣減成功 → 通知 Saga
+            // Publish 的行為：寫入 Outbox → 背景 Publisher 發送到 Kafka
+            await context.Publish(new InventoryReserved
+            {
+                OrderId = context.Message.OrderId,
+                Timestamp = DateTime.UtcNow
+            });
+        }
+        else
+        {
+            // 庫存不足 → 通知 Saga 啟動補償
+            await context.Publish(new InventoryReservationFailed
+            {
+                OrderId = context.Message.OrderId,
+                Reason = "庫存不足",   // 正式環境可加上當前庫存數
+                Timestamp = DateTime.UtcNow
+            });
+        }
+    }
+}
+```
+
+```csharp
+// ============================================================
+// Consumers/ProcessPaymentConsumer.cs —— 扣款
+// ============================================================
+public class ProcessPaymentConsumer : IConsumer<ProcessPayment>
+{
+    private readonly IPaymentGateway _gateway;  // 第三方支付 API 的抽象
+
+    public async Task Consume(ConsumeContext<ProcessPayment> context)
+    {
+        try
+        {
+            // 呼叫第三方支付 API
+            // 注意：第三方 API 必須支援冪等——傳入 OrderId 讓支付方做重複扣款防範
+            // 因為 Kafka Consumer 可能因 retry 而重複消費同一條訊息
+            await _gateway.ChargeAsync(context.Message.OrderId, context.Message.Amount);
+
+            // 扣款成功 → 通知 Saga
+            await context.Publish(new PaymentCompleted
+            {
+                OrderId = context.Message.OrderId,
+                Timestamp = DateTime.UtcNow
+            });
+        }
+        catch (PaymentFailedException ex)
+        {
+            // 扣款失敗 → 通知 Saga 啟動雙重補償（釋放庫存 + 取消訂單）
+            await context.Publish(new PaymentFailed
+            {
+                OrderId = context.Message.OrderId,
+                Reason = ex.Message,     // 銀行回傳的失敗原因（餘額不足、信用卡過期等）
+                Timestamp = DateTime.UtcNow
+            });
+        }
+        // 不需要 catch (Exception)：未預期的異常由 MassTransit 內建 Retry 機制處理
+    }
+}
+```
+
+```csharp
+// ============================================================
+// Consumers/CancelOrderConsumer.cs —— 取消訂單（補償）
+// ============================================================
+// 這個 Consumer 同時被兩個場景觸發：
+//   ① 庫存不足 → Saga 直接發布 CancelOrder（庫存沒扣，只需取消訂單）
+//   ② 付款失敗 → Saga 發布 CancelOrder + ReleaseInventory（雙重補償）
+// 兩種場景的處理邏輯相同：把訂單標記為已取消
+public class CancelOrderConsumer : IConsumer<CancelOrder>
+{
+    private readonly NpgsqlDataSource _ds;
+    private readonly ILogger<CancelOrderConsumer> _log;
+
+    public async Task Consume(ConsumeContext<CancelOrder> context)
+    {
+        await using var conn = await _ds.OpenConnectionAsync(context.CancellationToken);
+
+        // 訂單可能已在「待付款」或「已建立」狀態，UPDATE 時限定狀態避免誤取消已完成的訂單
+        var result = await conn.ExecuteAsync(
+            @"UPDATE orders
+              SET status = 'cancelled', cancelled_at = now(), cancel_reason = @reason
+              WHERE id = @orderId
+                AND status NOT IN ('completed', 'cancelled')",   // 避免重複取消或誤取消已完成訂單
+            new { orderId = context.Message.OrderId, reason = context.Message.Reason });
+
+        if (result > 0)
+        {
+            _log.LogInformation("Order {Id} cancelled: {Reason}",
+                context.Message.OrderId, context.Message.Reason);
+
+            // 通知使用者（發送取消通知郵件 / 推播等）
+            // await context.Publish(new OrderCancelledNotification { ... });
+        }
+        else
+        {
+            // 0 行受影響 → 訂單已完成或已被取消（冪等處理）
+            _log.LogDebug("Order {Id} already completed or cancelled, skipping",
+                context.Message.OrderId);
+        }
+    }
+}
+```
+
+```csharp
+// ============================================================
+// Consumers/ReleaseInventoryConsumer.cs —— 釋放庫存（補償）
+// ============================================================
+// 只在付款失敗後被 Saga 觸發：把之前扣掉的庫存加回去
+// 必須冪等——因為 Kafka Consumer 可能因 retry 重複執行
+// 冪等策略：用庫存流水表（inventory_log）記錄每次異動，避免重複加回
+public class ReleaseInventoryConsumer : IConsumer<ReleaseInventory>
+{
+    private readonly NpgsqlDataSource _ds;
+    private readonly ILogger<ReleaseInventoryConsumer> _log;
+
+    public async Task Consume(ConsumeContext<ReleaseInventory> context)
+    {
+        await using var conn = await _ds.OpenConnectionAsync(context.CancellationToken);
+        await using var tx = await conn.BeginTransactionAsync(context.CancellationToken);
+
+        // 冪等檢查：這個 OrderId 是否已經補償過庫存？
+        var alreadyCompensated = await conn.QuerySingleOrDefaultAsync<bool>(
+            @"SELECT EXISTS(
+                SELECT 1 FROM inventory_log
+                WHERE order_id = @orderId AND operation = 'release'
+            )",
+            new { orderId = context.Message.OrderId });
+
+        if (alreadyCompensated)
+        {
+            _log.LogDebug("Inventory already released for Order {Id}, skipping",
+                context.Message.OrderId);
+            return;
+        }
+
+        // 補償：庫存 +1（WHERE stock >= 0 防止負數庫存——理論上不該發生）
+        var result = await conn.ExecuteAsync(new(
+            "UPDATE inventory SET stock = stock + 1 WHERE id = @itemId AND stock >= 0",
+            new { itemId = 1 }), tx);
+
+        // 記錄補償流水（冪等防線）
+        await conn.ExecuteAsync(new(
+            @"INSERT INTO inventory_log (order_id, operation, quantity, created_at)
+              VALUES (@orderId, 'release', 1, now())
+              ON CONFLICT (order_id, operation) DO NOTHING",  // 雙重防範：UNIQUE CONSTRAINT
+            new { orderId = context.Message.OrderId }), tx);
+
+        await tx.CommitAsync(context.CancellationToken);
+
+        _log.LogInformation("Inventory released for Order {Id}, affected {Rows} row(s)",
+            context.Message.OrderId, result);
+    }
+}
+```
+
+```sql
+-- 庫存流水表（ReleaseInventoryConsumer 的冪等防線）
+CREATE TABLE IF NOT EXISTS inventory_log (
+    id BIGSERIAL PRIMARY KEY,
+    order_id UUID NOT NULL,
+    operation VARCHAR(20) NOT NULL,  -- 'reserve'（扣庫存）或 'release'（補償加回）
+    quantity INT NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (order_id, operation)    -- 確保同一訂單的同一操作只記錄一次
+);
+```
+
+##### h. Mermaid 全流程圖
+
+```mermaid
+sequenceDiagram
+    actor User as 使用者
+    participant API as OrderService API
+    participant Outbox as Outbox Publisher
+    participant Kafka as Kafka
+    participant Saga as Saga State Machine
+    participant Inv as 庫存 Consumer
+    participant Pay as 支付 Consumer
+    participant Cancel as 取消訂單 Consumer
+    participant Release as 釋放庫存 Consumer
+    participant PG as PostgreSQL
+
+    rect rgb(46, 204, 113, 0.15)
+        Note over User,PG: ===== 正向流程（成功路徑）=====
+
+        User->>API: POST /orders
+        API->>Outbox: Publish OrderSubmitted → INSERT mt_outbox
+        API-->>User: 202 Accepted
+
+        Outbox->>Kafka: 發送 OrderSubmitted → topic: order-submitted
+        Kafka->>Saga: 觸發 Saga（建立 OrderState）
+        Saga->>PG: INSERT saga_order_states + Outbox INSERT（同一事務）
+        Outbox->>Kafka: 發送 ReserveInventory → topic: reserve-inventory-cmd
+
+        Kafka->>Inv: 扣庫存
+        Inv->>PG: UPDATE inventory SET stock = stock - 1
+        Inv->>Outbox: Publish InventoryReserved → INSERT mt_outbox
+        Outbox->>Kafka: 發送 InventoryReserved → topic: inventory-reserved
+
+        Kafka->>Saga: 更新狀態 → InventoryReserved
+        Saga->>PG: UPDATE saga_order_states + Outbox INSERT（同一事務）
+        Outbox->>Kafka: 發送 ProcessPayment → topic: process-payment-cmd
+
+        Kafka->>Pay: 扣款
+        Pay->>Pay: 呼叫第三方支付 API（成功）
+        Pay->>Outbox: Publish PaymentCompleted → INSERT mt_outbox
+        Outbox->>Kafka: 發送 PaymentCompleted → topic: payment-completed
+
+        Kafka->>Saga: 更新狀態 → OrderCompleted（終態）
+        Saga->>PG: UPDATE saga_order_states（CurrentState = 'OrderCompleted'）
+    end
+
+    rect rgb(231, 76, 60, 0.15)
+        Note over User,PG: ===== 補償流程（付款失敗路徑）=====
+        Note over Pay: 如果扣款失敗...
+
+        Pay->>Outbox: Publish PaymentFailed → INSERT mt_outbox
+        Outbox->>Kafka: 發送 PaymentFailed → topic: payment-failed
+
+        Kafka->>Saga: 觸發補償
+        Saga->>PG: UPDATE + Outbox INSERT（原子寫入兩條補償訊息）
+        Outbox->>Kafka: 發送 ReleaseInventory → topic: release-inventory-cmd
+        Outbox->>Kafka: 發送 CancelOrder → topic: cancel-order-cmd
+
+        Kafka->>Release: 補償：加回庫存
+        Release->>PG: UPDATE inventory SET stock = stock + 1
+        Release->>PG: INSERT INTO inventory_log（冪等防線）
+
+        Kafka->>Cancel: 補償：取消訂單
+        Cancel->>PG: UPDATE orders SET status = 'cancelled'
+    end
+
+    Note over PG,Kafka: 關鍵：每一步的 Publish 都不是直接發送 Kafka<br/>而是寫入 PostgreSQL Outbox 表<br/>由背景 Outbox Publisher 非同步發送<br/>保證 at-least-once 語義
+```
+
+##### i. Outbox 自動管理（MassTransit 幫你做的事）
+
+使用 `UsePostgresOutbox()` 後，MassTransit 自動處理：
+
+| 自動處理 | 說明 |
+|---------|------|
+| **Outbox 表建立** | Dapper 版自動建立 `OutboxMessage` / `OutboxState` / `InboxState` 三張表 |
+| **Publisher 輪詢** | 內建 BackgroundService，從 Outbox 讀取 → 發送到 Kafka |
+| **Inbox 去重** | 消費端自動用 `InboxState` 表做冪等檢查 |
+| **Retry + Redelivery** | 消費失敗自動重試（可設定次數、間隔） |
+| **Transaction 邊界** | `UsePostgresOutbox` 自動包裹 DB 操作 + Outbox INSERT |
+
+##### j. 多 Instance 部署
+
+MassTransit + Kafka 原生支援多 Instance：
+
+```text
+Instance A ──┬── consumer 分配 Partition 0, 1
+Instance B ──┤── consumer 分配 Partition 2, 3
+Instance C ──┘── consumer 分配 Partition 4, 5
+
+Kafka Consumer Group 保證同一 Partition 只分配給一個 Consumer。
+Saga State Machine 用 PG RowVersion（xmin）做樂觀鎖，
+防止多 Instance 同時修改同一個 Saga 狀態。
+```
+
+```csharp
+// 如果兩個 Instance 同時更新同一個 Saga，MassTransit 會拋出：
+// OptimisticConcurrencyException → 自動重試該 Saga 的當前步驟
+```
+
+##### k. vs 手寫 Outbox：何時該用 MassTransit？
+
+| 面向 | 手寫 Outbox | MassTransit（Kafka + Dapper） |
+|------|-----------|--------------------------|
+| 程式碼量 | ~330 行（Publisher + Consumer + Saga） | 設定 ~30 行 + StateMachine 邏輯 |
+| 可靠性 | 看你的實作品質 | 十年開源、百萬生產驗證 |
+| 可觀測性 | 需要自己埋 Metrics + Tracing | OpenTelemetry 原生整合 |
+| 學習曲線 | 低（你清楚每一行） | 中（StateMachine DSL、Kafka 配置） |
+| 依賴 | 僅 PG | PG + Kafka |
+| 適用場景 | 簡單事件發佈、不想引入 Broker | 複雜協調、需要訊息重播/審計 |
+
+> 補充（Senior Dev）：MassTransit 的最強價值在於 **Saga State Machine + Outbox + Inbox 的三合一自動化**。Kafka 的訊息重播能力讓 debug 和 audit 變得非常方便——你可以把三個月前的訂單事件全部重跑一遍來驗證新邏輯。選擇 Kafka 而非 RabbitMQ 的主因通常是**訊息保留/重播**和**團隊已有 Kafka 基建**。如果只是簡單的事件通知，手寫 Outbox 更輕量。
 
 ### 4. Seata AT Mode（簡介）
 
@@ -1831,9 +2981,14 @@ flowchart TD
     style OUT fill:#2ecc71,color:#fff
 ```
 
-### 2. Npgsql + TransactionScope 的正確寫法
+### 2. Npgsql + TransactionScope（Windows 限定，.NET 8 仍可用但不建議）
+
+> **.NET 8 能跑嗎？** 在 Windows + MSDTC 啟用的環境下**可以跑**，語法和行為都沒變——TransactionScope 打開第二個 connection 時自動升級為分佈式事務，底層走 MSDTC 做 2PC 協調。
+>
+> **為什麼不建議？** (1) Linux / K8s 容器中 MSDTC 不存在，TransactionScope 不會報錯但**兩個 connection 各自獨立 COMMIT**——等於沒協調；(2) 2PC 鎖資源時間長，微服務架構下不可接受；(3) 雲端部署已是 Linux 主流。建議改用「Outbox + 非同步 Saga」（見下方三、最終一致性方案）。
 
 ```csharp
+// .NET 8 + Windows + MSDTC 環境下仍可運作，但不推薦新專案使用
 using var scope = new TransactionScope(
     TransactionScopeOption.Required,
     new TransactionOptions
