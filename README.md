@@ -9,7 +9,7 @@
 
 | 章節 | 檔案 | 主題 |
 |------|------|------|
-| **Transaction 全攻略** | [`transaction/transaction.md`](transaction/transaction.md) | MVCC Snapshot 深度解析、四種隔離級別底層原理（SSI/SIREAD/2PL/S2PL）、Write Skew 重現、EvalPlanQual / Lost Update、VACUUM 影響、.NET Dapper/Polly Retry 實戰、**分佈式事務（2PC/XA/Saga/TCC/Outbox + .NET 完整範例）** |
+| **Transaction 全攻略** | [`transaction.md`](transaction.md) | MVCC Snapshot 深度解析、四種隔離級別底層原理（SSI/SIREAD/2PL/S2PL）、Write Skew 重現、EvalPlanQual / Lost Update、VACUUM 影響、.NET Dapper/Polly Retry 實戰、**分佈式事務（2PC/XA/Saga/TCC/Outbox + .NET 完整範例）** |
 | **索引全解析** | [`index.md`](index.md) | 六種掃描類型全解析（Seq/Index/Bitmap/Parallel/Index-Only）、Bitmap Heap Scan 詳解、BRIN/Bloom/GIN/GiST/SP-GiST/RUM、Covering Index、索引失效 20 場景 |
 | **查詢深度解析** | [`query.md`](query.md) | 查詢生命週期、CBO 與 pg_hint_plan、GROUP BY 策略、IN/ANY/VALUES、分頁與計數、Recursive CTE 優化、死循環防禦、分組 Top-N（44x）、JOIN 冗餘膨脹 Early DISTINCT |
 | **鎖（Lock）** | [`lock.md`](lock.md) | 隱式鎖、Lock Wait 追蹤、秒殺 Advisory Lock、高並發更新、Lock Flooding、max_locks_per_transaction、OLTP advisory lock、無間隙 ID 生成 |
