@@ -2,7 +2,7 @@
 
 > **閱讀順序：由淺入深，逐步構建 PostgreSQL 生產級技術棧**
 
-本書按 PostgreSQL Extension 的安裝方式與應用層次編排兩大分類、共十三個 Extension：
+本書按 PostgreSQL Extension 的安裝方式與應用層次編排兩大分類、共十二個 Extension：
 
 **# 一、Non-Contrib Extensions（需額外安裝）** — 6 個，需透過 apt install、源碼編譯或第三方工具安裝：
 
@@ -13,13 +13,12 @@
 - **pg_stat_kcache**：查詢 CPU 與實體 IO 統計，getrusage() 真實磁盤讀寫分析。
 - **hypopg**：假設性索引分析，零成本試錯 EXPLAIN 計劃。
 
-**# 二、Contrib Extensions（PG 內建，CREATE EXTENSION 即可）** — 7 個，無需額外下載：
+**# 二、Contrib Extensions（PG 內建，CREATE EXTENSION 即可）** — 6 個，無需額外下載：
 
 - **pg_stat_statements**：查詢歸一化與聚合統計，Top-N 慢查詢、緩存命中率、WAL/JIT 分析。
 - **auto_explain**：自動記錄執行計劃，log_triggers / log_nested_statements（PG 16）。
 - **pgcrypto**：加解密完整指南，digest/hmac 校驗、crypt+gen_salt(bf) 密碼儲存、PGP 對稱/公鑰加密。
 - **pg_trgm**：三元組模糊文本搜索，GIN/GiST 加速 LIKE、similarity() 相似度排序。
-- **pg_prewarm**：緩存預熱，autoprewarm BGW 自動恢復，重啟冷啟動優化。
 - **pg_buffercache**：緩存內容即時診斷，usagecount 時鐘演算法、pg_buffercache_summary()（PG 17）。
 - **btree_gin / btree_gist**：GIN 多欄位複合索引擴展、GiST EXCLUSION CONSTRAINT。
 
@@ -645,7 +644,7 @@ EXPLAIN SELECT * FROM users WHERE email = 'alice@example.com';
 -- 場景：SELECT * FROM orders WHERE user_id = 42 AND status = 'active' ORDER BY created_at DESC LIMIT 20
 
 -- 策略 A：單欄索引
-SELECT hypopg_reset();
+SELECT hypopg_reset();  -- 清除上一輪的假設索引，否則 EXPLAIN 會同時考慮多個候選，無法單獨對比
 SELECT hypopg_create_index('CREATE INDEX hypox_a ON orders(user_id)');
 EXPLAIN SELECT * FROM orders WHERE user_id = 42 AND status = 'active' ORDER BY created_at DESC LIMIT 20;
 -- 記錄 total cost: ____
@@ -1437,158 +1436,7 @@ CREATE INDEX idx_products_fts ON products USING GIN (fts);
 ---
 
 
-## 5. pg_prewarm — 緩存預熱
-
-pg_prewarm 解決 PG 重啟後前幾分鐘查詢極慢的問題——shared_buffers 全空，所有資料從磁碟讀。手動或自動把熱表載入 cache，讓重啟後的第一波查詢直接命中記憶體。
-
-### I. 場景
-
-PG crash recovery 或計劃內重啟後，shared_buffers 一片空白。第一波使用者查詢全部命中磁碟。NVMe 的 Seq Scan 要幾十秒，HDD 要幾分鐘。P99 latency 在重啟後的前 10~30 分鐘暴增，直到 autovacuum 和正常查詢慢慢把熱資料拉回 shared_buffers。這段冷啟動窗口對 SLA 是災難。
-
-pg_prewarm 做的事情很簡單：讀取指定表的全部或部分 block，放入 shared_buffers 或 OS page cache。一個 SELECT `pg_prewarm('orders')` 就能把整張 orders 表從磁碟拉進記憶體。
-
-```mermaid
-flowchart LR
-    subgraph "❌ 重啟後無預熱"
-        A1["PG 重啟"] --> B1["shared_buffers 空"]
-        B1 --> C1["用戶查詢 → 全部磁碟讀"]
-        C1 --> D1["前 10~30min P99 timeout<br/>惡性循環：timeout → retry → 更多壓力"]
-    end
-    subgraph "✅ 重啟後有預熱"
-        A2["PG 重啟"] --> B2["pg_prewarm() 或 autoprewarm"]
-        B2 --> C2["熱資料已在 buffer"]
-        C2 --> D2["用戶查詢 → 記憶體命中<br/>P99 立即恢復正常"]
-    end
-```
-
-### II. 基本操作
-
-```sql
--- 同步載入整張表到 shared_buffers（當前 session 阻塞直到完成）
-SELECT pg_prewarm('public.orders');
--- 回傳載入的 block 數，例如 64000（500MB / 8KB）
-
--- 異步預熱：不阻塞當前 session，bgw 後台慢慢載入 OS page cache
-SELECT pg_prewarm('public.orders', 'prefetch');
--- 適合大表（> 1GB），避免同步載入卡住幾十秒
-
--- 只預熱索引（熱查詢通常走 index scan，不必載入全表）
-SELECT pg_prewarm('idx_orders_created_at');
-
--- mode 參數完整說明：
--- 'prefetch' → 非同步，讀入 OS page cache（最快，不阻塞）
--- 'buffer'   → 同步，讀入 shared_buffers（對查詢效果最直接）
--- 'main'     → 同步，同時讀入 OS page cache + shared_buffers
-
--- 指定要預熱的 block 範圍（只預熱最近一周的分區）
-SELECT pg_prewarm('public.orders', 'buffer', 'main',
-    first_block := 0,
-    last_block  := 10000);   -- 只載入前 10000 個 block
-```
-
-### III. 驗證預熱效果
-
-```sql
--- 預熱前：確認 cache 為空
-SELECT c.relname,
-       count(*) AS buffers_in_cache,
-       pg_size_pretty(count(*) * 8192) AS cache_size
-FROM pg_buffercache b
-JOIN pg_class c ON b.relfilenode = pg_relation_filenode(c.oid)
-WHERE c.relname = 'orders'
-GROUP BY c.relname;
--- buffers_in_cache = 0 → 完全不在 shared_buffers
-
--- 執行預熱
-SELECT pg_prewarm('public.orders');
--- 回傳 64000（表有 500MB）
-
--- 預熱後再查
-SELECT c.relname,
-       count(*) AS buffers_in_cache,
-       pg_size_pretty(count(*) * 8192) AS cache_size
-FROM pg_buffercache b
-JOIN pg_class c ON b.relfilenode = pg_relation_filenode(c.oid)
-WHERE c.relname = 'orders'
-GROUP BY c.relname;
--- buffers_in_cache 應接近表的總 block 數
-```
-
-### IV. autoprewarm（PG 11+ 自動預熱）
-
-autoprewarm 是一個 bgw，會在 PG 關機前把 shared_buffers 中的所有 block 列表 dump 到檔案，重啟後再逐一載入回來。
-
-```sql
--- 手動觸發 dump（將當前 cache 內容寫入檔案）
-SELECT autoprewarm_dump_now();
-
--- 查看 autoprewarm bgw 狀態
-SELECT backend_type, state, backend_start
-FROM pg_stat_activity
-WHERE backend_type = 'autoprewarm leader';
-
--- 清空記錄（重建 cache 策略後重新學習）
-SELECT autoprewarm_reset();
-
--- autoprewarm 的 dump 檔案位置
--- 預設在 PG data_directory 下：autoprewarm.blocks
-```
-
-**關鍵限制**：autoprewarm 用 **FIFO** 順序載入，不是按照熱門程度。如果你的 `autoprewarm.blocks` 中前面排了 5GB 的冷資料，後面才是 500MB 的核心熱表，那麼重啟後的前幾分鐘，使用者仍然可能命中尚未載入的熱表 block。**生產環境最佳實踐**：autoprewarm 做基礎恢復 + 手動 `pg_prewarm('核心表')` 搶先載入 SLA 敏感的表。
-
-```sql
--- 重啟後的初始化腳本（優先載入核心業務表）
-SELECT pg_prewarm('public.orders');
-SELECT pg_prewarm('public.products');
-SELECT pg_prewarm('public.users');
-SELECT pg_prewarm('idx_orders_created_at');
-SELECT pg_prewarm('idx_products_category');
--- 其餘交由 autoprewarm 按 FIFO 順序繼續載入
-```
-
-### V. App Dev 視角
-
-應用啟動時的預熱腳本：
-
-```csharp
-// 應用啟動初始化（例如 Startup.cs 或 Program.cs）
-using var conn = new NpgsqlConnection(connStr);
-conn.Open();
-
-// 異步預熱（prefetch mode 不阻塞）
-var hotTables = new[] { "orders", "products", "users" };
-foreach (var table in hotTables)
-{
-    await conn.ExecuteAsync(
-        $"SELECT pg_prewarm('public.{table}', 'prefetch')");
-}
-Console.WriteLine($"Cache warmup initiated for {hotTables.Length} tables");
-```
-
-**Kubernetes / Docker 環境特別注意**：Pod 重啟後可能形成以下惡性循環：
-
-```mermaid
-flowchart TD
-    A["Pod 重啟"] --> B{"有預熱步驟？"}
-    B -->|"無"| C["readiness probe 立即通過"]
-    C --> D["K8s 將流量導入 Pod"]
-    D --> E["cold cache → 查詢 timeout"]
-    E --> F["liveness probe 失敗"]
-    F --> G["K8s 殺掉 Pod 重啟"]
-    G --> A
-    B -->|"有，postStart hook<br/>執行 pg_prewarm()"| H["cache 已熱才標記 Ready"]
-    H --> I["流量導入 → 正常服務"]
-```
-
-解法：
-1. `initialDelaySeconds` 設大一點（60~120s）
-2. `postStart` lifecycle hook 執行預熱 SQL
-3. 或在 `initContainer` 中跑完預熱，main container 才啟動
-
----
-
-
-## 6. pg_buffercache — 緩存內容診斷
+## 5. pg_buffercache — 緩存內容診斷
 
 pg_buffercache 做的事：把 shared_buffers 中每個 8KB block 的所屬表、usagecount 攤開給你看。當你發現 cache 命中率低但不知道是 shared_buffers 太小、還是冷表 Scan 在汙染 cache、還是熱表根本沒進去過——這是第一線診斷工具。
 
@@ -1717,7 +1565,7 @@ var recent = await conn.QueryAsync<Order>(
 ---
 
 
-## 7. btree_gin / btree_gist — 複合索引
+## 6. btree_gin / btree_gist — 複合索引
 
 btree_gin 和 btree_gist 是兩個輕量 contrib extension，作用是在 GIN / GiST 的 operator class 目錄中註冊 B-tree 操作符（`=`, `<`, `<=`, `>`, `>=`）。核心價值：一個索引同時覆蓋多種查詢模式（FTS + 分類 + 價格），省掉 BitmapAnd 合併多個 bitmap 的開銷。
 
