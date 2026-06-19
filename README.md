@@ -18,7 +18,7 @@
 | **資料型別** | [`datatype.md`](datatype.md) | Float vs Numeric 效能對比（360x）、SIMD 向量化、`AT TIME ZONE` 語法解析與型別轉換陷阱 |
 | **JSON/JSONB** | [`json.md`](json.md) | Scalar Types（大小寫敏感）、Type I/O 機制、BYTEA Escape 與 base64 方案、Tokenizer 原理、陣列提取與 GIN Index、JSONPath / json_table（PG 12→17）、方案選擇矩陣、生產排查與 App Dev 視角 |
 | **系統底層** | [`system.md`](system.md) | Column Order 與 Byte Alignment 全鏈路效能、Bit 位運算標籤系統、Linux Page Fault 與 huge_pages / NUMA |
-| **擴充功能** | [`extensions/extensions.md`](extensions/extensions.md) | 兩大分類 13 個 Extension：Non-Contrib（pg_partman / PgBouncer / pg_repack / pg_cron / pg_stat_kcache / hypopg）+ Contrib 內建（pg_stat_statements / auto_explain / pgcrypto / pg_trgm / pg_prewarm / pg_buffercache / btree_gin+btree_gist） |
+| **擴充功能** | [`extensions.md`](extensions.md) | 兩大分類 12 個 Extension：Non-Contrib（pg_partman / PgBouncer / pg_repack / pg_cron / pg_stat_kcache / hypopg）+ Contrib 內建（pg_stat_statements / auto_explain / pgcrypto / pg_trgm / pg_buffercache / btree_gin+btree_gist） |
 | **分頁查詢** | [`pagination.md`](pagination.md) | OFFSET 效能退化、CURSOR 方案、Keyset Pagination、分頁優化策略 |
 | **其他進階** | [`others.md`](others.md) | PG 17 開發規範（六大章節 + Npgsql 連線/交易/Retry/Prepared Statement/WAL 完整 C# 實戰）、Trigger Audit（DML hstore+JSONB/DDL Event Trigger + pgaudit 對比 + 架構決策速查）、12306 搶票系統全案設計（varbit/SKIP LOCKED/Array+GIN/CURSOR/pgrouting/Parallel Query/Sharding/Recursive CTE） |
 
@@ -47,7 +47,6 @@
   - **auto_explain**：自動記錄執行計劃、log_analyze/log_buffers/log_triggers/log_nested_statements、生產調校策略
   - **pgcrypto**：digest/hmac 數據校驗、crypt+gen_salt(bf) 密碼儲存、PGP 對稱/公鑰加密、C# Npgsql 實戰
   - **pg_trgm**：Trigram 原理、GIN/GiST 加速 LIKE、similarity() / word_similarity()、與 pg_bigm 對比
-  - **pg_prewarm**：手動緩存預熱 + autoprewarm BGW（PG 11+）自動恢復、重啟冷啟動優化
   - **pg_buffercache**：緩存內容即時診斷、usagecount 時鐘演算法、pg_buffercache_summary()（PG 17）
   - **btree_gin / btree_gist**：GIN 多欄位複合類型索引、GiST EXCLUSION CONSTRAINT 擴展
 
