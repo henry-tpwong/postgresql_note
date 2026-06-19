@@ -17,7 +17,6 @@
 | **Vacuum / Bloat** | [`vacuum.md`](vacuum.md) | 生產場景驅動核心概念、4 大 Bloat 成因與診斷 SQL、VM 深度解析（結構/失效/Index Entry）、VACUUM FULL vs pg_repack 二方案對比與決策樹 |
 | **資料型別** | [`datatype.md`](datatype.md) | Float vs Numeric 效能對比（360x）、SIMD 向量化、`AT TIME ZONE` 語法解析與型別轉換陷阱 |
 | **JSON/JSONB** | [`json.md`](json.md) | Scalar Types（大小寫敏感）、Type I/O 機制、BYTEA Escape 與 base64 方案、Tokenizer 原理、陣列提取與 GIN Index、JSONPath / json_table（PG 12→17）、方案選擇矩陣、生產排查與 App Dev 視角 |
-| **全文檢索** | [`fulltext/fulltext.md`](fulltext/fulltext.md) | zhparser 中文分詞、Whole-Row FTS（Generated Column）、record_out + SCWS 逗號問題與解法 |
 | **系統底層** | [`system.md`](system.md) | Column Order 與 Byte Alignment 全鏈路效能、Bit 位運算標籤系統、Linux Page Fault 與 huge_pages / NUMA |
 | **擴充功能** | [`extensions/extensions.md`](extensions/extensions.md) | 兩大分類 13 個 Extension：Non-Contrib（pg_partman / PgBouncer / pg_repack / pg_cron / pg_stat_kcache / hypopg）+ Contrib 內建（pg_stat_statements / auto_explain / pgcrypto / pg_trgm / pg_prewarm / pg_buffercache / btree_gin+btree_gist） |
 | **分頁查詢** | [`pagination.md`](pagination.md) | OFFSET 效能退化、CURSOR 方案、Keyset Pagination、分頁優化策略 |
@@ -34,11 +33,6 @@
 ### JSON/JSONB（json）
 - **一、Value Types 與構造方法**：Scalar Types（大小寫敏感）、jsonb 內部無 Type 概念、Type I/O Function 機制、BYTEA Escape 限制與 base64 方案、Tokenizer 運作原理
 - **二、陣列提取與查詢**：`->` / `->>` 操作符、`json_array_elements` + ARRAY 構造器、`@>` / `&&` 陣列操作、GIN on Expression、JSONPath（PG 12+）、`json_table`（PG 17+）、方案選擇矩陣、PG16 Best Practice
-
-### 全文檢索（fulltext）
-- **一、zhparser 中文全文檢索**：SCWS 分詞引擎、Token Type Mapping（實詞 vs 虛詞）、分詞效果測試、完整部署流程、效能調校（GIN/GiST/RUM 選擇）
-- **二、Whole-Row FTS（PG 17 視角）**：Generated Column + GIN 現代方案、Legacy IMMUTABLE 繞過法、`t::text` 格式限制、加權檢索、中文分詞 Extension 選擇
-- **三、record_out + SCWS 逗號問題**：`record_out` 序列化格式、SCWS 將逗號解析為 auxiliary token 導致截斷、`replace(, → ' ')` 解法、分詞效能基準（4.44 萬字/s）
 
 ### 擴充功能（extensions）
 - **# 一、Non-Contrib Extensions（需額外安裝）**
