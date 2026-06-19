@@ -16,7 +16,7 @@
 | **監控與追溯** | [`monitoring.md`](monitoring.md) | pg_stat_activity 生產實戰（5 場景 + 決策圖）、wait_event Top 10、auto_explain、pg_stat_io、track_commit_timestamp |
 | **Vacuum / Bloat** | [`vacuum/vacuum.md`](vacuum/vacuum.md) | 生產場景驅動核心概念、4 大 Bloat 成因與診斷 SQL、VM 深度解析（結構/失效/Index Entry）、VACUUM FULL vs pg_repack 二方案對比與決策樹 |
 | **資料型別** | [`datatype.md`](datatype.md) | Float vs Numeric 效能對比（360x）、SIMD 向量化、`AT TIME ZONE` 語法解析與型別轉換陷阱 |
-| **JSON/JSONB** | [`json/json.md`](json/json.md) | JSONB Value Types、Type I/O 機制、陣列提取與 GIN Index、JSONPath / SQL/JSON / json_table（PG 12→17） |
+| **JSON/JSONB** | [`json.md`](json.md) | JSONB Value Types、Type I/O 機制、陣列提取與 GIN Index、JSONPath / SQL/JSON / json_table（PG 12→17） |
 | **全文檢索** | [`fulltext/fulltext.md`](fulltext/fulltext.md) | zhparser 中文分詞、Whole-Row FTS（Generated Column）、record_out + SCWS 逗號問題與解法 |
 | **系統底層** | [`system.md`](system.md) | Column Order 與 Byte Alignment 全鏈路效能、Bit 位運算標籤系統、Linux Page Fault 與 huge_pages / NUMA |
 | **擴充功能** | [`extensions/extensions.md`](extensions/extensions.md) | 兩大分類 13 個 Extension：Non-Contrib（pg_partman / PgBouncer / pg_repack / pg_cron / pg_stat_kcache / hypopg）+ Contrib 內建（pg_stat_statements / auto_explain / pgcrypto / pg_trgm / pg_prewarm / pg_buffercache / btree_gin+btree_gist） |
