@@ -14,7 +14,7 @@
 | **查詢深度解析** | [`query.md`](query.md) | 查詢生命週期、CBO 與 pg_hint_plan、GROUP BY 策略、IN/ANY/VALUES、分頁與計數、Recursive CTE 優化、死循環防禦、分組 Top-N（44x）、JOIN 冗餘膨脹 Early DISTINCT |
 | **鎖（Lock）** | [`lock.md`](lock.md) | 隱式鎖、Lock Wait 追蹤、秒殺 Advisory Lock、高並發更新、Lock Flooding、max_locks_per_transaction、OLTP advisory lock、無間隙 ID 生成 |
 | **監控與追溯** | [`monitoring.md`](monitoring.md) | pg_stat_activity 生產實戰（5 場景 + 決策圖）、wait_event Top 10、auto_explain、pg_stat_io、track_commit_timestamp |
-| **Vacuum / Bloat** | [`vacuum/vacuum.md`](vacuum/vacuum.md) | MVCC 可見性判斷、Bloat 8 大成因與測試驗證、預防措施、VACUUM FULL vs pg_repack vs pg_squeeze 三方案對比 |
+| **Vacuum / Bloat** | [`vacuum/vacuum.md`](vacuum/vacuum.md) | 生產場景驅動核心概念、4 大 Bloat 成因與診斷 SQL、VM 深度解析（結構/失效/Index Entry）、VACUUM FULL vs pg_repack 二方案對比與決策樹 |
 | **資料型別** | [`datatype.md`](datatype.md) | Float vs Numeric 效能對比（360x）、SIMD 向量化、`AT TIME ZONE` 語法解析與型別轉換陷阱 |
 | **JSON/JSONB** | [`json/json.md`](json/json.md) | JSONB Value Types、Type I/O 機制、陣列提取與 GIN Index、JSONPath / SQL/JSON / json_table（PG 12→17） |
 | **全文檢索** | [`fulltext/fulltext.md`](fulltext/fulltext.md) | zhparser 中文分詞、Whole-Row FTS（Generated Column）、record_out + SCWS 逗號問題與解法 |
@@ -58,8 +58,8 @@
   - **btree_gin / btree_gist**：GIN 多欄位複合類型索引、GiST EXCLUSION CONSTRAINT 擴展
 
 ### Vacuum / Bloat（vacuum）
-- **一、Vacuum 原理與防止 Bloat**：8 大 Bloat 成因（Long Transaction 為核心）、6 組測試驗證（XID/游標/長查詢/隔離級別/批量更新/naptime）、10 項預防措施、`OldestXmin` 原始碼分析
-- **二、收縮膨脹表**：VACUUM FULL vs pg_repack vs pg_squeeze 三方案對比（鎖定時長/Delta 捕捉/效能影響/成熟度）、現代最佳實踐、`REINDEX CONCURRENTLY`（PG 12+）
+- **一、Vacuum 原理與防止 Bloat**：生產場景驅動核心概念（MVCC/Dead Tuple/OldestXmin）、4 大 Bloat 成因（Long Transaction / 批量操作 / 觸發閾值 / 非 HOT 更新）附診斷 SQL、VM 深度解析（2-bit 結構 / 失效時序圖 / Index Entry 結構 + DDL + mermaid）
+- **二、收縮膨脹表**：VACUUM FULL vs pg_repack 二方案對比（FILENODE swap 機制 / Lock 時間估算 / 執行時長參考）、生產決策樹、`REINDEX CONCURRENTLY`（PG 12+）
 
 ### 系統底層（System）
 - **一、Column Order & Byte Alignment**：ADD COLUMN 永遠在末尾、Simple View 虛擬重排、Byte Alignment 對 Row Size 的影響（padding 可佔 41%）、全鏈路效能鏈式反應
