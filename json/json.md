@@ -17,7 +17,7 @@
 
 ## 1. JSON 支援的 Scalar Types（區分大小寫）
 
-### 新手入門：什麼是 Scalar Type？
+### I. 概念說明
 
 在 JSON 的世界裡，一個 JSON 值可以是**物件（object）**、**陣列（array）**、或者**純量（scalar）**──純量就是無法再拆分的單一值，例如一個數字 `42`、一個字串 `"hello"`、一個布林值 `true`。這就像程式語言的「基本型別」，是最底層的資料單元。
 
@@ -32,8 +32,6 @@ PostgreSQL JSON 的 value 支援以下 5 種 scalar types，**嚴格區分大小
 | null | `null` | `NULL`、`Null` | 只能全小寫 |
 
 > **為什麼大小寫這麼嚴格？** 因為 JSON 是一個獨立標準（RFC 7159），不是 SQL。SQL 不區分大小寫（`SELECT` = `select`），但 JSON 區分。PostgreSQL 的 JSON parser 忠實遵循 JSON 標準，所以在這裡 `TRUE` 和 `true` 是兩個完全不同的東西──前者不合法。
-
-### 解析過程視覺化
 
 ```mermaid
 flowchart LR
@@ -51,7 +49,7 @@ flowchart LR
     E2 -->|否| G2["❌ report_invalid_token\n→ ERROR!"]
 ```
 
-### 實測：
+### II. 實測
 
 ```sql
 SELECT jsonb '{"a": true}';       -- OK
